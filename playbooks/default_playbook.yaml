@@ -1,0 +1,11 @@
+playbooks:
+  - name: exfiltration_containment
+    when:
+      anomaly_detected: true
+      data_exfil_flag: true
+    then:
+      - action: isolate_host
+      - action: rotate_credentials
+      - action: notify_incident_channel
+      - action: create_case_file
+      - action: human_approval_gate

@@ -1,0 +1,6 @@
+title: Unknown External IP Communication
+description: Detects communication to unknown external IPs.
+severity: 70
+detection:
+  equals:
+    action: connect_external_unknown_ip

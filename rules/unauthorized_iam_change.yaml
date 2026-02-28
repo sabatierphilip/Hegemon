@@ -1,0 +1,7 @@
+title: Unauthorized IAM Privilege Changes
+description: Detects IAM privilege escalation attempts.
+severity: 90
+detection:
+  equals:
+    action: iam_privilege_change
+    user: unknown

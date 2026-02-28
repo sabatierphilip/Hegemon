@@ -1,0 +1,7 @@
+title: Unexpected Container Spawning
+description: Detects unapproved container execution.
+severity: 75
+detection:
+  equals:
+    action: container_spawn
+    approved: false

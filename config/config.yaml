@@ -1,0 +1,29 @@
+system_name: Sentinel-Containment
+simulated_mode: false
+refresh_minutes: 5
+anomaly_threshold: 2.0
+baseline_window: 14
+baseline_min_history: 5
+baseline_training_required: true
+containment_severity_threshold: 70
+rules_path: rules
+playbook_path: playbooks/default_playbook.yaml
+incident_channel: SOC-Slack
+telemetry_index_path: data/telemetry_index.jsonl
+telemetry_batch_limit: 200
+alert_dedup_seconds: 300
+alert_dedup_state_path: data/alert_dedup_state.json
+model_spike_weight: 0.25
+egress_weight: 0.30
+privilege_weight: 0.45
+correlation_bonus: 10.0
+latest_state_path: data/latest_state.json
+dashboard_host: 0.0.0.0
+dashboard_port: 5000
+ingestion:
+  index_path: data/telemetry_index.jsonl
+  syslog_host: 0.0.0.0
+  syslog_port: 5514
+  cloudtrail_file: data/cloudtrail.jsonl
+  network_flow_file: data/network_flows.jsonl
+  model_api_file: data/model_api.jsonl
