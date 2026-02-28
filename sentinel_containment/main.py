@@ -16,15 +16,27 @@ from sentinel_containment.soar.workflow import SoarEngine
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 
 
-def run_cycle(settings: Settings) -> dict:
+def run_cycle(
+    settings: Settings,
+    baseline: BehavioralBaseline | None = None,
+    rules: RuleEngine | None = None,
+    correlator: AlertCorrelator | None = None,
+) -> dict:
     audit = ImmutableAuditLog()
     mapper = AssetMapper(CloudProviderAdapter(simulated=settings.get("simulated_mode", False)))
     topology = mapper.snapshot()
 
     ingestor = TelemetryIngestor(Path(settings.get("telemetry_index_path", "data/telemetry_index.jsonl")))
-    baseline = BehavioralBaseline(threshold=float(settings.get("anomaly_threshold", 2.0)))
-    rules = RuleEngine(Path(settings.get("rules_path", "rules")))
-    correlator = AlertCorrelator()
+    baseline = baseline or BehavioralBaseline(
+        threshold=float(settings.get("anomaly_threshold", 2.0)),
+        window=int(settings.get("baseline_window", 30)),
+        min_history=int(settings.get("baseline_min_history", 5)),
+    )
+    rules = rules or RuleEngine(
+        Path(settings.get("rules_path", "rules")),
+        dedup_window_seconds=int(settings.get("alert_dedup_window_seconds", 300)),
+    )
+    correlator = correlator or AlertCorrelator()
     containment = ContainmentEngine(audit)
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
 
@@ -47,7 +59,9 @@ def run_cycle(settings: Settings) -> dict:
     containment_result = None
     soar_actions = []
 
-    if correlated and correlated.severity >= int(settings.get("containment_severity_threshold", 70)):
+    baseline_ready = all(len(values) >= baseline.min_history for values in baseline.series.values()) if baseline.series else False
+
+    if correlated and baseline_ready and correlated.severity >= int(settings.get("containment_severity_threshold", 70)):
         soar_actions = soar.run({"anomaly_detected": True, "data_exfil_flag": True})
         target_host = "unknown"
         if rule_alerts:
@@ -71,6 +85,7 @@ def run_cycle(settings: Settings) -> dict:
         "baseline_anomalies": [asdict(a) for a in baseline_alerts],
         "correlated": asdict(correlated) if correlated else None,
         "containment": asdict(containment_result) if containment_result else None,
+        "baseline_ready": baseline_ready,
         "soar_actions": soar_actions,
         "contained_hosts": sorted(list(containment.contained_hosts)),
     }
