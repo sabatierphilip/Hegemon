@@ -1,0 +1,120 @@
+from pathlib import Path
+
+from sentinel_containment.asset_mapper.discovery import AssetMapper
+from sentinel_containment.cloud.provider import CloudProviderAdapter
+from sentinel_containment.config import Settings
+from sentinel_containment.containment.engine import ContainmentEngine
+from sentinel_containment.detection.rule_engine import RuleEngine
+from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
+from sentinel_containment.main import run_cycle
+from sentinel_containment.runtime import SentinelRuntime
+from sentinel_containment.telemetry.ingestor import TelemetryIngestor
+from sentinel_containment.telemetry.sources import JSONLinesFileSource, parse_syslog_line
+
+
+def test_asset_snapshot_contains_nodes(tmp_path):
+    mapper = AssetMapper(CloudProviderAdapter(simulated=True), snapshot_path=tmp_path / "topology.json")
+    snap = mapper.snapshot()
+    assert snap["nodes"]
+
+
+def test_rule_engine_detects_excessive_calls():
+    engine = RuleEngine()
+    alerts = engine.evaluate({"action": "model_invoke", "api_call_count": 900})
+    assert any("Excessive Model API Calls" == a.rule for a in alerts)
+
+
+def test_containment_two_person_approval(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    engine = ContainmentEngine(audit)
+    denied = engine.execute("h1", 90, ["quarantine_host"], ["alice"])
+    assert not denied.approved
+    allowed = engine.execute("h1", 90, ["quarantine_host"], ["alice", "bob"])
+    assert allowed.approved
+
+
+def test_run_cycle_with_real_ingested_events(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "prod-model-1",
+            "user": "svc-prod",
+            "process": "gateway",
+            "action": "model_invoke",
+            "resource": "model-a",
+            "api_call_count": 900,
+            "egress_mb": 950,
+            "gpu_cpu": 97,
+        },
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "containment_severity_threshold": 70,
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+            }
+        )
+    )
+
+    assert state["events_processed"] == 1
+    assert state["correlated"] is not None
+    assert state["containment"] is not None
+
+
+def test_jsonl_source_and_syslog_parser(tmp_path):
+    index_path = tmp_path / "index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    source_file = tmp_path / "cloudtrail.jsonl"
+    source_file.write_text('{"host":"cloud-1","action":"iam_privilege_change","user":"unknown"}\n', encoding="utf-8")
+
+    source = JSONLinesFileSource(source_file, "cloud_audit", ingestor)
+    assert source.poll_once() == 1
+    docs = ingestor.read_recent()
+    assert docs and docs[0]["source_type"] == "cloud_audit"
+
+    parsed = parse_syslog_line("<13>Jan 10 12:00:00 host1 sshd: Failed login")
+    assert parsed["host"] == "host1"
+
+
+def test_runtime_run_once_writes_latest_state(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    TelemetryIngestor(index_path).ingest(
+        "model_api",
+        {
+            "host": "host-x",
+            "action": "model_invoke",
+            "api_call_count": 800,
+            "egress_mb": 900,
+            "gpu_cpu": 85,
+        },
+    )
+
+    state_path = tmp_path / "latest_state.json"
+    runtime = SentinelRuntime(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "latest_state_path": str(state_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "ingestion": {
+                    "syslog_host": "127.0.0.1",
+                    "syslog_port": 0,
+                    "cloudtrail_file": str(tmp_path / "c.jsonl"),
+                    "network_flow_file": str(tmp_path / "n.jsonl"),
+                    "model_api_file": str(tmp_path / "m.jsonl"),
+                },
+            }
+        )
+    )
+
+    state = runtime.run_once()
+    assert state_path.exists()
+    assert state["events_processed"] >= 1

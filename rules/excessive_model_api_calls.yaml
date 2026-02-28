@@ -1,0 +1,8 @@
+title: Excessive Model API Calls
+description: Detects excessive model invocation volume that may indicate abuse.
+severity: 85
+detection:
+  equals:
+    action: model_invoke
+  greater_than:
+    api_call_count: 500
