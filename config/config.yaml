@@ -1,8 +1,17 @@
 system_name: Sentinel-Containment
-simulated_mode: true
+simulated_mode: false
 refresh_minutes: 5
 anomaly_threshold: 2.0
 containment_severity_threshold: 70
 rules_path: rules
 playbook_path: playbooks/default_playbook.yaml
 incident_channel: SOC-Slack
+telemetry_index_path: data/telemetry_index.jsonl
+telemetry_batch_limit: 200
+ingestion:
+  index_path: data/telemetry_index.jsonl
+  syslog_host: 0.0.0.0
+  syslog_port: 5514
+  cloudtrail_file: data/cloudtrail.jsonl
+  network_flow_file: data/network_flows.jsonl
+  model_api_file: data/model_api.jsonl

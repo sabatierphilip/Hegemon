@@ -18,40 +18,42 @@ from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 
 def run_cycle(settings: Settings) -> dict:
     audit = ImmutableAuditLog()
-    mapper = AssetMapper(CloudProviderAdapter(simulated=settings.get("simulated_mode", True)))
+    mapper = AssetMapper(CloudProviderAdapter(simulated=settings.get("simulated_mode", False)))
     topology = mapper.snapshot()
 
-    ingestor = TelemetryIngestor()
+    ingestor = TelemetryIngestor(Path(settings.get("telemetry_index_path", "data/telemetry_index.jsonl")))
     baseline = BehavioralBaseline(threshold=float(settings.get("anomaly_threshold", 2.0)))
     rules = RuleEngine(Path(settings.get("rules_path", "rules")))
     correlator = AlertCorrelator()
     containment = ContainmentEngine(audit)
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
 
-    sample_event = ingestor.ingest("model_api", {
-        "host": "sim-model-1",
-        "user": "service-account",
-        "process": "model-gateway",
-        "action": "model_invoke",
-        "resource": "llm-safe-v1",
-        "api_call_count": 800,
-        "egress_mb": 900,
-    })
+    recent_events = ingestor.read_recent(limit=int(settings.get("telemetry_batch_limit", 200)))
+    rule_alerts = []
+    baseline_alerts = []
 
-    rule_alerts = rules.evaluate(sample_event)
-    baseline_alerts = baseline.update_and_detect("sim-model-1", {
-        "api_call_rate": sample_event.get("api_call_count", 0),
-        "network_egress": sample_event.get("egress_mb", 0),
-        "gpu_cpu": 95,
-    })
+    for event in recent_events:
+        rule_alerts.extend(rules.evaluate(event))
+        host = event.get("host", "unknown")
+        metrics = {
+            "api_call_rate": float(event.get("api_call_count", 0) or 0),
+            "network_egress": float(event.get("egress_mb", 0) or 0),
+            "gpu_cpu": float(event.get("gpu_cpu", 0) or 0),
+        }
+        if any(metrics.values()):
+            baseline_alerts.extend(baseline.update_and_detect(host, metrics))
 
     correlated = correlator.correlate(rule_alerts, baseline_alerts)
     containment_result = None
     soar_actions = []
+
     if correlated and correlated.severity >= int(settings.get("containment_severity_threshold", 70)):
         soar_actions = soar.run({"anomaly_detected": True, "data_exfil_flag": True})
+        target_host = "unknown"
+        if rule_alerts:
+            target_host = rule_alerts[0].event.get("host", "unknown")
         containment_result = containment.execute(
-            host="sim-model-1",
+            host=target_host,
             severity=correlated.severity,
             requested_actions=[
                 "disable_outbound_traffic",
@@ -64,6 +66,7 @@ def run_cycle(settings: Settings) -> dict:
 
     state = {
         "topology": topology,
+        "events_processed": len(recent_events),
         "alerts": [asdict(a) for a in rule_alerts],
         "baseline_anomalies": [asdict(a) for a in baseline_alerts],
         "correlated": asdict(correlated) if correlated else None,

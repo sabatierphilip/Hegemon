@@ -21,3 +21,21 @@ class TelemetryIngestor:
 
     def ingest_batch(self, source_type: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [self.ingest(source_type, e) for e in events]
+
+    def read_recent(self, limit: int = 200) -> list[dict[str, Any]]:
+        if not self.output_path.exists():
+            return []
+        with self.output_path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+        events: list[dict[str, Any]] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+                if isinstance(payload, dict):
+                    events.append(payload)
+            except json.JSONDecodeError:
+                continue
+        return events

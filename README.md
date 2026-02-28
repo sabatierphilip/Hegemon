@@ -9,9 +9,12 @@ Sentinel-Containment is a defensive, modular cybersecurity system for rapid depl
   - Uses cloud abstraction adapter (AWS/GCP/Azure style) for instances, IAM roles, buckets, model endpoints
   - Builds a live asset graph with `networkx`
   - Exports topology JSON snapshot
-- **Telemetry Ingestion**
-  - Normalizes syslog, cloud audit logs, network flow logs, and model API logs
-  - Stores OpenSearch/Elasticsearch-style JSON documents
+- **Telemetry Ingestion (real sources)**
+  - Syslog UDP listener
+  - Cloud audit JSONL tailing (CloudTrail-like)
+  - Network flow JSONL tailing
+  - Model API request/response JSONL tailing
+  - Normalizes all events into a common OpenSearch-style schema
 - **Detection Engine**
   - Sigma-like YAML rule matching
   - Behavioral baseline anomaly detection (rolling window)
@@ -34,37 +37,46 @@ Sentinel-Containment is a defensive, modular cybersecurity system for rapid depl
 sentinel_containment/
   asset_mapper/discovery.py
   cloud/provider.py
-  telemetry/{schema.py, ingestor.py}
+  telemetry/{schema.py, ingestor.py, sources.py}
   detection/{rule_engine.py, baseline.py, correlator.py}
   containment/engine.py
   soar/workflow.py
   logging_layer/immutable_log.py
   web/app.py
   main.py
+scripts/run_ingestion_service.py
 config/config.yaml
 rules/*.yaml
 playbooks/default_playbook.yaml
-scripts/simulate_scenario.py
 Dockerfile
 deploy.sh
 ```
 
-## Quick Start
+## Quick Start (real ingestion)
 
-1. Create venv and install deps:
+1. Install dependencies:
    ```bash
    python -m venv .venv && source .venv/bin/activate
    pip install -r requirements.txt
    ```
-2. Run simulation:
+2. Start ingestion service:
    ```bash
-   python scripts/simulate_scenario.py
+   python scripts/run_ingestion_service.py
    ```
-3. Run dashboard:
+3. Feed logs:
+   - Syslog → UDP `5514`
+   - Append JSON lines to:
+     - `data/cloudtrail.jsonl`
+     - `data/network_flows.jsonl`
+     - `data/model_api.jsonl`
+4. Run detection/containment cycle:
+   ```bash
+   python -c "from sentinel_containment.config import Settings; from sentinel_containment.main import run_cycle; print(run_cycle(Settings.load()))"
+   ```
+5. Run dashboard:
    ```bash
    flask --app sentinel_containment.web.app run --host 0.0.0.0 --port 5000
    ```
-4. Open `http://localhost:5000` and `http://localhost:5000/graph`
 
 ## Single-command Docker deployment
 
@@ -80,10 +92,8 @@ deploy.sh
 - Tamper-evident immutable audit trail
 - No exploitation, counter-attack, destructive action, or external offensive scanning
 
-## Example Test Scenario
+## Test
 
 ```bash
-python scripts/simulate_scenario.py
 pytest -q
 ```
-

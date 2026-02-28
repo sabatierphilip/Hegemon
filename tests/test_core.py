@@ -1,10 +1,14 @@
-from sentinel_containment.cloud.provider import CloudProviderAdapter
+from pathlib import Path
+
 from sentinel_containment.asset_mapper.discovery import AssetMapper
+from sentinel_containment.cloud.provider import CloudProviderAdapter
+from sentinel_containment.config import Settings
+from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
-from sentinel_containment.containment.engine import ContainmentEngine
-from sentinel_containment.config import Settings
 from sentinel_containment.main import run_cycle
+from sentinel_containment.telemetry.ingestor import TelemetryIngestor
+from sentinel_containment.telemetry.sources import JSONLinesFileSource, parse_syslog_line
 
 
 def test_asset_snapshot_contains_nodes(tmp_path):
@@ -28,8 +32,50 @@ def test_containment_two_person_approval(tmp_path):
     assert allowed.approved
 
 
-def test_run_cycle_generates_correlated_alert_and_containment():
-    state = run_cycle(Settings.load())
+def test_run_cycle_with_real_ingested_events(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "prod-model-1",
+            "user": "svc-prod",
+            "process": "gateway",
+            "action": "model_invoke",
+            "resource": "model-a",
+            "api_call_count": 900,
+            "egress_mb": 950,
+            "gpu_cpu": 97,
+        },
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "containment_severity_threshold": 70,
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+            }
+        )
+    )
+
+    assert state["events_processed"] == 1
     assert state["correlated"] is not None
-    assert state["correlated"]["severity"] >= 70
     assert state["containment"] is not None
+
+
+def test_jsonl_source_and_syslog_parser(tmp_path):
+    index_path = tmp_path / "index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    source_file = tmp_path / "cloudtrail.jsonl"
+    source_file.write_text('{"host":"cloud-1","action":"iam_privilege_change","user":"unknown"}\n', encoding="utf-8")
+
+    source = JSONLinesFileSource(source_file, "cloud_audit", ingestor)
+    assert source.poll_once() == 1
+    docs = ingestor.read_recent()
+    assert docs and docs[0]["source_type"] == "cloud_audit"
+
+    parsed = parse_syslog_line("<13>Jan 10 12:00:00 host1 sshd: Failed login")
+    assert parsed["host"] == "host1"
