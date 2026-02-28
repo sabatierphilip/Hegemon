@@ -25,6 +25,9 @@ class ContainmentEngine:
         requested_actions: list[str],
         approvals: list[str],
         high_impact_threshold: int = 80,
+        simulation_mode: bool = True,
+        hard_quarantine_threshold: int = 90,
+        simulation_context: dict[str, Any] | None = None,
     ) -> ContainmentResult:
         if severity >= high_impact_threshold and len(set(approvals)) < 2:
             self.audit_log.append("containment_denied", {
@@ -45,6 +48,16 @@ class ContainmentEngine:
         }
 
         executed = [a for a in requested_actions if a in safe_actions]
+        quarantine_requested = "quarantine_host" in executed
+
+        if quarantine_requested and simulation_mode:
+            simulation = self._simulate_quarantine(host, severity, simulation_context or {})
+            self.audit_log.append("containment_simulated", simulation)
+
+            if severity < hard_quarantine_threshold:
+                executed.remove("quarantine_host")
+                executed.append("simulate_quarantine_host")
+
         if "quarantine_host" in executed:
             self.contained_hosts.add(host)
 
@@ -55,5 +68,19 @@ class ContainmentEngine:
             "approvals": approvals,
             "reversible": True,
             "offensive_actions": False,
+            "simulation_mode": simulation_mode,
         })
         return ContainmentResult(True, executed, "Containment actions executed")
+
+    def _simulate_quarantine(self, host: str, severity: int, context: dict[str, Any]) -> dict[str, Any]:
+        blast_radius = context.get("blast_radius", {})
+        impacted_hosts = blast_radius.get("impacted_hosts", [])
+        impacted_assets = blast_radius.get("impacted_resources", [])
+        return {
+            "host": host,
+            "severity": severity,
+            "estimated_service_impact": "medium" if severity < 90 else "high",
+            "lateral_hosts_at_risk": impacted_hosts,
+            "dependent_assets_at_risk": impacted_assets,
+            "recommendation": "Proceed with hard quarantine" if severity >= 90 else "Continue monitored containment",
+        }

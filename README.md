@@ -14,6 +14,9 @@ What starts automatically:
 - Syslog UDP listener (`5514`)
 - JSONL ingestion watchers (`cloudtrail`, `network_flows`, `model_api`)
 - Periodic detection/correlation/containment cycles
+- Probabilistic MITRE-aware attack chain extraction
+- Learned graph edge novelty with temporal and structural drift scoring
+- Credential blast-radius estimation and containment simulation before hard quarantine
 - Immutable audit logging
 - Flask dashboard (`http://localhost:5000`) and `/graph`
 
@@ -37,6 +40,8 @@ Send syslog to UDP `5514`.
 Main settings are in `config/config.yaml`:
 - `refresh_minutes` for automated cycle frequency
 - `containment_severity_threshold` for auto containment
+- `containment_simulation_mode` to stage soft-containment before hard host quarantine
+- `hard_quarantine_threshold` to force quarantine only at critical severity
 - `ingestion.*` for real source locations and ports
 - `dashboard_host`/`dashboard_port` for web UI
 

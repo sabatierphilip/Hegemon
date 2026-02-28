@@ -7,6 +7,7 @@ from pathlib import Path
 from sentinel_containment.asset_mapper.discovery import AssetMapper
 from sentinel_containment.cloud.provider import CloudProviderAdapter
 from sentinel_containment.config import Settings
+from sentinel_containment.containment.blast_radius import CredentialBlastRadiusAnalyzer
 from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
@@ -49,6 +50,7 @@ def run_cycle(
         chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
     )
     containment = ContainmentEngine(audit)
+    blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
 
     recent_events = ingestor.read_recent(limit=int(settings.get("telemetry_batch_limit", 200)))
@@ -72,6 +74,7 @@ def run_cycle(
     attack_chains = sequence_model.evaluate(recent_events)
     containment_result = None
     soar_actions = []
+    blast_radius = blast_radius_analyzer.analyze(recent_events, topology)
 
     baseline_ready = all(len(values) >= baseline.min_history for values in baseline.series.values()) if baseline.series else False
 
@@ -98,6 +101,9 @@ def run_cycle(
                 "forensic_snapshot_metadata",
             ],
             approvals=["alice", "bob"],
+            simulation_mode=bool(settings.get("containment_simulation_mode", True)),
+            hard_quarantine_threshold=int(settings.get("hard_quarantine_threshold", 90)),
+            simulation_context={"blast_radius": asdict(blast_radius)},
         )
 
     state = {
@@ -109,6 +115,7 @@ def run_cycle(
         "attack_chains": [asdict(c) for c in attack_chains],
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
+        "credential_blast_radius": asdict(blast_radius),
         "containment": asdict(containment_result) if containment_result else None,
         "baseline_ready": baseline_ready,
         "soar_actions": soar_actions,
