@@ -1,0 +1,8 @@
+system_name: Sentinel-Containment
+simulated_mode: true
+refresh_minutes: 5
+anomaly_threshold: 2.0
+containment_severity_threshold: 70
+rules_path: rules
+playbook_path: playbooks/default_playbook.yaml
+incident_channel: SOC-Slack

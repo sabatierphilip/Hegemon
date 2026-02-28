@@ -1,0 +1,6 @@
+title: High-volume Outbound Data Transfer
+description: Detects unusual outbound transfer volume.
+severity: 80
+detection:
+  greater_than:
+    egress_mb: 700
