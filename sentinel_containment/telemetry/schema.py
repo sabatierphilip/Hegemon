@@ -32,4 +32,9 @@ class NormalizedEvent:
     def to_opensearch_doc(self) -> dict[str, Any]:
         doc = asdict(self)
         doc["@timestamp"] = doc.pop("timestamp")
+        # Keep metadata nested, but also expose scalar metadata keys at top-level
+        # so simple rule engines can match on fields like `api_call_count`.
+        for key, value in self.metadata.items():
+            if key not in doc and isinstance(value, (str, int, float, bool)):
+                doc[key] = value
         return doc

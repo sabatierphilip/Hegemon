@@ -3,6 +3,8 @@ from sentinel_containment.asset_mapper.discovery import AssetMapper
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.containment.engine import ContainmentEngine
+from sentinel_containment.config import Settings
+from sentinel_containment.main import run_cycle
 
 
 def test_asset_snapshot_contains_nodes(tmp_path):
@@ -24,3 +26,10 @@ def test_containment_two_person_approval(tmp_path):
     assert not denied.approved
     allowed = engine.execute("h1", 90, ["quarantine_host"], ["alice", "bob"])
     assert allowed.approved
+
+
+def test_run_cycle_generates_correlated_alert_and_containment():
+    state = run_cycle(Settings.load())
+    assert state["correlated"] is not None
+    assert state["correlated"]["severity"] >= 70
+    assert state["containment"] is not None
