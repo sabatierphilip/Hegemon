@@ -11,14 +11,115 @@ app = Flask(__name__)
 
 HTML = """
 <!doctype html>
-<title>Sentinel-Containment Dashboard</title>
-<h1>Sentinel-Containment</h1>
-<h2>Current Topology</h2>
-<pre>{{ topology }}</pre>
-<h2>Active Alerts</h2>
-<pre>{{ alerts }}</pre>
-<h2>Contained Hosts</h2>
-<pre>{{ contained_hosts }}</pre>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>Sentinel-Containment Command Center</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #131a2e;
+      --panel-2: #1a2340;
+      --text: #d8e2ff;
+      --muted: #9fb1dd;
+      --critical: #ff4d6d;
+      --high: #ff9f1c;
+      --medium: #f7d154;
+      --low: #4cc9f0;
+      --ok: #2dd4bf;
+    }
+    body { margin: 0; font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg, #0a0e1b, #0b1020); color: var(--text); }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 22px; }
+    .title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+    .title h1 { margin: 0; font-size: 28px; }
+    .badge { background: #20305f; border: 1px solid #2f4383; padding: 6px 10px; border-radius: 20px; color: #cfe0ff; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }
+    .card { background: var(--panel); border: 1px solid #253155; border-radius: 12px; padding: 14px; box-shadow: 0 8px 16px rgba(0, 0, 0, .25); }
+    .kpi { font-size: 26px; font-weight: 700; margin: 6px 0 2px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .layout { display: grid; grid-template-columns: 1.7fr 1fr; gap: 14px; }
+    .panel { background: var(--panel); border: 1px solid #253155; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+    .panel h3 { margin: 0 0 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid #283354; text-align: left; padding: 8px 6px; }
+    .sev { font-weight: 700; }
+    .sev.high { color: var(--high); }
+    .sev.critical { color: var(--critical); }
+    .sev.medium { color: var(--medium); }
+    .sev.low { color: var(--low); }
+    .chain { background: var(--panel-2); border-radius: 10px; padding: 10px; margin-bottom: 8px; }
+    .pill { font-size: 11px; border-radius: 999px; padding: 2px 8px; background: #2a3a68; margin-right: 5px; }
+    .small { font-size: 12px; }
+    .json { max-height: 280px; overflow: auto; background: #0f1528; border: 1px solid #283354; border-radius: 8px; padding: 8px; }
+  </style>
+</head>
+<body>
+<div class=\"wrap\">
+  <div class=\"title\">
+    <h1>🛡️ Sentinel-Containment Command Center</h1>
+    <div class=\"badge\">Candidate Severity: {{ candidate_severity }}</div>
+  </div>
+
+  <div class=\"grid\">
+    <div class=\"card\"><div class=\"muted\">Events Processed</div><div class=\"kpi\">{{ events_processed }}</div></div>
+    <div class=\"card\"><div class=\"muted\">Rule Alerts</div><div class=\"kpi\">{{ alerts_count }}</div></div>
+    <div class=\"card\"><div class=\"muted\">Graph Edge Anomalies</div><div class=\"kpi\">{{ graph_count }}</div></div>
+    <div class=\"card\"><div class=\"muted\">Attack Chains</div><div class=\"kpi\">{{ chains_count }}</div></div>
+  </div>
+
+  <div class=\"layout\">
+    <div>
+      <div class=\"panel\">
+        <h3>Graph-based Anomaly Detection</h3>
+        <table>
+          <thead><tr><th>Edge</th><th>Relation</th><th>Novelty</th><th>Severity</th></tr></thead>
+          <tbody>
+            {% for a in graph_anomalies %}
+            <tr>
+              <td>{{ a.source }} → {{ a.target }}</td>
+              <td>{{ a.relation }}</td>
+              <td>{{ a.novelty_score }}</td>
+              <td class=\"sev {{ severity_class(a.severity) }}\">{{ a.severity }}</td>
+            </tr>
+            {% endfor %}
+            {% if not graph_anomalies %}<tr><td colspan=\"4\" class=\"small muted\">No novel edges detected in current batch.</td></tr>{% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class=\"panel\">
+        <h3>Time-sequence Attack Modeling</h3>
+        {% for c in attack_chains %}
+        <div class=\"chain\">
+          <div><strong>{{ c.host }}</strong> · severity <span class=\"sev {{ severity_class(c.severity) }}\">{{ c.severity }}</span></div>
+          <div class=\"small\">{{ c.summary }} (confidence: {{ c.confidence }})</div>
+          <div style=\"margin-top: 6px;\">{% for s in c.stages %}<span class=\"pill\">{{ s }}</span>{% endfor %}</div>
+        </div>
+        {% endfor %}
+        {% if not attack_chains %}<div class=\"small muted\">No multi-stage attack chains detected in current time window.</div>{% endif %}
+      </div>
+    </div>
+
+    <div>
+      <div class=\"panel\">
+        <h3>Correlated Alert Overview</h3>
+        <div class=\"json\"><pre>{{ correlated }}</pre></div>
+      </div>
+      <div class=\"panel\">
+        <h3>Containment</h3>
+        <div class=\"small\">Contained Hosts: {{ contained_hosts }}</div>
+        <div class=\"small\">SOAR Actions: {{ soar_actions }}</div>
+      </div>
+      <div class=\"panel\">
+        <h3>Topology</h3>
+        <div class=\"json\"><pre>{{ topology }}</pre></div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
 """
 
 
@@ -27,7 +128,24 @@ def _load_latest_state() -> dict:
     state_path = Path(settings.get("latest_state_path", "data/latest_state.json"))
     if state_path.exists():
         return json.loads(state_path.read_text(encoding="utf-8"))
-    return {"topology": {}, "correlated": {}, "contained_hosts": []}
+    return {
+        "topology": {},
+        "correlated": {},
+        "contained_hosts": [],
+        "graph_anomalies": [],
+        "attack_chains": [],
+        "candidate_severity": 0,
+    }
+
+
+def _severity_class(value: int) -> str:
+    if value >= 90:
+        return "critical"
+    if value >= 75:
+        return "high"
+    if value >= 55:
+        return "medium"
+    return "low"
 
 
 @app.get("/")
@@ -35,9 +153,18 @@ def dashboard():
     state = _load_latest_state()
     return render_template_string(
         HTML,
-        topology=json.dumps(state.get("topology", {}), indent=2),
-        alerts=json.dumps(state.get("correlated", {}), indent=2),
+        events_processed=state.get("events_processed", 0),
+        alerts_count=len(state.get("alerts", [])),
+        graph_count=len(state.get("graph_anomalies", [])),
+        chains_count=len(state.get("attack_chains", [])),
+        candidate_severity=state.get("candidate_severity", 0),
+        graph_anomalies=state.get("graph_anomalies", []),
+        attack_chains=state.get("attack_chains", []),
+        correlated=json.dumps(state.get("correlated", {}), indent=2),
         contained_hosts=json.dumps(state.get("contained_hosts", []), indent=2),
+        soar_actions=json.dumps(state.get("soar_actions", []), indent=2),
+        topology=json.dumps(state.get("topology", {}), indent=2),
+        severity_class=_severity_class,
     )
 
 
@@ -45,3 +172,8 @@ def dashboard():
 def graph():
     state = _load_latest_state()
     return jsonify(state.get("topology", {}))
+
+
+@app.get("/api/state")
+def api_state():
+    return jsonify(_load_latest_state())

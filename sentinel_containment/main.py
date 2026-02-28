@@ -8,8 +8,10 @@ from sentinel_containment.asset_mapper.discovery import AssetMapper
 from sentinel_containment.cloud.provider import CloudProviderAdapter
 from sentinel_containment.config import Settings
 from sentinel_containment.containment.engine import ContainmentEngine
+from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
+from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.soar.workflow import SoarEngine
@@ -21,6 +23,8 @@ def run_cycle(
     baseline: BehavioralBaseline | None = None,
     rules: RuleEngine | None = None,
     correlator: AlertCorrelator | None = None,
+    graph_detector: GraphAnomalyDetector | None = None,
+    sequence_model: AttackSequenceModel | None = None,
 ) -> dict:
     audit = ImmutableAuditLog()
     mapper = AssetMapper(CloudProviderAdapter(simulated=settings.get("simulated_mode", False)))
@@ -37,15 +41,24 @@ def run_cycle(
         dedup_window_seconds=int(settings.get("alert_dedup_window_seconds", 300)),
     )
     correlator = correlator or AlertCorrelator()
+    graph_detector = graph_detector or GraphAnomalyDetector(
+        warmup_events=int(settings.get("graph_warmup_events", 5)),
+        novelty_weight=float(settings.get("graph_novelty_weight", 1.6)),
+    )
+    sequence_model = sequence_model or AttackSequenceModel(
+        chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
+    )
     containment = ContainmentEngine(audit)
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
 
     recent_events = ingestor.read_recent(limit=int(settings.get("telemetry_batch_limit", 200)))
     rule_alerts = []
     baseline_alerts = []
+    graph_anomalies = []
 
     for event in recent_events:
         rule_alerts.extend(rules.evaluate(event))
+        graph_anomalies.extend(graph_detector.evaluate(event))
         host = event.get("host", "unknown")
         metrics = {
             "api_call_rate": float(event.get("api_call_count", 0) or 0),
@@ -56,19 +69,28 @@ def run_cycle(
             baseline_alerts.extend(baseline.update_and_detect(host, metrics))
 
     correlated = correlator.correlate(rule_alerts, baseline_alerts)
+    attack_chains = sequence_model.evaluate(recent_events)
     containment_result = None
     soar_actions = []
 
     baseline_ready = all(len(values) >= baseline.min_history for values in baseline.series.values()) if baseline.series else False
 
-    if correlated and baseline_ready and correlated.severity >= int(settings.get("containment_severity_threshold", 70)):
+    candidate_severity = 0
+    if correlated:
+        candidate_severity = correlated.severity
+    if graph_anomalies:
+        candidate_severity = max(candidate_severity, max(a.severity for a in graph_anomalies))
+    if attack_chains:
+        candidate_severity = max(candidate_severity, max(c.severity for c in attack_chains))
+
+    if candidate_severity and baseline_ready and candidate_severity >= int(settings.get("containment_severity_threshold", 70)):
         soar_actions = soar.run({"anomaly_detected": True, "data_exfil_flag": True})
         target_host = "unknown"
         if rule_alerts:
             target_host = rule_alerts[0].event.get("host", "unknown")
         containment_result = containment.execute(
             host=target_host,
-            severity=correlated.severity,
+            severity=candidate_severity,
             requested_actions=[
                 "disable_outbound_traffic",
                 "revoke_rotate_api_keys",
@@ -83,7 +105,10 @@ def run_cycle(
         "events_processed": len(recent_events),
         "alerts": [asdict(a) for a in rule_alerts],
         "baseline_anomalies": [asdict(a) for a in baseline_alerts],
+        "graph_anomalies": [asdict(a) for a in graph_anomalies],
+        "attack_chains": [asdict(c) for c in attack_chains],
         "correlated": asdict(correlated) if correlated else None,
+        "candidate_severity": candidate_severity,
         "containment": asdict(containment_result) if containment_result else None,
         "baseline_ready": baseline_ready,
         "soar_actions": soar_actions,

@@ -11,6 +11,9 @@ telemetry_batch_limit: 200
 latest_state_path: data/latest_state.json
 dashboard_host: 0.0.0.0
 dashboard_port: 5000
+graph_warmup_events: 5
+graph_novelty_weight: 1.6
+attack_chain_window_minutes: 30
 ingestion:
   index_path: data/telemetry_index.jsonl
   syslog_host: 0.0.0.0
