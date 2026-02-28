@@ -4,6 +4,8 @@ from sentinel_containment.asset_mapper.discovery import AssetMapper
 from sentinel_containment.cloud.provider import CloudProviderAdapter
 from sentinel_containment.config import Settings
 from sentinel_containment.containment.engine import ContainmentEngine
+from sentinel_containment.detection.attack_sequence import AttackSequenceModel
+from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
@@ -195,3 +197,62 @@ def test_correlator_privilege_weighting_beats_model_only():
 
     assert model_score is not None and iam_score is not None
     assert iam_score.severity > model_score.severity
+
+
+def test_graph_detector_flags_novel_edges_after_warmup():
+    detector = GraphAnomalyDetector(warmup_events=2)
+    no_alerts_1 = detector.evaluate({"host": "h1", "user": "u1", "action": "model_invoke"})
+    no_alerts_2 = detector.evaluate({"host": "h1", "process": "p1", "action": "process_start"})
+    alerts = detector.evaluate({"host": "h9", "user": "intruder", "action": "iam_privilege_change"})
+
+    assert no_alerts_1 == []
+    assert no_alerts_2 == []
+    assert alerts and "New graph edge detected" in alerts[0].reason
+
+
+def test_attack_sequence_detects_multistage_chain():
+    model = AttackSequenceModel(chain_window_minutes=60)
+    events = [
+        {"host": "h1", "@timestamp": "2024-01-01T00:00:00+00:00", "action": "login_failure"},
+        {"host": "h1", "@timestamp": "2024-01-01T00:03:00+00:00", "action": "container_spawn"},
+        {"host": "h1", "@timestamp": "2024-01-01T00:05:00+00:00", "action": "iam_privilege_change"},
+        {"host": "h1", "@timestamp": "2024-01-01T00:08:00+00:00", "action": "model_invoke"},
+        {"host": "h1", "@timestamp": "2024-01-01T00:10:00+00:00", "action": "network_send", "egress_mb": 900},
+    ]
+
+    alerts = model.evaluate(events)
+    assert alerts
+    assert alerts[0].host == "h1"
+    assert "exfiltration" in alerts[0].stages
+
+
+def test_run_cycle_emits_graph_and_chain_outputs(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    samples = [
+        {"host": "h1", "user": "alice", "action": "login_success", "resource": "ssh"},
+        {"host": "h1", "process": "runner", "action": "container_spawn", "resource": "container-A"},
+        {"host": "h1", "user": "unknown", "action": "iam_privilege_change", "resource": "admin-role"},
+        {"host": "h1", "action": "model_invoke", "resource": "model-a", "api_call_count": 700},
+        {"host": "h1", "action": "network_send", "resource": "8.8.8.8", "egress_mb": 950},
+        {"host": "h9", "user": "intruder", "action": "network_send", "resource": "9.9.9.9", "egress_mb": 980},
+    ]
+    for s in samples:
+        ingestor.ingest("network_flow", s)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "graph_warmup_events": 2,
+                "attack_chain_window_minutes": 60,
+            }
+        )
+    )
+
+    assert state["graph_anomalies"]
+    assert state["attack_chains"]

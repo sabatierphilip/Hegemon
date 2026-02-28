@@ -8,6 +8,8 @@ from pathlib import Path
 from sentinel_containment.config import Settings
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
+from sentinel_containment.detection.attack_sequence import AttackSequenceModel
+from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.main import run_cycle
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
@@ -38,6 +40,13 @@ class SentinelRuntime:
             dedup_window_seconds=int(settings.get("alert_dedup_window_seconds", 300)),
         )
         self.correlator = AlertCorrelator()
+        self.graph_detector = GraphAnomalyDetector(
+            warmup_events=int(settings.get("graph_warmup_events", 5)),
+            novelty_weight=float(settings.get("graph_novelty_weight", 1.6)),
+        )
+        self.sequence_model = AttackSequenceModel(
+            chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
+        )
 
         self.ingestion_service = IngestionService(
             ingestor=ingestor,
@@ -49,7 +58,14 @@ class SentinelRuntime:
         )
 
     def run_once(self) -> dict:
-        state = run_cycle(self.settings, baseline=self.baseline, rules=self.rule_engine, correlator=self.correlator)
+        state = run_cycle(
+            self.settings,
+            baseline=self.baseline,
+            rules=self.rule_engine,
+            correlator=self.correlator,
+            graph_detector=self.graph_detector,
+            sequence_model=self.sequence_model,
+        )
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return state
