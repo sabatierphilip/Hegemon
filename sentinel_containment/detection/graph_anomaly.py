@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -17,7 +19,7 @@ class GraphEdgeAnomaly:
 
 
 class GraphAnomalyDetector:
-    """Detects novel graph edges (node-to-node relations) appearing in telemetry."""
+    """Learns graph edge behavior and flags temporal/structural outliers."""
 
     def __init__(self, warmup_events: int = 5, novelty_weight: float = 1.6):
         self.warmup_events = warmup_events
@@ -25,6 +27,12 @@ class GraphAnomalyDetector:
         self._processed_events = 0
         self._known_edges: set[tuple[str, str, str]] = set()
         self._node_degree: dict[str, int] = {}
+        self._neighbors: dict[str, set[str]] = defaultdict(set)
+        self._relation_counts: dict[str, int] = defaultdict(int)
+        self._embedding_mean = [0.0, 0.0, 0.0, 0.0]
+        self._embedding_var = [1.0, 1.0, 1.0, 1.0]
+        self._embedding_seen = 0
+        self._relation_ewma: dict[str, float] = defaultdict(float)
 
     def evaluate(self, event: dict[str, Any]) -> list[GraphEdgeAnomaly]:
         edge = self._event_edge(event)
@@ -34,16 +42,31 @@ class GraphAnomalyDetector:
 
         source, target, relation = edge
         key = (source, target, relation)
-
-        anomalies: list[GraphEdgeAnomaly] = []
-        edge_known = key in self._known_edges
-        warmed_up = self._processed_events >= self.warmup_events
         source_degree = self._node_degree.get(source, 0)
         target_degree = self._node_degree.get(target, 0)
 
-        if warmed_up and not edge_known:
-            novelty_score = min(1.0, (1.0 / (1 + source_degree + target_degree)) * self.novelty_weight)
-            severity = min(95, 55 + int(40 * novelty_score))
+        embedding = self._edge_embedding(source, target, relation)
+        embed_distance = self._embedding_distance(embedding)
+        temporal_drift = self._temporal_drift(relation)
+        structural_outlier = self._structural_outlier(source, target)
+        first_seen_bonus = 1.0 if key not in self._known_edges else 0.15
+
+        combined = (
+            0.35 * min(1.0, embed_distance / 3.0)
+            + 0.25 * temporal_drift
+            + 0.20 * structural_outlier
+            + 0.20 * first_seen_bonus
+        ) * self.novelty_weight
+        novelty_score = min(1.0, combined)
+
+        anomalies: list[GraphEdgeAnomaly] = []
+        warmed_up = self._processed_events >= self.warmup_events
+        if warmed_up and novelty_score >= 0.55:
+            severity = min(97, 52 + int(novelty_score * 45))
+            reason = (
+                f"Graph edge outlier: {source} -> {target} ({relation}); "
+                f"embed={embed_distance:.2f}, drift={temporal_drift:.2f}, structural={structural_outlier:.2f}"
+            )
             anomalies.append(
                 GraphEdgeAnomaly(
                     source=source,
@@ -51,16 +74,79 @@ class GraphAnomalyDetector:
                     relation=relation,
                     severity=severity,
                     novelty_score=round(novelty_score, 3),
-                    reason=f"New graph edge detected: {source} -> {target} ({relation})",
+                    reason=reason,
                     event=event,
                 )
             )
 
+        self._update_models(source, target, relation, key, embedding, source_degree, target_degree)
+        self._processed_events += 1
+        return anomalies
+
+    def _update_models(
+        self,
+        source: str,
+        target: str,
+        relation: str,
+        key: tuple[str, str, str],
+        embedding: list[float],
+        source_degree: int,
+        target_degree: int,
+    ) -> None:
         self._known_edges.add(key)
         self._node_degree[source] = source_degree + 1
         self._node_degree[target] = target_degree + 1
-        self._processed_events += 1
-        return anomalies
+        self._neighbors[source].add(target)
+        self._neighbors[target].add(source)
+        self._relation_counts[relation] += 1
+
+        alpha = 0.3
+        self._relation_ewma[relation] = (
+            alpha * self._relation_counts[relation] + (1.0 - alpha) * self._relation_ewma[relation]
+        )
+
+        self._embedding_seen += 1
+        for i, value in enumerate(embedding):
+            delta = value - self._embedding_mean[i]
+            self._embedding_mean[i] += delta / self._embedding_seen
+            self._embedding_var[i] = max(1e-6, ((self._embedding_seen - 1) * self._embedding_var[i] + delta * (value - self._embedding_mean[i])) / self._embedding_seen)
+
+    def _edge_embedding(self, source: str, target: str, relation: str) -> list[float]:
+        src_degree = float(self._node_degree.get(source, 0))
+        tgt_degree = float(self._node_degree.get(target, 0))
+        relation_freq = float(self._relation_counts.get(relation, 0))
+        shared = len(self._neighbors.get(source, set()) & self._neighbors.get(target, set()))
+        return [
+            math.log1p(src_degree),
+            math.log1p(tgt_degree),
+            math.log1p(relation_freq),
+            float(shared),
+        ]
+
+    def _embedding_distance(self, embedding: list[float]) -> float:
+        zsum = 0.0
+        for i, value in enumerate(embedding):
+            std = math.sqrt(max(self._embedding_var[i], 1e-6))
+            zsum += ((value - self._embedding_mean[i]) / std) ** 2
+        return math.sqrt(zsum)
+
+    def _temporal_drift(self, relation: str) -> float:
+        baseline = self._relation_ewma.get(relation, 0.0)
+        current = float(self._relation_counts.get(relation, 0))
+        if baseline <= 0:
+            return 0.6
+        drift = abs(current - baseline) / max(1.0, baseline)
+        return min(1.0, drift)
+
+    def _structural_outlier(self, source: str, target: str) -> float:
+        src_neighbors = self._neighbors.get(source, set())
+        tgt_neighbors = self._neighbors.get(target, set())
+        if not src_neighbors or not tgt_neighbors:
+            return 1.0
+        overlap = len(src_neighbors & tgt_neighbors)
+        union = len(src_neighbors | tgt_neighbors)
+        jaccard = overlap / max(1, union)
+        return 1.0 - jaccard
 
     @staticmethod
     def _event_edge(event: dict[str, Any]) -> tuple[str, str, str] | None:

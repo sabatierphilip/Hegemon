@@ -14,6 +14,8 @@ dashboard_port: 5000
 graph_warmup_events: 5
 graph_novelty_weight: 1.6
 attack_chain_window_minutes: 30
+containment_simulation_mode: true
+hard_quarantine_threshold: 90
 ingestion:
   index_path: data/telemetry_index.jsonl
   syslog_host: 0.0.0.0

@@ -207,7 +207,7 @@ def test_graph_detector_flags_novel_edges_after_warmup():
 
     assert no_alerts_1 == []
     assert no_alerts_2 == []
-    assert alerts and "New graph edge detected" in alerts[0].reason
+    assert alerts and "Graph edge outlier" in alerts[0].reason
 
 
 def test_attack_sequence_detects_multistage_chain():
@@ -224,6 +224,26 @@ def test_attack_sequence_detects_multistage_chain():
     assert alerts
     assert alerts[0].host == "h1"
     assert "exfiltration" in alerts[0].stages
+
+
+
+
+def test_containment_simulation_before_quarantine(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    engine = ContainmentEngine(audit)
+    result = engine.execute(
+        "h2",
+        85,
+        ["disable_outbound_traffic", "quarantine_host"],
+        ["alice", "bob"],
+        simulation_mode=True,
+        hard_quarantine_threshold=90,
+        simulation_context={"blast_radius": {"impacted_hosts": ["h2"], "impacted_resources": ["model-a"]}},
+    )
+
+    assert result.approved
+    assert "simulate_quarantine_host" in result.actions_executed
+    assert "quarantine_host" not in result.actions_executed
 
 
 def test_run_cycle_emits_graph_and_chain_outputs(tmp_path):
@@ -256,3 +276,4 @@ def test_run_cycle_emits_graph_and_chain_outputs(tmp_path):
 
     assert state["graph_anomalies"]
     assert state["attack_chains"]
+    assert state["credential_blast_radius"]["estimated_impact_score"] >= 30
