@@ -56,3 +56,12 @@ IAM/privilege changes are intentionally weighted highest by default.
 ```bash
 pytest -q
 ```
+
+## Merge conflict safety
+
+A repository test now fails if any Git merge conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) are present in tracked text files. Run:
+
+```bash
+pytest -q
+```
+
