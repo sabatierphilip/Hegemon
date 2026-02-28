@@ -2,4 +2,4 @@
 set -euo pipefail
 
 docker build -t sentinel-containment .
-docker run --rm -p 5000:5000 --env-file .env sentinel-containment
+docker run --rm -p 5000:5000 -p 5514:5514/udp --env-file .env sentinel-containment

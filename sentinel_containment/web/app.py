@@ -6,7 +6,6 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template_string
 
 from sentinel_containment.config import Settings
-from sentinel_containment.main import run_cycle
 
 app = Flask(__name__)
 
@@ -23,16 +22,17 @@ HTML = """
 """
 
 
+def _load_latest_state() -> dict:
+    settings = Settings.load()
+    state_path = Path(settings.get("latest_state_path", "data/latest_state.json"))
+    if state_path.exists():
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    return {"topology": {}, "correlated": {}, "contained_hosts": []}
+
+
 @app.get("/")
 def dashboard():
-    state_path = Path("data/latest_state.json")
-    if state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    else:
-        settings = Settings.load()
-        state = run_cycle(settings)
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    state = _load_latest_state()
     return render_template_string(
         HTML,
         topology=json.dumps(state.get("topology", {}), indent=2),
@@ -43,11 +43,5 @@ def dashboard():
 
 @app.get("/graph")
 def graph():
-    state_path = Path("data/latest_state.json")
-    if not state_path.exists():
-        settings = Settings.load()
-        state = run_cycle(settings)
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state = _load_latest_state()
     return jsonify(state.get("topology", {}))

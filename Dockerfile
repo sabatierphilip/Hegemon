@@ -4,5 +4,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV PYTHONUNBUFFERED=1
-EXPOSE 5000
-CMD ["python", "-m", "flask", "--app", "sentinel_containment.web.app", "run", "--host", "0.0.0.0", "--port", "5000"]
+EXPOSE 5000 5514/udp
+CMD ["python", "scripts/start_sentinel.py"]

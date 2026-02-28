@@ -7,6 +7,7 @@ from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
+from sentinel_containment.runtime import SentinelRuntime
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import JSONLinesFileSource, parse_syslog_line
 
@@ -79,3 +80,41 @@ def test_jsonl_source_and_syslog_parser(tmp_path):
 
     parsed = parse_syslog_line("<13>Jan 10 12:00:00 host1 sshd: Failed login")
     assert parsed["host"] == "host1"
+
+
+def test_runtime_run_once_writes_latest_state(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    TelemetryIngestor(index_path).ingest(
+        "model_api",
+        {
+            "host": "host-x",
+            "action": "model_invoke",
+            "api_call_count": 800,
+            "egress_mb": 900,
+            "gpu_cpu": 85,
+        },
+    )
+
+    state_path = tmp_path / "latest_state.json"
+    runtime = SentinelRuntime(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "latest_state_path": str(state_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "ingestion": {
+                    "syslog_host": "127.0.0.1",
+                    "syslog_port": 0,
+                    "cloudtrail_file": str(tmp_path / "c.jsonl"),
+                    "network_flow_file": str(tmp_path / "n.jsonl"),
+                    "model_api_file": str(tmp_path / "m.jsonl"),
+                },
+            }
+        )
+    )
+
+    state = runtime.run_once()
+    assert state_path.exists()
+    assert state["events_processed"] >= 1

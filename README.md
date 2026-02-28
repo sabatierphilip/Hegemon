@@ -1,98 +1,54 @@
 # Sentinel-Containment
 
-Sentinel-Containment is a defensive, modular cybersecurity system for rapid deployment in cloud, hybrid, or on-prem environments. It focuses on **containment, auditability, and safe reversibility** with no offensive capabilities.
+Sentinel-Containment is a defensive, modular cybersecurity system for rapid deployment in cloud, hybrid, or on-prem environments.
 
-## Features
+## One-command startup (auto-orchestrated)
 
-- **Asset Auto-Mapping**
-  - Discovers local hosts, ports, services
-  - Uses cloud abstraction adapter (AWS/GCP/Azure style) for instances, IAM roles, buckets, model endpoints
-  - Builds a live asset graph with `networkx`
-  - Exports topology JSON snapshot
-- **Telemetry Ingestion (real sources)**
-  - Syslog UDP listener
-  - Cloud audit JSONL tailing (CloudTrail-like)
-  - Network flow JSONL tailing
-  - Model API request/response JSONL tailing
-  - Normalizes all events into a common OpenSearch-style schema
-- **Detection Engine**
-  - Sigma-like YAML rule matching
-  - Behavioral baseline anomaly detection (rolling window)
-  - Alert correlation and severity scoring
-- **Containment Engine (defensive-only)**
-  - Safe actions only: traffic block, key rotation, IAM session disable, host quarantine, container pause, forensic metadata
-  - Two-person approval gate for high-impact actions
-  - Reversible action model and immutable auditing
-- **SOAR Workflow**
-  - YAML playbooks with conditional steps and human approval gates
-- **Immutable Logging**
-  - Append-only hash-chained audit log
-- **Dashboard + Graph API**
-  - Flask dashboard for topology, alerts, and contained hosts
-  - `/graph` endpoint for topology JSON visualization
+Start one process and the platform handles the rest automatically:
 
-## Project Structure
-
-```text
-sentinel_containment/
-  asset_mapper/discovery.py
-  cloud/provider.py
-  telemetry/{schema.py, ingestor.py, sources.py}
-  detection/{rule_engine.py, baseline.py, correlator.py}
-  containment/engine.py
-  soar/workflow.py
-  logging_layer/immutable_log.py
-  web/app.py
-  main.py
-scripts/run_ingestion_service.py
-config/config.yaml
-rules/*.yaml
-playbooks/default_playbook.yaml
-Dockerfile
-deploy.sh
+```bash
+python scripts/start_sentinel.py
 ```
 
-## Quick Start (real ingestion)
+What starts automatically:
+- Syslog UDP listener (`5514`)
+- JSONL ingestion watchers (`cloudtrail`, `network_flows`, `model_api`)
+- Periodic detection/correlation/containment cycles
+- Immutable audit logging
+- Flask dashboard (`http://localhost:5000`) and `/graph`
 
-1. Install dependencies:
-   ```bash
-   python -m venv .venv && source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-2. Start ingestion service:
-   ```bash
-   python scripts/run_ingestion_service.py
-   ```
-3. Feed logs:
-   - Syslog → UDP `5514`
-   - Append JSON lines to:
-     - `data/cloudtrail.jsonl`
-     - `data/network_flows.jsonl`
-     - `data/model_api.jsonl`
-4. Run detection/containment cycle:
-   ```bash
-   python -c "from sentinel_containment.config import Settings; from sentinel_containment.main import run_cycle; print(run_cycle(Settings.load()))"
-   ```
-5. Run dashboard:
-   ```bash
-   flask --app sentinel_containment.web.app run --host 0.0.0.0 --port 5000
-   ```
-
-## Single-command Docker deployment
+## Docker single-command deployment
 
 ```bash
 ./deploy.sh
 ```
 
-## Security Principles
+## Real telemetry inputs
 
-- Zero Trust and least privilege by default
-- No hardcoded secrets (use env vars)
-- Containment actions are defensive and reversible
-- Tamper-evident immutable audit trail
-- No exploitation, counter-attack, destructive action, or external offensive scanning
+Write real events to the configured files (or bind mount/pipe your collector output):
+- `data/cloudtrail.jsonl`
+- `data/network_flows.jsonl`
+- `data/model_api.jsonl`
 
-## Test
+Send syslog to UDP `5514`.
+
+## Configuration
+
+Main settings are in `config/config.yaml`:
+- `refresh_minutes` for automated cycle frequency
+- `containment_severity_threshold` for auto containment
+- `ingestion.*` for real source locations and ports
+- `dashboard_host`/`dashboard_port` for web UI
+
+## Security principles
+
+- Defensive-only containment
+- Two-person approval for high-impact actions
+- Reversible actions
+- Tamper-evident immutable hash-chain log
+- No offensive actions
+
+## Tests
 
 ```bash
 pytest -q
