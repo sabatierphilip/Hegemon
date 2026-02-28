@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 
 from sentinel_containment.config import Settings
+from sentinel_containment.detection.baseline import BehavioralBaseline
+from sentinel_containment.detection.correlator import AlertCorrelator
+from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.main import run_cycle
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import IngestionService
@@ -25,6 +28,17 @@ class SentinelRuntime:
             settings.get("telemetry_index_path", ingest_cfg.get("index_path", "data/telemetry_index.jsonl"))
         )
         ingestor = TelemetryIngestor(telemetry_path)
+        self.baseline = BehavioralBaseline(
+            threshold=float(settings.get("anomaly_threshold", 2.0)),
+            window=int(settings.get("baseline_window", 30)),
+            min_history=int(settings.get("baseline_min_history", 5)),
+        )
+        self.rule_engine = RuleEngine(
+            Path(settings.get("rules_path", "rules")),
+            dedup_window_seconds=int(settings.get("alert_dedup_window_seconds", 300)),
+        )
+        self.correlator = AlertCorrelator()
+
         self.ingestion_service = IngestionService(
             ingestor=ingestor,
             syslog_host=ingest_cfg.get("syslog_host", "0.0.0.0"),
@@ -35,7 +49,7 @@ class SentinelRuntime:
         )
 
     def run_once(self) -> dict:
-        state = run_cycle(self.settings)
+        state = run_cycle(self.settings, baseline=self.baseline, rules=self.rule_engine, correlator=self.correlator)
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return state

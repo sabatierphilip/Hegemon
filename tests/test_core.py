@@ -64,7 +64,8 @@ def test_run_cycle_with_real_ingested_events(tmp_path):
 
     assert state["events_processed"] == 1
     assert state["correlated"] is not None
-    assert state["containment"] is not None
+    assert state["baseline_ready"] is False
+    assert state["containment"] is None
 
 
 def test_jsonl_source_and_syslog_parser(tmp_path):
@@ -118,3 +119,104 @@ def test_runtime_run_once_writes_latest_state(tmp_path):
     state = runtime.run_once()
     assert state_path.exists()
     assert state["events_processed"] >= 1
+
+
+def test_rule_engine_dedup_window_suppresses_duplicates():
+    engine = RuleEngine(dedup_window_seconds=300)
+    event = {
+        "@timestamp": "2024-01-01T00:00:00+00:00",
+        "host": "prod-model-1",
+        "action": "model_invoke",
+        "api_call_count": 900,
+    }
+    first = engine.evaluate(event)
+    second = engine.evaluate({**event, "@timestamp": "2024-01-01T00:02:00+00:00"})
+    third = engine.evaluate({**event, "@timestamp": "2024-01-01T00:06:00+00:00"})
+
+    assert first
+    assert second == []
+    assert third and third[0].dedup_hits == 2
+
+
+def test_run_cycle_generates_baseline_anomalies_after_training(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+
+    for _ in range(6):
+        ingestor.ingest(
+            "model_api",
+            {
+                "host": "prod-model-1",
+                "action": "model_invoke",
+                "api_call_count": 120,
+                "egress_mb": 20,
+                "gpu_cpu": 40,
+            },
+        )
+
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "prod-model-1",
+            "action": "model_invoke",
+            "api_call_count": 800,
+            "egress_mb": 90,
+            "gpu_cpu": 91,
+        },
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "containment_severity_threshold": 70,
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 5,
+            }
+        )
+    )
+
+    assert state["baseline_ready"] is True
+    assert state["baseline_anomalies"]
+
+
+def test_correlator_privilege_weighting_beats_model_only():
+    from sentinel_containment.detection.correlator import AlertCorrelator
+    from sentinel_containment.detection.rule_engine import DetectionAlert
+
+    correlator = AlertCorrelator()
+    model_alert = DetectionAlert("Excessive Model API Calls", "desc", 70, {"host": "h1"})
+    iam_alert = DetectionAlert("Unauthorized IAM Privilege Change", "desc", 70, {"host": "h1"})
+
+    model_score = correlator.correlate([model_alert], [])
+    iam_score = correlator.correlate([iam_alert], [])
+
+    assert model_score is not None and iam_score is not None
+    assert iam_score.severity > model_score.severity
+
+
+def test_correlator_emits_correlation_groups():
+    from sentinel_containment.detection.baseline import BaselineAnomaly
+    from sentinel_containment.detection.correlator import AlertCorrelator
+    from sentinel_containment.detection.rule_engine import DetectionAlert
+
+    correlator = AlertCorrelator()
+    alerts = [
+        DetectionAlert("Excessive Model API Calls", "desc", 60, {"host": "h1", "action": "model_invoke"}, dedup_hits=3),
+        DetectionAlert("Excessive Model API Calls", "desc", 60, {"host": "h1", "action": "model_invoke"}, dedup_hits=1),
+    ]
+    baseline = [
+        BaselineAnomaly("api_call_rate", "h1", 800, 120, 6.6, 90),
+        BaselineAnomaly("api_call_rate", "h1", 780, 120, 6.5, 80),
+    ]
+
+    correlated = correlator.correlate(alerts, baseline)
+
+    assert correlated is not None
+    rule_groups = correlated.details["event_correlation"]["rule_groups"]
+    assert rule_groups[0]["host"] == "h1"
+    assert rule_groups[0]["suppressed"] == 2
+    baseline_groups = correlated.details["event_correlation"]["baseline_groups"]
+    assert baseline_groups[0]["hits"] == 2
