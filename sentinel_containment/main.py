@@ -107,6 +107,8 @@ def execute_counter_clone_actions(
                     "action": probe_action,
                     "resource": target,
                     "synthetic": True,
+                    "counterclone_participant": True,
+                    "counterclone_integrity_verified": True,
                     "clone_deployment_id": deployment.get("deployment_id", "unknown"),
                 },
             )
@@ -124,6 +126,7 @@ def execute_counter_clone_actions(
                     "resource": f"synthetic://hunter/{target}",
                     "synthetic": True,
                     "counterclone_participant": True,
+                    "counterclone_integrity_verified": True,
                     "clone_deployment_id": deployment.get("deployment_id", "autonomous-recon"),
                 },
             )
@@ -158,6 +161,7 @@ def execute_counter_clone_actions(
                     "resource": f"synthetic://honeypot/{target}",
                     "synthetic": True,
                     "counterclone_participant": True,
+                    "counterclone_integrity_verified": True,
                     "clone_deployment_id": deployment.get("deployment_id", "autonomous-recon"),
                 },
             )
@@ -176,6 +180,8 @@ def execute_counter_clone_actions(
                             "action": baseline_action,
                             "resource": f"synthetic://baseline/{baseline_action}",
                             "synthetic": True,
+                            "counterclone_participant": True,
+                            "counterclone_integrity_verified": True,
                             "clone_deployment_id": deployment.get("deployment_id", "unknown"),
                         },
                     )
@@ -282,7 +288,16 @@ def run_cycle(
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
 
     recent_events = ingestor.read_recent(limit=int(settings.get("telemetry_batch_limit", 200)))
-    detector_events = [event for event in recent_events if not bool(event.get("synthetic", False))]
+
+    def _trusted_synthetic_event(event: dict[str, Any]) -> bool:
+        return (
+            bool(event.get("synthetic", False))
+            and str(event.get("source_type", "")) == "clone_synthetic"
+            and bool(event.get("counterclone_participant", False))
+            and bool(event.get("counterclone_integrity_verified", False))
+        )
+
+    detector_events = [event for event in recent_events if not _trusted_synthetic_event(event)]
     rule_alerts = []
     baseline_alerts = []
     graph_anomalies = []
