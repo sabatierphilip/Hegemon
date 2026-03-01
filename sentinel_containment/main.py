@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from sentinel_containment.asset_mapper.discovery import AssetMapper
 from sentinel_containment.cloud.provider import CloudProviderAdapter
@@ -19,6 +20,97 @@ from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.soar.workflow import SoarEngine
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
+
+
+CLONE_ALLOWED_SYNTHETIC_ACTIONS = {"read", "list", "model_invoke"}
+
+
+def execute_counter_clone_actions(
+    actions: list[dict[str, Any]],
+    deployment: dict[str, Any],
+    containment: ContainmentEngine,
+    ingestor: TelemetryIngestor,
+    audit: ImmutableAuditLog,
+) -> list[dict[str, Any]]:
+    """Execute counter-clone actions with safety constraints and synthetic stream isolation.
+
+    `activate_deception_hardening` is explicitly defined as emitting baseline-like synthetic
+    read/list/model_invoke events that obscure detector timing without offensive behavior.
+    """
+    execution_log: list[dict[str, Any]] = []
+
+    def _record(action: str, target: str, status: str, details: dict[str, Any] | None = None) -> None:
+        payload = {"action": action, "target": target, "status": status, "details": details or {}}
+        execution_log.append(payload)
+        audit.append("counter_clone_executor", payload)
+
+    simulated_host = deployment["shard"].split("|", 1)[0].replace("host:", "")
+    for item in actions:
+        action = str(item.get("action", "unknown"))
+        target = str(item.get("target", "unknown"))
+
+        if action == "prestage_containment":
+            target_host = target.split("|", 1)[0].replace("host:", "") if "host:" in target else simulated_host
+            result = containment.execute(
+                host=target_host,
+                severity=70,
+                requested_actions=["disable_outbound_traffic", "forensic_snapshot_metadata"],
+                approvals=["alice", "bob"],
+                simulation_mode=True,
+            )
+            _record(action, target, "executed", {"approved": result.approved, "actions": result.actions_executed})
+            continue
+
+        if action == "block_simulated_path":
+            _record(action, target, "simulated", {"rule": "egress_sinkhole", "applied": True})
+            continue
+
+        if action == "emit_synthetic_probe":
+            sequence = deployment.get("synthetic_probe_sequence", [])
+            probe = next((p for p in sequence if str(p.get("resource", "")) == target), None)
+            probe_action = str((probe or {}).get("action", "unknown")).strip().lower()
+            if probe_action not in CLONE_ALLOWED_SYNTHETIC_ACTIONS:
+                _record(action, target, "dropped", {"reason": "action_not_whitelisted", "candidate": probe_action})
+                continue
+
+            ingestor.ingest(
+                "clone_synthetic",
+                {
+                    "host": (probe or {}).get("host", simulated_host),
+                    "user": "clone-shadow",
+                    "process": "counter-clone",
+                    "action": probe_action,
+                    "resource": target,
+                    "synthetic": True,
+                    "clone_deployment_id": deployment.get("deployment_id", "unknown"),
+                },
+            )
+            _record(action, target, "executed", {"event_action": probe_action})
+            continue
+
+        if action == "run_phase":
+            if target == "activate_deception_hardening":
+                for baseline_action in ("list", "read", "model_invoke"):
+                    ingestor.ingest(
+                        "clone_synthetic",
+                        {
+                            "host": simulated_host,
+                            "user": "clone-shadow",
+                            "process": "counter-clone",
+                            "action": baseline_action,
+                            "resource": f"synthetic://baseline/{baseline_action}",
+                            "synthetic": True,
+                            "clone_deployment_id": deployment.get("deployment_id", "unknown"),
+                        },
+                    )
+                _record(action, target, "executed", {"definition": "baseline_cover_traffic"})
+            else:
+                _record(action, target, "executed", {"phase": "acknowledged"})
+            continue
+
+        _record(action, target, "ignored", {"reason": "unsupported_action"})
+
+    return execution_log
 
 
 def compute_risk_confidence(
@@ -113,8 +205,11 @@ def run_cycle(
     mirror_alerts = []
     clone_deployments = []
     counter_clone_actions = []
+    counter_clone_execution = []
 
     for event in recent_events:
+        if bool(event.get("synthetic", False)):
+            continue
         rule_alerts.extend(rules.evaluate(event))
         graph_anomalies.extend(graph_detector.evaluate(event))
         honeypot_alerts.extend(honeypot_detector.evaluate(event))
@@ -152,7 +247,17 @@ def run_cycle(
             if alert.severity >= deploy_threshold:
                 deployment = mirror_clone_detector.deploy_counter_clone(alert)
                 clone_deployments.append(deployment)
-                counter_clone_actions.extend(mirror_clone_detector.execute_counter_clone(deployment))
+                planned_actions = mirror_clone_detector.execute_counter_clone(deployment)
+                counter_clone_actions.extend(planned_actions)
+                counter_clone_execution.extend(
+                    execute_counter_clone_actions(
+                        actions=[asdict(a) for a in planned_actions],
+                        deployment=asdict(deployment),
+                        containment=containment,
+                        ingestor=ingestor,
+                        audit=audit,
+                    )
+                )
 
     immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
     risk_confidence = compute_risk_confidence(
@@ -235,6 +340,7 @@ def run_cycle(
         "mirror_alerts": [asdict(a) for a in mirror_alerts],
         "clone_deployments": [asdict(d) for d in clone_deployments],
         "counter_clone_actions": [asdict(a) for a in counter_clone_actions],
+        "counter_clone_execution": counter_clone_execution,
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
         "risk_confidence": risk_confidence,

@@ -775,3 +775,79 @@ def test_run_cycle_fast_tracks_containment_with_high_confidence(tmp_path):
     assert state["risk_confidence"] > 0.2
     assert state["containment"] is not None
     assert "quarantine_host" in state["containment"]["actions_executed"]
+
+
+def test_run_cycle_executes_counter_clone_with_safety_whitelist(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    for event in [
+        {"host": "h-exec", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h-exec", "user": "svc", "process": "agent", "action": "model_invoke", "resource": "m1"},
+        {"host": "h-exec", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h-exec", "user": "svc", "process": "agent", "action": "network_send", "resource": "8.8.8.8"},
+    ]:
+        ingestor.ingest("model_api", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+                "clone_min_prediction_confidence": 0.6,
+                "clone_deploy_severity_threshold": 70,
+            }
+        )
+    )
+
+    assert state["counter_clone_execution"]
+    assert any(r["status"] == "executed" for r in state["counter_clone_execution"])
+
+    docs = TelemetryIngestor(index_path).read_recent(limit=200)
+    synthetic_events = [d for d in docs if d.get("source_type") == "clone_synthetic"]
+    assert synthetic_events
+    assert all(d.get("synthetic") is True for d in synthetic_events)
+    assert all(d.get("action") in {"read", "list", "model_invoke"} for d in synthetic_events)
+
+
+def test_run_cycle_skips_synthetic_events_in_detectors(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+
+    # Synthetic events should not trigger detector pipelines.
+    ingestor.ingest(
+        "clone_synthetic",
+        {
+            "host": "h-synth",
+            "user": "clone-shadow",
+            "process": "counter-clone",
+            "action": "model_invoke",
+            "resource": "synthetic://primary_path",
+            "synthetic": True,
+            "api_call_count": 999,
+            "egress_mb": 999,
+            "gpu_cpu": 99,
+        },
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+            }
+        )
+    )
+
+    assert state["events_processed"] == 1
+    assert state["alerts"] == []
+    assert state["graph_anomalies"] == []
+    assert state["honeypot_alerts"] == []
+    assert state["mirror_alerts"] == []
