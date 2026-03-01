@@ -55,7 +55,7 @@ def execute_counter_clone_actions(
                 host=target_host,
                 severity=70,
                 requested_actions=["disable_outbound_traffic", "forensic_snapshot_metadata"],
-                approvals=["alice", "bob"],
+                approvals=["user"],
                 simulation_mode=True,
             )
             _record(action, target, "executed", {"approved": result.approved, "actions": result.actions_executed})
@@ -193,7 +193,11 @@ def run_cycle(
         min_prediction_confidence=float(settings.get("clone_min_prediction_confidence", 0.65)),
         rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
     )
-    containment = ContainmentEngine(audit, identity_store=settings.get("approval_identity_store", {}))
+    containment = ContainmentEngine(
+        audit,
+        identity_store=settings.get("approval_identity_store", {}),
+        required_approvals=int(settings.get("approval_quorum", 1)),
+    )
     blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
 
@@ -322,7 +326,7 @@ def run_cycle(
             host=target_host,
             severity=candidate_severity,
             requested_actions=requested_actions,
-            approvals=["alice", "bob"],
+            approvals=list(settings.get("automated_approvers", ["user"])),
             simulation_mode=simulation_mode,
             hard_quarantine_threshold=int(settings.get("hard_quarantine_threshold", 90)),
             simulation_context={"blast_radius": asdict(blast_radius)},

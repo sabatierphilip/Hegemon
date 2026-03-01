@@ -14,10 +14,16 @@ class ContainmentResult:
 
 
 class ContainmentEngine:
-    def __init__(self, audit_log: ImmutableAuditLog, identity_store: dict[str, list[str]] | None = None):
+    def __init__(
+        self,
+        audit_log: ImmutableAuditLog,
+        identity_store: dict[str, list[str]] | None = None,
+        required_approvals: int = 1,
+    ):
         self.audit_log = audit_log
         self.contained_hosts: set[str] = set()
         self.identity_store = identity_store or {}
+        self.required_approvals = max(1, int(required_approvals))
         self._alias_lookup = self._build_alias_lookup(self.identity_store)
 
     def execute(
@@ -32,15 +38,20 @@ class ContainmentEngine:
         simulation_context: dict[str, Any] | None = None,
     ) -> ContainmentResult:
         unique_approvers = self._normalize_approvals(approvals)
-        if severity >= high_impact_threshold and len(unique_approvers) < 2:
+        if severity >= high_impact_threshold and len(unique_approvers) < self.required_approvals:
             self.audit_log.append("containment_denied", {
                 "host": host,
                 "severity": severity,
                 "requested_actions": requested_actions,
-                "reason": "two_person_approval_required",
+                "reason": "approval_quorum_required",
+                "required_approvals": self.required_approvals,
                 "normalized_approvals": sorted(unique_approvers),
             })
-            return ContainmentResult(False, [], "Containment denied: two-person approval required")
+            return ContainmentResult(
+                False,
+                [],
+                f"Containment denied: {self.required_approvals}-person approval quorum required",
+            )
 
         safe_actions = {
             "disable_outbound_traffic",

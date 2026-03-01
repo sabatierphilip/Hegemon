@@ -12,7 +12,7 @@ python scripts/start_sentinel.py
 
 What starts automatically:
 - Syslog UDP listener (`5514`)
-- JSONL ingestion watchers (`cloudtrail`, `network_flows`, `model_api`)
+- JSONL ingestion watchers (`cloudtrail`, `network_flows`, `model_api`, `osquery`, `kernel`, `runtime`, `hypervisor`, `counterclone`)
 - Periodic detection/correlation/containment cycles
 - Probabilistic MITRE-aware attack chain extraction
 - Learned graph edge novelty with temporal and structural drift scoring
@@ -46,7 +46,8 @@ Main settings are in `config/config.yaml`:
 - `force_hard_containment_threshold` and `force_hard_containment_blast_radius` to bypass simulation on high confidence/high blast-radius incidents
 - `hard_quarantine_threshold` to force quarantine at elevated severity
 - `fast_track_containment_threshold`/`fast_track_risk_confidence` for immediate containment based on multi-signal confidence
-- `ingestion.*` for real source locations and ports
+- `ingestion.*` for real source locations and ports across cloud, host, runtime, hypervisor, and counter-clone feeds
+- `approval_quorum` and `automated_approvers` to control single-person fast authorization
 - `honeypot_resources` for decoy assets that should never be accessed
 - `proto_agi_indicators` to tune high-risk autonomous behavior markers that trigger immediate containment
 - `audit_out_of_band_path` for append-only out-of-band audit sink
@@ -77,9 +78,9 @@ Notes:
 ## Security principles
 
 - Defensive-first containment with hard-response acceleration for high-risk incidents
-- Two-person approval for high-impact actions
+- Configurable approval quorum (default single-user for faster autonomous response)
 - Reversible actions where possible with stronger automatic isolation for severe events
-- Tamper-evident immutable hash-chain log
+- Tamper-evident immutable hash-chain logs plus telemetry event signature-chain verification
 - No offensive actions against external infrastructure
 
 ## Tests

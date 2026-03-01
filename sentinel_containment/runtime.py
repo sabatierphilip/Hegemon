@@ -59,6 +59,13 @@ class SentinelRuntime:
             rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
         )
 
+        extra_sources = {
+            "host_kernel": Path(ingest_cfg.get("kernel_events_file", "data/kernel_events.jsonl")),
+            "host_runtime": Path(ingest_cfg.get("runtime_events_file", "data/runtime_events.jsonl")),
+            "host_osquery": Path(ingest_cfg.get("osquery_file", "data/osquery_events.jsonl")),
+            "hypervisor": Path(ingest_cfg.get("hypervisor_events_file", "data/hypervisor_events.jsonl")),
+            "counterclone": Path(ingest_cfg.get("counterclone_events_file", "data/counterclone_events.jsonl")),
+        }
         self.ingestion_service = IngestionService(
             ingestor=ingestor,
             syslog_host=ingest_cfg.get("syslog_host", "0.0.0.0"),
@@ -66,6 +73,7 @@ class SentinelRuntime:
             cloudtrail_path=Path(ingest_cfg.get("cloudtrail_file", "data/cloudtrail.jsonl")),
             network_flow_path=Path(ingest_cfg.get("network_flow_file", "data/network_flows.jsonl")),
             model_api_path=Path(ingest_cfg.get("model_api_file", "data/model_api.jsonl")),
+            extra_sources=extra_sources,
         )
 
     def run_once(self) -> dict:

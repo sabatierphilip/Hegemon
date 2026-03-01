@@ -28,9 +28,16 @@ def test_rule_engine_detects_excessive_calls():
     assert any("Excessive Model API Calls" == a.rule for a in alerts)
 
 
-def test_containment_two_person_approval(tmp_path):
+def test_containment_defaults_to_single_user_approval(tmp_path):
     audit = ImmutableAuditLog(tmp_path / "audit.log")
     engine = ContainmentEngine(audit)
+    allowed = engine.execute("h1", 90, ["quarantine_host"], ["user"])
+    assert allowed.approved
+
+
+def test_containment_honors_configured_quorum(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    engine = ContainmentEngine(audit, required_approvals=2)
     denied = engine.execute("h1", 90, ["quarantine_host"], ["alice"])
     assert not denied.approved
     allowed = engine.execute("h1", 90, ["quarantine_host"], ["alice", "bob"])
@@ -71,6 +78,22 @@ def test_run_cycle_with_real_ingested_events(tmp_path):
     assert state["baseline_ready"] is False
     assert state["containment"] is None
 
+
+
+
+def test_telemetry_signature_chain_detects_tampering(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path, signing_key="test-key", key_rotation_seconds=60)
+    ingestor.ingest("hypervisor", {"host": "hv-1", "action": "vm_exit", "collector_level": "hypervisor"})
+    ingestor.ingest("counterclone", {"host": "h1", "action": "emit_synthetic_probe", "counterclone_participant": True})
+
+    assert ingestor.verify_recent(limit=10)
+
+    lines = index_path.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1].replace("emit_synthetic_probe", "emit_synthetic_probe_tampered")
+    index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert not ingestor.verify_recent(limit=10)
 
 def test_jsonl_source_and_syslog_parser(tmp_path):
     index_path = tmp_path / "index.jsonl"
@@ -424,7 +447,7 @@ def test_rule_engine_detects_distributed_near_threshold_burst():
 
 def test_containment_approval_normalization_avoids_same_identity_double_vote(tmp_path):
     audit = ImmutableAuditLog(tmp_path / "audit.log")
-    engine = ContainmentEngine(audit, identity_store={"alice": ["Alice", "alice@corp"]})
+    engine = ContainmentEngine(audit, identity_store={"alice": ["Alice", "alice@corp"]}, required_approvals=2)
     denied = engine.execute("h1", 95, ["quarantine_host"], ["Alice", "alice@corp"])
 
     assert not denied.approved
