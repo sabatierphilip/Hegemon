@@ -21,9 +21,17 @@ class GraphEdgeAnomaly:
 class GraphAnomalyDetector:
     """Learns graph edge behavior and flags temporal/structural outliers."""
 
-    def __init__(self, warmup_events: int = 5, novelty_weight: float = 1.6):
+    def __init__(
+        self,
+        warmup_events: int = 5,
+        novelty_weight: float = 1.6,
+        warmup_min_distinct_sources: int = 2,
+        warmup_min_relations: int = 1,
+    ):
         self.warmup_events = warmup_events
         self.novelty_weight = novelty_weight
+        self.warmup_min_distinct_sources = max(1, warmup_min_distinct_sources)
+        self.warmup_min_relations = max(1, warmup_min_relations)
         self._processed_events = 0
         self._known_edges: set[tuple[str, str, str]] = set()
         self._known_edge_patterns: set[tuple[str, str]] = set()
@@ -34,6 +42,8 @@ class GraphAnomalyDetector:
         self._embedding_var = [1.0, 1.0, 1.0, 1.0]
         self._embedding_seen = 0
         self._relation_ewma: dict[str, float] = defaultdict(float)
+        self._warmup_sources: set[str] = set()
+        self._warmup_relations: set[str] = set()
 
     def evaluate(self, event: dict[str, Any]) -> list[GraphEdgeAnomaly]:
         edge = self._event_edge(event)
@@ -69,7 +79,9 @@ class GraphAnomalyDetector:
         novelty_score = min(1.0, combined)
 
         anomalies: list[GraphEdgeAnomaly] = []
-        warmed_up = self._processed_events >= self.warmup_events
+        self._warmup_sources.add(source)
+        self._warmup_relations.add(relation)
+        warmed_up = self._is_warmed_up()
         if warmed_up and novelty_score >= 0.55:
             severity = min(97, 52 + int(novelty_score * 45))
             reason = (
@@ -91,6 +103,13 @@ class GraphAnomalyDetector:
         self._update_models(source, target, relation, key, edge_pattern, embedding, source_degree, target_degree)
         self._processed_events += 1
         return anomalies
+
+    def _is_warmed_up(self) -> bool:
+        return (
+            self._processed_events >= self.warmup_events
+            and len(self._warmup_sources) >= self.warmup_min_distinct_sources
+            and len(self._warmup_relations) >= self.warmup_min_relations
+        )
 
     def _update_models(
         self,

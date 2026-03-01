@@ -19,6 +19,7 @@ from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
 from sentinel_containment.security.hardware_keys import HardwareKeyVerifier
+from sentinel_containment.security.human_confirmation import HumanConfirmationVerifier
 from sentinel_containment.runtime import SentinelRuntime
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import JSONLinesFileSource, discover_live_file_sources, parse_syslog_line
@@ -80,6 +81,41 @@ def test_containment_defaults_to_single_user_approval(tmp_path):
     engine = ContainmentEngine(audit, hardware_key_verifier=HardwareKeyVerifier(cfg["trusted_hardware_public_keys"]))
     allowed = engine.execute("h1", 90, ["quarantine_host"], ["user"], signature_bundle=bundle)
     assert allowed.approved
+
+
+def test_containment_allows_non_hardware_path_with_verified_human_confirmation(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    shared_secret = "human-gate-secret"
+    confirmation = HumanConfirmationVerifier.build_confirmation_bundle(
+        shared_secret=shared_secret,
+        host="h1",
+        severity=90,
+        requested_actions=["quarantine_host"],
+        approvals=["user"],
+        nonce="n-1",
+    )
+    engine = ContainmentEngine(
+        audit,
+        human_confirmation_verifier=HumanConfirmationVerifier(shared_secret=shared_secret),
+    )
+    allowed = engine.execute(
+        "h1",
+        90,
+        ["quarantine_host"],
+        ["user"],
+        confirmation_bundle=confirmation,
+    )
+    assert allowed.approved
+
+
+def test_containment_denies_when_human_confirmation_missing(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    engine = ContainmentEngine(
+        audit,
+        human_confirmation_verifier=HumanConfirmationVerifier(shared_secret="human-gate-secret"),
+    )
+    denied = engine.execute("h1", 90, ["quarantine_host"], ["user"])
+    assert not denied.approved
 
 
 def test_containment_honors_configured_quorum(tmp_path):
@@ -405,6 +441,17 @@ def test_graph_detector_flags_novel_edges_after_warmup():
     assert no_alerts_1 == []
     assert no_alerts_2 == []
     assert alerts and "Graph edge outlier" in alerts[0].reason
+
+
+def test_graph_detector_warmup_requires_source_diversity_before_firing():
+    detector = GraphAnomalyDetector(warmup_events=1, warmup_min_distinct_sources=2)
+    first = detector.evaluate({"host": "h1", "user": "u1", "action": "model_invoke"})
+    second = detector.evaluate({"host": "h1", "user": "u1", "action": "iam_privilege_change"})
+    third = detector.evaluate({"host": "h9", "user": "intruder", "action": "iam_privilege_change"})
+
+    assert first == []
+    assert second == []
+    assert third
 
 
 def test_graph_detector_service_activity_does_not_alert_on_every_new_resource():

@@ -20,7 +20,7 @@ from sentinel_containment.detection.mirror_clone import MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
-from sentinel_containment.security import HardwareKeyVerifier
+from sentinel_containment.security import HardwareKeyVerifier, HumanConfirmationVerifier
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import IngestionService, discover_live_file_sources
 
@@ -111,6 +111,8 @@ class SentinelRuntime:
         self.graph_detector = GraphAnomalyDetector(
             warmup_events=int(settings.get("graph_warmup_events", 5)),
             novelty_weight=float(settings.get("graph_novelty_weight", 1.6)),
+            warmup_min_distinct_sources=int(settings.get("graph_warmup_min_distinct_sources", 2)),
+            warmup_min_relations=int(settings.get("graph_warmup_min_relations", 1)),
         )
         self.sequence_model = AttackSequenceModel(
             chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
@@ -132,6 +134,11 @@ class SentinelRuntime:
             identity_store=settings.get("approval_identity_store", {}),
             required_approvals=int(settings.get("approval_quorum", 1)),
             hardware_key_verifier=HardwareKeyVerifier(settings.get("trusted_hardware_public_keys", {})),
+            human_confirmation_verifier=HumanConfirmationVerifier(
+                shared_secret=str(settings.get("human_confirmation_shared_secret", "")),
+                prompt_count=int(settings.get("human_confirmation_prompt_count", 2)),
+                question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
+            ),
         )
 
         extra_sources = {
@@ -208,6 +215,9 @@ class SentinelRuntime:
             signature_bundle=event.get("containment_signature")
             if isinstance(event.get("containment_signature"), dict)
             else self.settings.get("containment_signature"),
+            confirmation_bundle=event.get("containment_confirmation")
+            if isinstance(event.get("containment_confirmation"), dict)
+            else self.settings.get("containment_confirmation"),
         )
         payload = {
             "host": host,

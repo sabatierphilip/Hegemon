@@ -20,6 +20,8 @@ web_rate_burst_limit: 6
 web_rate_burst_duration_seconds: 30.0
 graph_warmup_events: 5
 graph_novelty_weight: 1.6
+graph_warmup_min_distinct_sources: 2
+graph_warmup_min_relations: 1
 attack_chain_window_minutes: 30
 containment_simulation_mode: false
 hard_quarantine_threshold: 85
@@ -38,6 +40,10 @@ automated_approvers:
   - user
 trusted_hardware_public_keys: {}
 containment_signature: null
+human_confirmation_shared_secret: ""
+human_confirmation_prompt_count: 2
+human_confirmation_question_salt: human-presence-gate
+containment_confirmation: null
 ingestion:
   index_path: data/telemetry_index.jsonl
   syslog_host: 0.0.0.0
