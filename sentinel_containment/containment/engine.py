@@ -14,9 +14,11 @@ class ContainmentResult:
 
 
 class ContainmentEngine:
-    def __init__(self, audit_log: ImmutableAuditLog):
+    def __init__(self, audit_log: ImmutableAuditLog, identity_store: dict[str, list[str]] | None = None):
         self.audit_log = audit_log
         self.contained_hosts: set[str] = set()
+        self.identity_store = identity_store or {}
+        self._alias_lookup = self._build_alias_lookup(self.identity_store)
 
     def execute(
         self,
@@ -29,12 +31,14 @@ class ContainmentEngine:
         hard_quarantine_threshold: int = 90,
         simulation_context: dict[str, Any] | None = None,
     ) -> ContainmentResult:
-        if severity >= high_impact_threshold and len(set(approvals)) < 2:
+        unique_approvers = self._normalize_approvals(approvals)
+        if severity >= high_impact_threshold and len(unique_approvers) < 2:
             self.audit_log.append("containment_denied", {
                 "host": host,
                 "severity": severity,
                 "requested_actions": requested_actions,
                 "reason": "two_person_approval_required",
+                "normalized_approvals": sorted(unique_approvers),
             })
             return ContainmentResult(False, [], "Containment denied: two-person approval required")
 
@@ -66,6 +70,7 @@ class ContainmentEngine:
             "severity": severity,
             "actions": executed,
             "approvals": approvals,
+            "normalized_approvals": sorted(unique_approvers),
             "reversible": True,
             "offensive_actions": False,
             "simulation_mode": simulation_mode,
@@ -84,3 +89,23 @@ class ContainmentEngine:
             "dependent_assets_at_risk": impacted_assets,
             "recommendation": "Proceed with hard quarantine" if severity >= 90 else "Continue monitored containment",
         }
+
+    @staticmethod
+    def _normalize_identity(identity: str) -> str:
+        return "".join(ch for ch in identity.strip().lower() if ch.isalnum() or ch in {"@", "."})
+
+    def _build_alias_lookup(self, identity_store: dict[str, list[str]]) -> dict[str, str]:
+        lookup: dict[str, str] = {}
+        for canonical, aliases in identity_store.items():
+            canonical_norm = self._normalize_identity(canonical)
+            lookup[canonical_norm] = canonical_norm
+            for alias in aliases:
+                lookup[self._normalize_identity(alias)] = canonical_norm
+        return lookup
+
+    def _normalize_approvals(self, approvals: list[str]) -> set[str]:
+        normalized = set()
+        for identity in approvals:
+            key = self._normalize_identity(identity)
+            normalized.add(self._alias_lookup.get(key, key))
+        return {n for n in normalized if n}

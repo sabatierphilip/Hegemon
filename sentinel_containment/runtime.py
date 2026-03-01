@@ -10,6 +10,7 @@ from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
+from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.main import run_cycle
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
@@ -47,6 +48,7 @@ class SentinelRuntime:
         self.sequence_model = AttackSequenceModel(
             chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
         )
+        self.honeypot_detector = HoneypotDetector(settings.get("honeypot_resources", []))
 
         self.ingestion_service = IngestionService(
             ingestor=ingestor,
@@ -65,6 +67,7 @@ class SentinelRuntime:
             correlator=self.correlator,
             graph_detector=self.graph_detector,
             sequence_model=self.sequence_model,
+            honeypot_detector=self.honeypot_detector,
         )
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")

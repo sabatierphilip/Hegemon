@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,8 @@ class RuleEngine:
         self.dedup_window = timedelta(seconds=dedup_window_seconds)
         self._last_alert_seen: dict[tuple[str, str], datetime] = {}
         self._suppressed_count: dict[tuple[str, str], int] = {}
+        self._metric_history: dict[tuple[str, str, str], deque[tuple[datetime, float]]] = defaultdict(deque)
+        self._recent_events: dict[str, deque[tuple[datetime, str, float]]] = defaultdict(deque)
 
     def _load_rules(self) -> list[dict[str, Any]]:
         loaded = []
@@ -43,6 +46,10 @@ class RuleEngine:
                 for key, threshold in cond["greater_than"].items():
                     if float(event.get(key, 0)) <= float(threshold):
                         matches = False
+            if "dynamic_velocity" in cond:
+                matches = self._check_dynamic_velocity(rule, cond["dynamic_velocity"], event, event_time) or matches
+            if "distributed_burst" in cond:
+                matches = self._check_distributed_burst(rule, cond["distributed_burst"], event, event_time) or matches
             if matches:
                 rule_name = rule.get("title", "unnamed_rule")
                 key = (host, rule_name)
@@ -63,6 +70,66 @@ class RuleEngine:
                     )
                 )
         return alerts
+
+    def _check_dynamic_velocity(
+        self,
+        rule: dict[str, Any],
+        condition: dict[str, Any],
+        event: dict[str, Any],
+        event_time: datetime,
+    ) -> bool:
+        metric = str(condition.get("metric", "api_call_count"))
+        value = float(event.get(metric, 0) or 0)
+        identity_fields = condition.get("identity_fields", ["user", "host"])
+        identity = "|".join(str(event.get(field, "unknown")).strip().lower() for field in identity_fields)
+        history_key = (rule.get("title", "unnamed_rule"), identity, metric)
+        history = self._metric_history[history_key]
+
+        baseline_window = timedelta(seconds=int(condition.get("baseline_window_seconds", 900)))
+        while history and (event_time - history[0][0]) > baseline_window:
+            history.popleft()
+
+        values = [sample for _, sample in history]
+        min_samples = int(condition.get("min_samples", 4))
+        multiplier = float(condition.get("multiplier", 10.0))
+        baseline = (sum(values) / len(values)) if values else 0.0
+        is_burst = len(values) >= min_samples and baseline > 0 and value >= baseline * multiplier
+
+        history.append((event_time, value))
+        return is_burst
+
+    def _check_distributed_burst(
+        self,
+        rule: dict[str, Any],
+        condition: dict[str, Any],
+        event: dict[str, Any],
+        event_time: datetime,
+    ) -> bool:
+        metric = str(condition.get("metric", "api_call_count"))
+        value = float(event.get(metric, 0) or 0)
+        identity_field = str(condition.get("identity_field", "user"))
+        identity = str(event.get(identity_field, "unknown")).strip().lower()
+        rule_name = rule.get("title", "unnamed_rule")
+
+        window = timedelta(seconds=int(condition.get("baseline_window_seconds", 900)))
+        recent = self._recent_events[rule_name]
+        while recent and (event_time - recent[0][0]) > window:
+            recent.popleft()
+        recent.append((event_time, identity, value))
+
+        max_per_identity = float(condition.get("max_per_identity", 500))
+        min_total = float(condition.get("min_total_api_calls", 1200))
+        min_identities = int(condition.get("min_identities", 4))
+        under_threshold = [(ident, api) for _, ident, api in recent if api <= max_per_identity]
+        if not under_threshold:
+            return False
+        unique_identities = {ident for ident, _ in under_threshold}
+        aggregate_velocity = sum(api for _, api in under_threshold)
+        # Dynamic graph-ish behavior: many low-volume identities rising in lockstep.
+        return (
+            len(unique_identities) >= min_identities
+            and aggregate_velocity >= min_total
+        )
 
     @staticmethod
     def _event_timestamp(event: dict[str, Any]) -> datetime:

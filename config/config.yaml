@@ -23,3 +23,17 @@ ingestion:
   cloudtrail_file: data/cloudtrail.jsonl
   network_flow_file: data/network_flows.jsonl
   model_api_file: data/model_api.jsonl
+
+audit_out_of_band_path: logs/immutable_audit_oob.log
+honeypot_resources:
+  - decoy://llm-admin
+  - s3://sentinel-honeypot-secrets
+approval_identity_store:
+  alice:
+    - alice
+    - Alice
+    - alice@corp
+  bob:
+    - bob
+    - Bob
+    - bob@corp
