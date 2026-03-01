@@ -48,6 +48,27 @@ Main settings are in `config/config.yaml`:
 - `approval_identity_store` for canonical approval identity normalization
 - `dashboard_host`/`dashboard_port` for web UI
 
+
+## GitHub zip download + cryptographic sealing
+
+Use the helper script to download a GitHub zipball and unzip it with **automatic sealing during extraction**:
+
+```bash
+python scripts/download_and_seal_github_zip.py --repo owner/repo --ref main --output /tmp/repo_extract
+```
+
+You can also point it at an existing downloaded zip (sealing still runs automatically during unzip):
+
+```bash
+python scripts/download_and_seal_github_zip.py --zip /path/to/repo.zip --output /tmp/repo_extract
+```
+
+Notes:
+- Extracted files are not modified, so runtime behavior is preserved.
+- A `.seal/manifest.enc` file and `.seal/seal_meta.json` are created in the output directory automatically.
+- Default sealing key (AES-256-GCM, base64): `uPs8Q_C_nBEGtssLsy5cazP2PghacquTQ76hHL2FMiw=`.
+- "AES-800" is not a standardized AES mode/key-size; this tool uses AES-256-GCM.
+
 ## Security principles
 
 - Defensive-only containment
