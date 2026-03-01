@@ -39,10 +39,13 @@ Send syslog to UDP `5514`.
 ## Configuration
 
 Main settings are in `config/config.yaml`:
-- `refresh_minutes` for automated cycle frequency
+- `refresh_minutes` for baseline automated cycle frequency (defaults to 1 minute)
+- `burst_cycle_severity_threshold`/`burst_cycle_seconds` for sub-minute burst detection cadence during active incidents
 - `containment_severity_threshold` for auto containment
-- `containment_simulation_mode` to stage soft-containment before hard host quarantine
-- `hard_quarantine_threshold` to force quarantine only at critical severity
+- `containment_simulation_mode` to stage soft-containment before hard host quarantine (defaults to hard containment-first)
+- `force_hard_containment_threshold` and `force_hard_containment_blast_radius` to bypass simulation on high confidence/high blast-radius incidents
+- `hard_quarantine_threshold` to force quarantine at elevated severity
+- `fast_track_containment_threshold`/`fast_track_risk_confidence` for immediate containment based on multi-signal confidence
 - `ingestion.*` for real source locations and ports
 - `honeypot_resources` for decoy assets that should never be accessed
 - `proto_agi_indicators` to tune high-risk autonomous behavior markers that trigger immediate containment
@@ -73,11 +76,11 @@ Notes:
 
 ## Security principles
 
-- Defensive-only containment
+- Defensive-first containment with hard-response acceleration for high-risk incidents
 - Two-person approval for high-impact actions
-- Reversible actions
+- Reversible actions where possible with stronger automatic isolation for severe events
 - Tamper-evident immutable hash-chain log
-- No offensive actions
+- No offensive actions against external infrastructure
 
 ## Tests
 

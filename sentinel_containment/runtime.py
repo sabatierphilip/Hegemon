@@ -84,10 +84,13 @@ class SentinelRuntime:
         return state
 
     def _cycle_loop(self) -> None:
-        interval = int(self.settings.get("refresh_minutes", 5)) * 60
+        interval = int(self.settings.get("refresh_minutes", 1)) * 60
+        burst_threshold = int(self.settings.get("burst_cycle_severity_threshold", 80))
+        burst_interval_seconds = int(self.settings.get("burst_cycle_seconds", 20))
         while not self._stop.is_set():
-            self.run_once()
-            self._stop.wait(interval)
+            state = self.run_once()
+            cycle_interval = burst_interval_seconds if state.get("candidate_severity", 0) >= burst_threshold else interval
+            self._stop.wait(cycle_interval)
 
     def start(self) -> None:
         self.ingestion_service.start()

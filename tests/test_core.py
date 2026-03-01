@@ -721,3 +721,57 @@ def test_capture_rogue_clone_builds_behavioral_copy():
     assert clone.transition_model
     assert clone.likely_resources
     assert clone.behavioral_signature
+
+
+def test_should_simulate_containment_disables_simulation_for_high_risk():
+    from sentinel_containment.main import should_simulate_containment
+
+    settings = Settings(
+        {
+            "containment_simulation_mode": True,
+            "force_hard_containment_threshold": 80,
+            "force_hard_containment_blast_radius": 70,
+        }
+    )
+
+    assert should_simulate_containment(settings, severity=88, blast_radius_score=40, immediate=False) is False
+    assert should_simulate_containment(settings, severity=60, blast_radius_score=75, immediate=False) is False
+    assert should_simulate_containment(settings, severity=60, blast_radius_score=40, immediate=False) is True
+
+
+def test_run_cycle_fast_tracks_containment_with_high_confidence(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "h-fast",
+            "action": "model_invoke",
+            "api_call_count": 930,
+            "egress_mb": 980,
+            "gpu_cpu": 97,
+            "resource": "model-z",
+            "user": "svc-fast",
+        },
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "containment_severity_threshold": 95,
+                "fast_track_containment_threshold": 80,
+                "fast_track_risk_confidence": 0.2,
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 50,
+                "containment_simulation_mode": False,
+            }
+        )
+    )
+
+    assert state["baseline_ready"] is False
+    assert state["risk_confidence"] > 0.2
+    assert state["containment"] is not None
+    assert "quarantine_host" in state["containment"]["actions_executed"]

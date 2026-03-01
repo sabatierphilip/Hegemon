@@ -50,6 +50,8 @@ class ContainmentEngine:
             "pause_model_serving_container",
             "kill_active_model_sessions",
             "forensic_snapshot_metadata",
+            "sinkhole_suspicious_destinations",
+            "block_lateral_movement_paths",
         }
 
         executed = [a for a in requested_actions if a in safe_actions]

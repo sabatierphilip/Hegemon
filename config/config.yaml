@@ -1,6 +1,6 @@
 system_name: Sentinel-Containment
 simulated_mode: false
-refresh_minutes: 5
+refresh_minutes: 1
 anomaly_threshold: 2.0
 containment_severity_threshold: 70
 rules_path: rules
@@ -14,8 +14,15 @@ dashboard_port: 5000
 graph_warmup_events: 5
 graph_novelty_weight: 1.6
 attack_chain_window_minutes: 30
-containment_simulation_mode: true
-hard_quarantine_threshold: 90
+containment_simulation_mode: false
+hard_quarantine_threshold: 85
+force_hard_containment_threshold: 80
+force_hard_containment_blast_radius: 70
+fast_track_containment_threshold: 85
+fast_track_risk_confidence: 0.65
+hard_response_action_threshold: 85
+burst_cycle_severity_threshold: 80
+burst_cycle_seconds: 20
 ingestion:
   index_path: data/telemetry_index.jsonl
   syslog_host: 0.0.0.0
