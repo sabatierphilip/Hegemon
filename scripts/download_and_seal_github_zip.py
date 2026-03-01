@@ -22,8 +22,6 @@ from urllib.request import Request, urlopen
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-DEFAULT_SEAL_KEY_B64 = "uPs8Q_C_nBEGtssLsy5cazP2PghacquTQ76hHL2FMiw="
-
 
 @dataclass(frozen=True)
 class SealArtifact:
@@ -108,10 +106,15 @@ def _seal_manifest(manifest: dict, seal_dir: pathlib.Path, key_b64: str) -> Seal
     return SealArtifact(manifest_path=manifest_path, nonce_path=nonce_path, key_b64=key_b64)
 
 
-def extract_and_seal(zip_path: pathlib.Path, output_dir: pathlib.Path, key_b64: str = DEFAULT_SEAL_KEY_B64) -> SealArtifact:
+def _generate_key_b64() -> str:
+    return base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
+
+
+def extract_and_seal(zip_path: pathlib.Path, output_dir: pathlib.Path, key_b64: str | None = None) -> SealArtifact:
+    resolved_key_b64 = key_b64 or _generate_key_b64()
     _safe_extract(zip_path, output_dir)
     manifest = _build_manifest(output_dir)
-    return _seal_manifest(manifest, output_dir / ".seal", key_b64)
+    return _seal_manifest(manifest, output_dir / ".seal", resolved_key_b64)
 
 
 def _make_zip_url(repo: str, ref: str) -> str:
@@ -127,8 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Directory where the zip should be extracted")
     parser.add_argument(
         "--key",
-        default=DEFAULT_SEAL_KEY_B64,
-        help="Base64 key for AES-256-GCM sealing. Defaults to the fixed high-security key.",
+        help="Optional base64 key for AES-256-GCM sealing. If omitted, a random key is generated.",
     )
     return parser.parse_args()
 

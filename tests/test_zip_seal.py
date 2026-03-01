@@ -6,15 +6,15 @@ import zipfile
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from scripts.download_and_seal_github_zip import (
-    DEFAULT_SEAL_KEY_B64,
     _build_manifest,
+    _generate_key_b64,
     _safe_extract,
     _seal_manifest,
     extract_and_seal,
 )
 
 
-def test0_extract_auto_seals_with_fixed_key(tmp_path: pathlib.Path):
+def test0_extract_auto_seals_with_random_key(tmp_path: pathlib.Path):
     zip_path = tmp_path / "sample.zip"
     with zipfile.ZipFile(zip_path, "w") as archive:
         archive.writestr("repo-main/hello.txt", "hello")
@@ -22,9 +22,18 @@ def test0_extract_auto_seals_with_fixed_key(tmp_path: pathlib.Path):
     extracted = tmp_path / "out"
     artifact = extract_and_seal(zip_path, extracted)
 
-    assert artifact.key_b64 == DEFAULT_SEAL_KEY_B64
+    assert len(base64.urlsafe_b64decode(artifact.key_b64)) == 32
     assert (extracted / ".seal" / "manifest.enc").exists()
     assert (extracted / ".seal" / "seal_meta.json").exists()
+
+
+def test_generated_keys_are_unique_and_valid_length():
+    key_a = _generate_key_b64()
+    key_b = _generate_key_b64()
+
+    assert key_a != key_b
+    assert len(base64.urlsafe_b64decode(key_a)) == 32
+    assert len(base64.urlsafe_b64decode(key_b)) == 32
 
 
 def test_extract_and_seal_manifest_roundtrip(tmp_path: pathlib.Path):
@@ -39,7 +48,8 @@ def test_extract_and_seal_manifest_roundtrip(tmp_path: pathlib.Path):
     extracted = tmp_path / "out"
     _safe_extract(zip_path, extracted)
     manifest = _build_manifest(extracted)
-    artifact = _seal_manifest(manifest, extracted / ".seal", DEFAULT_SEAL_KEY_B64)
+    key_b64 = _generate_key_b64()
+    artifact = _seal_manifest(manifest, extracted / ".seal", key_b64)
 
     meta = json.loads(artifact.nonce_path.read_text())
     nonce = base64.urlsafe_b64decode(meta["nonce_b64"])
