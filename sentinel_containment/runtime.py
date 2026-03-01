@@ -48,7 +48,10 @@ class SentinelRuntime:
         self.sequence_model = AttackSequenceModel(
             chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
         )
-        self.honeypot_detector = HoneypotDetector(settings.get("honeypot_resources", []))
+        self.honeypot_detector = HoneypotDetector(
+            settings.get("honeypot_resources", []),
+            settings.get("proto_agi_indicators", []),
+        )
 
         self.ingestion_service = IngestionService(
             ingestor=ingestor,
