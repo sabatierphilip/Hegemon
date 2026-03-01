@@ -13,7 +13,7 @@ from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
-from sentinel_containment.detection.mirror_clone import MirrorCloneDetector
+from sentinel_containment.detection.mirror_clone import MirrorCloneDetector, ReconDirective
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
@@ -68,7 +68,7 @@ def execute_counter_clone_actions(
         if action == "emit_synthetic_probe":
             sequence = deployment.get("synthetic_probe_sequence", [])
             probe = next((p for p in sequence if str(p.get("resource", "")) == target), None)
-            probe_action = str((probe or {}).get("action", "unknown")).strip().lower()
+            probe_action = str((probe or {}).get("action", "list")).strip().lower()
             if probe_action not in CLONE_ALLOWED_SYNTHETIC_ACTIONS:
                 _record(action, target, "dropped", {"reason": "action_not_whitelisted", "candidate": probe_action})
                 continue
@@ -86,6 +86,27 @@ def execute_counter_clone_actions(
                 },
             )
             _record(action, target, "executed", {"event_action": probe_action})
+            continue
+
+        if action == "launch_autonomous_recon":
+            ingestor.ingest(
+                "clone_synthetic",
+                {
+                    "host": simulated_host,
+                    "user": "clone-hunter",
+                    "process": "counter-clone",
+                    "action": "list",
+                    "resource": f"synthetic://hunter/{target}",
+                    "synthetic": True,
+                    "counterclone_participant": True,
+                    "clone_deployment_id": deployment.get("deployment_id", "autonomous-recon"),
+                },
+            )
+            _record(action, target, "executed", {"mode": "active_hunt"})
+            continue
+
+        if action == "backmodel_markov_kill_chain":
+            _record(action, target, "executed", {"model": "markov", "status": "updated"})
             continue
 
         if action == "run_phase":
@@ -211,6 +232,7 @@ def run_cycle(
     clone_deployments = []
     counter_clone_actions = []
     counter_clone_execution = []
+    autonomous_recon_directives = []
 
     for event in detector_events:
         rule_alerts.extend(rules.evaluate(event))
@@ -271,6 +293,36 @@ def run_cycle(
                         audit=audit,
                     )
                 )
+
+    autonomous_recon_directives = [
+        asdict(d)
+        for d in mirror_clone_detector.generate_autonomous_recon_directives(
+            max_directives=int(settings.get("autonomous_recon_max_directives", 4)),
+            min_markov_score=float(settings.get("autonomous_recon_min_markov_score", 0.35)),
+        )
+    ]
+    for directive in autonomous_recon_directives:
+        planned_actions = mirror_clone_detector.execute_recon_directive(ReconDirective(**directive))
+        counter_clone_actions.extend(planned_actions)
+        counter_clone_execution.extend(
+            execute_counter_clone_actions(
+                actions=[asdict(a) for a in planned_actions],
+                deployment={
+                    "deployment_id": f"recon::{directive['shard']}",
+                    "shard": directive["shard"],
+                    "synthetic_probe_sequence": [
+                        {
+                            "host": directive["shard"].split("|", 1)[0].replace("host:", ""),
+                            "action": "list",
+                            "resource": "synthetic://hunter/recon",
+                        }
+                    ],
+                },
+                containment=containment,
+                ingestor=ingestor,
+                audit=audit,
+            )
+        )
 
     immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
     risk_confidence = compute_risk_confidence(
@@ -354,6 +406,7 @@ def run_cycle(
         "clone_deployments": [asdict(d) for d in clone_deployments],
         "counter_clone_actions": [asdict(a) for a in counter_clone_actions],
         "counter_clone_execution": counter_clone_execution,
+        "autonomous_recon_directives": autonomous_recon_directives,
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
         "risk_confidence": risk_confidence,

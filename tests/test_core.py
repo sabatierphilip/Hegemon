@@ -1003,3 +1003,53 @@ def test_runtime_fast_lane_event_executes_immediate_containment(tmp_path):
     assert "quarantine_host" in result["actions_executed"]
     docs = runtime.ingestor.read_recent(limit=5)
     assert any(doc.get("source_type") == "honeypot_interrupt" for doc in docs)
+
+
+def test_mirror_clone_generates_autonomous_recon_directives():
+    detector = MirrorCloneDetector(warmup_events=1)
+    events = [
+        {"host": "hunt-1", "user": "svc", "process": "agent", "action": "login_failure", "resource": "ssh"},
+        {"host": "hunt-1", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "ctr-a"},
+        {"host": "hunt-1", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-1", "user": "svc", "process": "agent", "action": "network_send", "resource": "8.8.8.8"},
+    ]
+    for event in events:
+        detector.evaluate(event)
+
+    directives = detector.generate_autonomous_recon_directives(max_directives=2, min_markov_score=0.2)
+
+    assert directives
+    assert directives[0].markov_kill_chain_score >= 0.2
+    actions = detector.execute_recon_directive(directives[0])
+    assert any(a.action == "launch_autonomous_recon" for a in actions)
+    assert any(a.action == "backmodel_markov_kill_chain" for a in actions)
+
+
+def test_run_cycle_emits_autonomous_recon_directives(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    for event in [
+        {"host": "hunt-2", "user": "svc", "process": "agent", "action": "login_failure", "resource": "ssh"},
+        {"host": "hunt-2", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "ctr-a"},
+        {"host": "hunt-2", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-2", "user": "svc", "process": "agent", "action": "network_send", "resource": "8.8.8.8"},
+    ]:
+        ingestor.ingest("model_api", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+                "autonomous_recon_min_markov_score": 0.2,
+            }
+        )
+    )
+
+    assert state["autonomous_recon_directives"]
+    assert any(a["action"] == "launch_autonomous_recon" for a in state["counter_clone_actions"])
+    assert any(r["action"] == "backmodel_markov_kill_chain" for r in state["counter_clone_execution"])
