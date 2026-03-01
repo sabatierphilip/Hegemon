@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import http.server
 import json
 import logging
+import os
 import socketserver
 import threading
 import time
@@ -12,6 +14,46 @@ from typing import Any, Callable
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 
 logger = logging.getLogger(__name__)
+
+
+def discover_live_file_sources(existing: dict[str, Path] | None = None) -> dict[str, Path]:
+    existing = existing or {}
+    discovered: dict[str, Path] = {}
+
+    env_dirs = os.getenv("TELEMETRY_AUTODISCOVER_DIRS", "")
+    candidate_dirs = [Path("data"), Path("/var/log")]
+    candidate_dirs.extend(Path(part.strip()) for part in env_dirs.split(",") if part.strip())
+
+    candidates = {
+        "cloud_audit": ("cloudtrail.jsonl", "audit.jsonl"),
+        "network_flow": ("network_flows.jsonl", "netflow.jsonl"),
+        "model_api": ("model_api.jsonl", "model_events.jsonl"),
+        "host_osquery": ("osquery_events.jsonl",),
+        "host_kernel": ("kernel_events.jsonl",),
+        "host_runtime": ("runtime_events.jsonl",),
+        "hypervisor": ("hypervisor_events.jsonl",),
+        "counterclone": ("counterclone_events.jsonl",),
+    }
+    known = {str(path.resolve()) for path in existing.values()}
+    for source_type, names in candidates.items():
+        if source_type in existing:
+            continue
+        for directory in candidate_dirs:
+            for name in names:
+                path = directory / name
+                try:
+                    resolved = str(path.resolve())
+                except FileNotFoundError:
+                    resolved = str(path.absolute())
+                if resolved in known:
+                    continue
+                if path.exists():
+                    discovered[source_type] = path
+                    known.add(resolved)
+                    break
+            if source_type in discovered:
+                break
+    return discovered
 
 
 class SyslogUDPHandler(socketserver.BaseRequestHandler):
@@ -28,6 +70,66 @@ class SyslogUDPServer(socketserver.ThreadingUDPServer):
     def __init__(self, host: str, port: int, ingestor: TelemetryIngestor):
         self.ingestor = ingestor
         super().__init__((host, port), SyslogUDPHandler)
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class PushWebhookHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802 - standard handler name
+        server: "PushWebhookServer" = self.server  # type: ignore[assignment]
+        if self.path != server.path:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":"invalid_json"}')
+            return
+
+        if not isinstance(payload, dict):
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":"event_must_be_object"}')
+            return
+
+        server.ingestor.ingest(server.source_type, payload)
+        if server.on_event:
+            try:
+                server.on_event(payload)
+            except Exception:  # pragma: no cover - never break ingestion on callback failure
+                logger.exception("Push webhook callback failed")
+        self.send_response(202)
+        self.end_headers()
+        self.wfile.write(b'{"accepted":true}')
+
+    def log_message(self, fmt: str, *args: object) -> None:  # noqa: A003 - inherited name
+        logger.debug("push-webhook %s", fmt % args)
+
+
+class PushWebhookServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        ingestor: TelemetryIngestor,
+        source_type: str,
+        path: str,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ):
+        self.ingestor = ingestor
+        self.source_type = source_type
+        self.path = path
+        self.on_event = on_event
+        super().__init__((host, port), PushWebhookHandler)
 
 
 def parse_syslog_line(line: str) -> dict[str, Any]:
@@ -104,9 +206,21 @@ class IngestionService:
         network_flow_path: Path,
         model_api_path: Path,
         extra_sources: dict[str, Path] | None = None,
+        kernel_webhook_host: str = "0.0.0.0",
+        kernel_webhook_port: int = 5515,
+        kernel_webhook_path: str = "/kernel-event",
+        on_kernel_event: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.ingestor = ingestor
         self.syslog_server = SyslogUDPServer(syslog_host, syslog_port, ingestor)
+        self.kernel_webhook_server = PushWebhookServer(
+            kernel_webhook_host,
+            kernel_webhook_port,
+            ingestor,
+            source_type="host_kernel",
+            path=kernel_webhook_path,
+            on_event=on_kernel_event,
+        )
         self.file_sources = [
             JSONLinesFileSource(cloudtrail_path, "cloud_audit", ingestor),
             JSONLinesFileSource(network_flow_path, "network_flow", ingestor),
@@ -121,6 +235,10 @@ class IngestionService:
         udp_thread.start()
         self._threads.append(udp_thread)
 
+        kernel_thread = threading.Thread(target=self.kernel_webhook_server.serve_forever, daemon=True)
+        kernel_thread.start()
+        self._threads.append(kernel_thread)
+
         for source in self.file_sources:
             t = threading.Thread(target=source.run_forever, daemon=True)
             t.start()
@@ -129,3 +247,5 @@ class IngestionService:
     def stop(self) -> None:
         self.syslog_server.shutdown()
         self.syslog_server.server_close()
+        self.kernel_webhook_server.shutdown()
+        self.kernel_webhook_server.server_close()

@@ -163,7 +163,7 @@ def run_cycle(
 ) -> dict:
     out_of_band = settings.get("audit_out_of_band_path")
     audit = ImmutableAuditLog(out_of_band_path=Path(out_of_band) if out_of_band else None)
-    mapper = AssetMapper(CloudProviderAdapter(simulated=settings.get("simulated_mode", False)))
+    mapper = AssetMapper(CloudProviderAdapter(simulated=bool(settings.get("simulated_mode", False))))
     topology = mapper.snapshot()
 
     ingestor = TelemetryIngestor(Path(settings.get("telemetry_index_path", "data/telemetry_index.jsonl")))
@@ -370,7 +370,7 @@ def run_cycle(
 
 def run_forever(config_path: str = "config/config.yaml") -> None:
     settings = Settings.load(config_path)
-    interval = int(settings.get("refresh_minutes", 1)) * 60
+    base_interval = float(settings.get("continuous_cycle_sleep_seconds", 0.25))
     baseline = BehavioralBaseline(
         threshold=float(settings.get("anomaly_threshold", 2.0)),
         window=int(settings.get("baseline_window", 30)),
@@ -407,9 +407,9 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
             mirror_clone_detector=mirror_clone_detector,
         )
         burst_threshold = int(settings.get("burst_cycle_severity_threshold", 80))
-        burst_interval_seconds = int(settings.get("burst_cycle_seconds", 20))
-        cycle_interval = burst_interval_seconds if state.get("candidate_severity", 0) >= burst_threshold else interval
-        time.sleep(cycle_interval)
+        burst_interval_seconds = float(settings.get("burst_cycle_seconds", 0.1))
+        cycle_interval = burst_interval_seconds if state.get("candidate_severity", 0) >= burst_threshold else base_interval
+        time.sleep(max(0.0, cycle_interval))
 
 
 if __name__ == "__main__":

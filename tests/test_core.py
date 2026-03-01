@@ -13,7 +13,7 @@ from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
 from sentinel_containment.runtime import SentinelRuntime
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
-from sentinel_containment.telemetry.sources import JSONLinesFileSource, parse_syslog_line
+from sentinel_containment.telemetry.sources import JSONLinesFileSource, discover_live_file_sources, parse_syslog_line
 
 
 def test_asset_snapshot_contains_nodes(tmp_path):
@@ -939,3 +939,67 @@ def test_counterclone_context_feeds_dynamic_automodeller_without_false_positives
 
     assert anomalies
     assert anomalies[0].metric == "counterclone_activity"
+
+
+def test_cloud_adapter_returns_local_instance_without_simulation():
+    adapter = CloudProviderAdapter(simulated=False, provider="local")
+    instances = adapter.list_instances()
+    assert instances
+    assert instances[0]["provider"] == "local"
+
+
+def test_discover_live_file_sources_finds_present_inputs(tmp_path):
+    import os
+
+    cloudtrail = tmp_path / "cloudtrail.jsonl"
+    cloudtrail.write_text('{"host":"h1","action":"read"}\n', encoding="utf-8")
+
+    old = os.environ.get("TELEMETRY_AUTODISCOVER_DIRS")
+    os.environ["TELEMETRY_AUTODISCOVER_DIRS"] = str(tmp_path)
+    try:
+        discovered = discover_live_file_sources(existing={})
+    finally:
+        if old is None:
+            os.environ.pop("TELEMETRY_AUTODISCOVER_DIRS", None)
+        else:
+            os.environ["TELEMETRY_AUTODISCOVER_DIRS"] = old
+
+    assert discovered.get("cloud_audit") == cloudtrail
+
+
+def test_runtime_fast_lane_event_executes_immediate_containment(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    runtime = SentinelRuntime(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "fast_lane": {"enabled": False},
+                "ingestion": {
+                    "syslog_host": "127.0.0.1",
+                    "syslog_port": 0,
+                    "kernel_webhook_host": "127.0.0.1",
+                    "kernel_webhook_port": 0,
+                    "cloudtrail_file": str(tmp_path / "c.jsonl"),
+                    "network_flow_file": str(tmp_path / "n.jsonl"),
+                    "model_api_file": str(tmp_path / "m.jsonl"),
+                },
+            }
+        )
+    )
+
+    result = runtime.process_priority_event(
+        {
+            "host": "prod-model-urgent",
+            "severity": 96,
+            "honeypot_trigger": True,
+            "source_type": "honeypot_interrupt",
+        }
+    )
+
+    assert result["approved"] is True
+    assert "quarantine_host" in result["actions_executed"]
+    docs = runtime.ingestor.read_recent(limit=5)
+    assert any(doc.get("source_type") == "honeypot_interrupt" for doc in docs)

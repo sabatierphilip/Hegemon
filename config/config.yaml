@@ -1,6 +1,6 @@
 system_name: Sentinel-Containment
 simulated_mode: false
-refresh_minutes: 1
+continuous_cycle_sleep_seconds: 0.25
 anomaly_threshold: 2.0
 containment_severity_threshold: 70
 rules_path: rules
@@ -22,7 +22,7 @@ fast_track_containment_threshold: 85
 fast_track_risk_confidence: 0.65
 hard_response_action_threshold: 85
 burst_cycle_severity_threshold: 80
-burst_cycle_seconds: 20
+burst_cycle_seconds: 0.1
 approval_quorum: 1
 automated_approvers:
   - user
@@ -30,6 +30,9 @@ ingestion:
   index_path: data/telemetry_index.jsonl
   syslog_host: 0.0.0.0
   syslog_port: 5514
+  kernel_webhook_host: 0.0.0.0
+  kernel_webhook_port: 5515
+  kernel_webhook_path: /kernel-event
   cloudtrail_file: data/cloudtrail.jsonl
   network_flow_file: data/network_flows.jsonl
   model_api_file: data/model_api.jsonl
@@ -55,3 +58,12 @@ approval_identity_store:
     - user
     - User
     - user@corp
+
+fast_lane:
+  enabled: true
+  host: 0.0.0.0
+  port: 9443
+  path: /fast-lane/event
+  server_cert_path: certs/fastlane-server.crt
+  server_key_path: certs/fastlane-server.key
+  client_ca_cert_path: certs/fastlane-client-ca.crt
