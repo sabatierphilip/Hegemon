@@ -41,15 +41,26 @@ class RuleEngine:
         host = event.get("host", "unknown")
         for rule in self.rules:
             cond = rule.get("detection", {})
-            matches = all(event.get(k) == v for k, v in cond.get("equals", {}).items())
-            if "greater_than" in cond:
-                for key, threshold in cond["greater_than"].items():
-                    if float(event.get(key, 0)) <= float(threshold):
-                        matches = False
+            equals = cond.get("equals", {})
+            base_matches = all(event.get(k) == v for k, v in equals.items()) if equals else True
+
+            threshold_matches: list[bool] = []
+            greater_than = cond.get("greater_than", {})
+            if greater_than:
+                gt_ok = True
+                for key, threshold in greater_than.items():
+                    event_value = self._safe_float(event.get(key), default=0.0)
+                    threshold_value = self._safe_float(threshold, default=0.0)
+                    if event_value <= threshold_value:
+                        gt_ok = False
+                        break
+                threshold_matches.append(gt_ok)
             if "dynamic_velocity" in cond:
-                matches = self._check_dynamic_velocity(rule, cond["dynamic_velocity"], event, event_time) or matches
+                threshold_matches.append(self._check_dynamic_velocity(rule, cond["dynamic_velocity"], event, event_time))
             if "distributed_burst" in cond:
-                matches = self._check_distributed_burst(rule, cond["distributed_burst"], event, event_time) or matches
+                threshold_matches.append(self._check_distributed_burst(rule, cond["distributed_burst"], event, event_time))
+
+            matches = base_matches and (any(threshold_matches) if threshold_matches else True)
             if matches:
                 rule_name = rule.get("title", "unnamed_rule")
                 key = (host, rule_name)
@@ -79,7 +90,7 @@ class RuleEngine:
         event_time: datetime,
     ) -> bool:
         metric = str(condition.get("metric", "api_call_count"))
-        value = float(event.get(metric, 0) or 0)
+        value = self._safe_float(event.get(metric), default=0.0)
         identity_fields = condition.get("identity_fields", ["user", "host"])
         identity = "|".join(str(event.get(field, "unknown")).strip().lower() for field in identity_fields)
         history_key = (rule.get("title", "unnamed_rule"), identity, metric)
@@ -106,7 +117,7 @@ class RuleEngine:
         event_time: datetime,
     ) -> bool:
         metric = str(condition.get("metric", "api_call_count"))
-        value = float(event.get(metric, 0) or 0)
+        value = self._safe_float(event.get(metric), default=0.0)
         identity_field = str(condition.get("identity_field", "user"))
         identity = str(event.get(identity_field, "unknown")).strip().lower()
         rule_name = rule.get("title", "unnamed_rule")
@@ -130,6 +141,14 @@ class RuleEngine:
             len(unique_identities) >= min_identities
             and aggregate_velocity >= min_total
         )
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return default
+        return numeric
 
     @staticmethod
     def _event_timestamp(event: dict[str, Any]) -> datetime:

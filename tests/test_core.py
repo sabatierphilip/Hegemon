@@ -1276,3 +1276,90 @@ def test_run_cycle_emits_autonomous_recon_directives(tmp_path):
     assert state["autonomous_recon_directives"]
     assert any(a["action"] == "launch_autonomous_recon" for a in state["counter_clone_actions"])
     assert any(r["action"] == "backmodel_markov_kill_chain" for r in state["counter_clone_execution"])
+
+
+def test_baseline_ignores_non_numeric_metrics_without_crashing():
+    baseline = BehavioralBaseline(threshold=2.0, window=10, min_history=2)
+
+    baseline.update_and_detect("h1", {"api_call_rate": "100"})
+    baseline.update_and_detect("h1", {"api_call_rate": None, "gpu": "not-a-number"})
+    anomalies = baseline.update_and_detect("h1", {"api_call_rate": "350"})
+
+    assert isinstance(anomalies, list)
+    assert len(baseline.series[("h1", "api_call_rate")]) == 2
+    assert ("h1", "gpu") not in baseline.series
+
+
+def test_rule_engine_applies_threshold_conditions_consistently(tmp_path):
+    rules_path = tmp_path / "rules"
+    rules_path.mkdir()
+    (rules_path / "strict_rule.yaml").write_text(
+        """
+        title: Strict Threshold Rule
+        description: requires static and dynamic thresholds
+        severity: 90
+        detection:
+          equals:
+            action: model_invoke
+          greater_than:
+            api_call_count: 500
+          dynamic_velocity:
+            metric: api_call_count
+            baseline_window_seconds: 3600
+            min_samples: 2
+            multiplier: 2
+            identity_fields:
+              - user
+              - host
+        """,
+        encoding="utf-8",
+    )
+
+    engine = RuleEngine(rules_path=rules_path, dedup_window_seconds=0)
+    event = {"host": "h1", "user": "svc", "action": "model_invoke", "api_call_count": 100}
+    engine.evaluate({**event, "@timestamp": "2024-01-01T00:00:00+00:00"})
+    engine.evaluate({**event, "@timestamp": "2024-01-01T00:01:00+00:00"})
+
+    precondition_alerts = engine.evaluate({**event, "@timestamp": "2024-01-01T00:02:00+00:00", "api_call_count": 260})
+    assert precondition_alerts
+
+    mismatch = engine.evaluate({**event, "@timestamp": "2024-01-01T00:03:00+00:00", "action": "network_send", "api_call_count": 900})
+    assert mismatch == []
+
+    alerts = engine.evaluate({**event, "@timestamp": "2024-01-01T00:04:00+00:00", "api_call_count": 600})
+    assert alerts and alerts[0].rule == "Strict Threshold Rule"
+
+
+def test_rule_engine_handles_non_numeric_threshold_values_gracefully(tmp_path):
+    rules_path = tmp_path / "rules"
+    rules_path.mkdir()
+    (rules_path / "safe_gt.yaml").write_text(
+        """
+        title: Safe Greater Than
+        detection:
+          greater_than:
+            api_call_count: 10
+        """,
+        encoding="utf-8",
+    )
+
+    engine = RuleEngine(rules_path=rules_path)
+    alerts = engine.evaluate({"api_call_count": "not-a-number"})
+    assert alerts == []
+
+
+def test_graph_detector_bounds_tracked_edge_memory():
+    detector = GraphAnomalyDetector(warmup_events=0, max_tracked_edges=50)
+
+    for i in range(200):
+        detector.evaluate(
+            {
+                "host": f"h{i}",
+                "user": f"u{i}",
+                "action": "model_invoke",
+                "resource": f"r{i}",
+            }
+        )
+
+    assert len(detector._known_edges) <= 50
+    assert len(detector._edge_order) <= 50

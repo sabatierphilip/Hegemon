@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -27,16 +27,21 @@ class GraphAnomalyDetector:
         novelty_weight: float = 1.6,
         warmup_min_distinct_sources: int = 2,
         warmup_min_relations: int = 1,
+        max_tracked_edges: int = 20000,
     ):
         self.warmup_events = warmup_events
         self.novelty_weight = novelty_weight
         self.warmup_min_distinct_sources = max(1, warmup_min_distinct_sources)
         self.warmup_min_relations = max(1, warmup_min_relations)
+        self.max_tracked_edges = max(1, int(max_tracked_edges))
         self._processed_events = 0
         self._known_edges: set[tuple[str, str, str]] = set()
+        self._edge_order: deque[tuple[str, str, str]] = deque()
         self._known_edge_patterns: set[tuple[str, str]] = set()
+        self._edge_pattern_counts: dict[tuple[str, str], int] = defaultdict(int)
         self._node_degree: dict[str, int] = {}
         self._neighbors: dict[str, set[str]] = defaultdict(set)
+        self._pair_counts: dict[tuple[str, str], int] = defaultdict(int)
         self._relation_counts: dict[str, int] = defaultdict(int)
         self._embedding_mean = [0.0, 0.0, 0.0, 0.0]
         self._embedding_var = [1.0, 1.0, 1.0, 1.0]
@@ -122,12 +127,18 @@ class GraphAnomalyDetector:
         source_degree: int,
         target_degree: int,
     ) -> None:
-        self._known_edges.add(key)
+        if key not in self._known_edges:
+            self._known_edges.add(key)
+            self._edge_order.append(key)
+
         self._known_edge_patterns.add(edge_pattern)
+        self._edge_pattern_counts[edge_pattern] += 1
         self._node_degree[source] = source_degree + 1
         self._node_degree[target] = target_degree + 1
         self._neighbors[source].add(target)
         self._neighbors[target].add(source)
+        pair = tuple(sorted((source, target)))
+        self._pair_counts[pair] += 1
         self._relation_counts[relation] += 1
 
         alpha = 0.3
@@ -140,6 +151,49 @@ class GraphAnomalyDetector:
             delta = value - self._embedding_mean[i]
             self._embedding_mean[i] += delta / self._embedding_seen
             self._embedding_var[i] = max(1e-6, ((self._embedding_seen - 1) * self._embedding_var[i] + delta * (value - self._embedding_mean[i])) / self._embedding_seen)
+
+        self._evict_edges_if_needed()
+
+    def _evict_edges_if_needed(self) -> None:
+        while len(self._known_edges) > self.max_tracked_edges:
+            old_source, old_target, old_relation = self._edge_order.popleft()
+            old_key = (old_source, old_target, old_relation)
+            if old_key not in self._known_edges:
+                continue
+            self._known_edges.remove(old_key)
+
+            old_pattern = (old_source, old_relation)
+            pattern_count = self._edge_pattern_counts.get(old_pattern, 0)
+            if pattern_count <= 1:
+                self._edge_pattern_counts.pop(old_pattern, None)
+                self._known_edge_patterns.discard(old_pattern)
+            else:
+                self._edge_pattern_counts[old_pattern] = pattern_count - 1
+
+            self._relation_counts[old_relation] = max(0, self._relation_counts.get(old_relation, 0) - 1)
+            if self._relation_counts[old_relation] == 0:
+                self._relation_counts.pop(old_relation, None)
+                self._relation_ewma.pop(old_relation, None)
+
+            self._node_degree[old_source] = max(0, self._node_degree.get(old_source, 0) - 1)
+            self._node_degree[old_target] = max(0, self._node_degree.get(old_target, 0) - 1)
+            if self._node_degree.get(old_source, 0) == 0:
+                self._node_degree.pop(old_source, None)
+                self._neighbors.pop(old_source, None)
+            if self._node_degree.get(old_target, 0) == 0:
+                self._node_degree.pop(old_target, None)
+                self._neighbors.pop(old_target, None)
+
+            pair = tuple(sorted((old_source, old_target)))
+            pair_count = self._pair_counts.get(pair, 0)
+            if pair_count <= 1:
+                self._pair_counts.pop(pair, None)
+                if old_source in self._neighbors:
+                    self._neighbors[old_source].discard(old_target)
+                if old_target in self._neighbors:
+                    self._neighbors[old_target].discard(old_source)
+            else:
+                self._pair_counts[pair] = pair_count - 1
 
     def _edge_embedding(self, source: str, target: str, relation: str) -> list[float]:
         src_degree = float(self._node_degree.get(source, 0))
