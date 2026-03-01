@@ -31,15 +31,12 @@ class SyslogUDPServer(socketserver.ThreadingUDPServer):
 
 
 def parse_syslog_line(line: str) -> dict[str, Any]:
-    # Minimal parser for common RFC3164-ish format:
-    # <PRI>TIMESTAMP HOST PROCESS: message
     host = "unknown"
     process = "syslog"
     action = "log"
     message = line
 
     parts = line.split()
-    # Handle common RFC3164 tokens: <PRI>Mon dd hh:mm:ss host process: msg
     if len(parts) >= 5:
         host = parts[3]
         proc_part = parts[4]
@@ -55,6 +52,8 @@ def parse_syslog_line(line: str) -> dict[str, Any]:
         "resource": "system",
         "message": message,
         "raw": line,
+        "collector_level": "os",
+        "telemetry_scope": "syslog",
     }
 
 
@@ -104,6 +103,7 @@ class IngestionService:
         cloudtrail_path: Path,
         network_flow_path: Path,
         model_api_path: Path,
+        extra_sources: dict[str, Path] | None = None,
     ):
         self.ingestor = ingestor
         self.syslog_server = SyslogUDPServer(syslog_host, syslog_port, ingestor)
@@ -112,6 +112,8 @@ class IngestionService:
             JSONLinesFileSource(network_flow_path, "network_flow", ingestor),
             JSONLinesFileSource(model_api_path, "model_api", ingestor),
         ]
+        for source_type, path in (extra_sources or {}).items():
+            self.file_sources.append(JSONLinesFileSource(path, source_type, ingestor))
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:

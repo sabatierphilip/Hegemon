@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import hmac
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -8,16 +12,77 @@ from sentinel_containment.telemetry.schema import NormalizedEvent
 
 
 class TelemetryIngestor:
-    def __init__(self, output_path: Path = Path("data/telemetry_index.jsonl")):
+    def __init__(
+        self,
+        output_path: Path = Path("data/telemetry_index.jsonl"),
+        signing_key: str | None = None,
+        key_rotation_seconds: int = 300,
+    ):
         self.output_path = output_path
+        self.signing_key = (signing_key or os.getenv("TELEMETRY_SIGNING_KEY") or "hegemon-default-telemetry-key").encode("utf-8")
+        self.key_rotation_seconds = max(60, int(key_rotation_seconds))
+
+    def _epoch(self, event_ts: str) -> int:
+        dt = datetime.fromisoformat(event_ts.replace("Z", "+00:00"))
+        return int(dt.timestamp()) // self.key_rotation_seconds
+
+    def _derive_epoch_key(self, epoch: int) -> bytes:
+        return hmac.new(self.signing_key, str(epoch).encode("utf-8"), hashlib.sha256).digest()
+
+    def _last_chain_hash(self) -> str:
+        if not self.output_path.exists() or self.output_path.stat().st_size == 0:
+            return "GENESIS"
+        with self.output_path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if not lines:
+            return "GENESIS"
+        try:
+            payload = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            return "GENESIS"
+        return str(payload.get("telemetry_chain_hash", "GENESIS"))
+
+    def _sign(self, doc: dict[str, Any], epoch: int) -> str:
+        key = self._derive_epoch_key(epoch)
+        canonical = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hmac.new(key, canonical, hashlib.sha256).hexdigest()
 
     def ingest(self, source_type: str, raw_event: dict[str, Any]) -> dict[str, Any]:
         event = NormalizedEvent.from_raw(source_type, raw_event)
         doc = event.to_opensearch_doc()
+        event_ts = str(doc.get("@timestamp", datetime.now(timezone.utc).isoformat()))
+        prev_chain_hash = self._last_chain_hash()
+        epoch = self._epoch(event_ts)
+        integrity_payload = {
+            **doc,
+            "collector_level": raw_event.get("collector_level", "workload"),
+            "telemetry_scope": raw_event.get("telemetry_scope", source_type),
+            "source_type": source_type,
+            "counterclone_participant": bool(raw_event.get("counterclone_participant", source_type == "counterclone")),
+            "hypervisor_visible": bool(raw_event.get("hypervisor_visible", source_type == "hypervisor")),
+            "integrity": {
+                "prev_chain_hash": prev_chain_hash,
+                "signature_epoch": epoch,
+            },
+        }
+        integrity_payload["integrity"]["signature"] = self._sign(integrity_payload, epoch)
+        integrity_payload["telemetry_chain_hash"] = hashlib.sha256(
+            json.dumps(
+                {
+                    "prev": prev_chain_hash,
+                    "event_hash": hashlib.sha256(
+                        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest(),
+                    "signature": integrity_payload["integrity"]["signature"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         with self.output_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(doc) + "\n")
-        return doc
+            f.write(json.dumps(integrity_payload) + "\n")
+        return integrity_payload
 
     def ingest_batch(self, source_type: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [self.ingest(source_type, e) for e in events]
@@ -39,3 +104,23 @@ class TelemetryIngestor:
             except json.JSONDecodeError:
                 continue
         return events
+
+    def verify_recent(self, limit: int = 200) -> bool:
+        events = self.read_recent(limit=limit)
+        last_chain = "GENESIS"
+        for payload in events:
+            integrity = payload.get("integrity", {})
+            if integrity.get("prev_chain_hash") != last_chain:
+                return False
+
+            epoch = int(integrity.get("signature_epoch", 0))
+            expected_sig = integrity.get("signature")
+            candidate = dict(payload)
+            candidate.pop("telemetry_chain_hash", None)
+            candidate_integrity = dict(candidate.get("integrity", {}))
+            candidate_integrity.pop("signature", None)
+            candidate["integrity"] = candidate_integrity
+            if expected_sig != self._sign(candidate, epoch):
+                return False
+            last_chain = str(payload.get("telemetry_chain_hash", ""))
+        return True

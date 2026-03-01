@@ -23,6 +23,9 @@ fast_track_risk_confidence: 0.65
 hard_response_action_threshold: 85
 burst_cycle_severity_threshold: 80
 burst_cycle_seconds: 20
+approval_quorum: 1
+automated_approvers:
+  - user
 ingestion:
   index_path: data/telemetry_index.jsonl
   syslog_host: 0.0.0.0
@@ -30,6 +33,11 @@ ingestion:
   cloudtrail_file: data/cloudtrail.jsonl
   network_flow_file: data/network_flows.jsonl
   model_api_file: data/model_api.jsonl
+  osquery_file: data/osquery_events.jsonl
+  kernel_events_file: data/kernel_events.jsonl
+  runtime_events_file: data/runtime_events.jsonl
+  hypervisor_events_file: data/hypervisor_events.jsonl
+  counterclone_events_file: data/counterclone_events.jsonl
 
 audit_out_of_band_path: logs/immutable_audit_oob.log
 honeypot_resources:
@@ -43,11 +51,7 @@ proto_agi_indicators:
   - sandbox escape
   - compute hoarding
 approval_identity_store:
-  alice:
-    - alice
-    - Alice
-    - alice@corp
-  bob:
-    - bob
-    - Bob
-    - bob@corp
+  user:
+    - user
+    - User
+    - user@corp
