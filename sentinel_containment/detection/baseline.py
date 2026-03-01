@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 from statistics import mean, median
+from typing import Any
 
 
 @dataclass
@@ -102,7 +103,7 @@ class BehavioralBaseline:
     def update_and_detect(
         self,
         host: str,
-        metrics: dict[str, float],
+        metrics: dict[str, Any],
         context: dict[str, float | bool | str] | None = None,
     ) -> list[BaselineAnomaly]:
         anomalies: list[BaselineAnomaly] = []
@@ -110,7 +111,10 @@ class BehavioralBaseline:
         trusted_signal = bool((context or {}).get("counterclone_participant", False)) and source_type == "counterclone"
         trusted_signal = trusted_signal and bool((context or {}).get("counterclone_integrity_verified", False))
         event_ts = str((context or {}).get("event_timestamp", "")) or None
-        for metric, current in metrics.items():
+        for metric, raw_current in metrics.items():
+            current = self._coerce_float(raw_current)
+            if current is None:
+                continue
             key = (host, metric)
             history = self.series[key]
             avg = mean(history) if history else current
@@ -144,6 +148,18 @@ class BehavioralBaseline:
                 self._anchor_mean[key] = (1.0 - alpha) * self._anchor_mean[key] + alpha * current
 
         return anomalies
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return numeric
 
     @staticmethod
     def _robust_score(history: list[float], current: float, anchor: float | None = None) -> float:
