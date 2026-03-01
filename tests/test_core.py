@@ -901,3 +901,41 @@ def test_run_cycle_skips_synthetic_events_across_all_analytics(tmp_path):
     assert state["credential_blast_radius"]["compromised_credentials"] == []
     assert state["credential_blast_radius"]["impacted_hosts"] == []
     assert state["credential_blast_radius"]["impacted_resources"] == []
+
+
+def test_dynamic_automodeller_resists_infected_baseline_rebasing():
+    baseline = BehavioralBaseline(threshold=2.0, window=30, min_history=5)
+
+    for _ in range(20):
+        baseline.update_and_detect("h-infected", {"api_call_rate": 220.0})
+
+    # Simulate attacker-induced baseline poisoning toward low values.
+    for _ in range(15):
+        baseline.update_and_detect("h-infected", {"api_call_rate": 8.0})
+
+    anomalies = baseline.update_and_detect("h-infected", {"api_call_rate": 85.0})
+
+    assert anomalies
+    assert anomalies[0].metric == "api_call_rate"
+    assert anomalies[0].severity >= 60
+
+
+def test_counterclone_context_feeds_dynamic_automodeller_without_false_positives():
+    baseline = BehavioralBaseline(threshold=2.0, window=30, min_history=5)
+
+    for _ in range(8):
+        no_anomalies = baseline.update_and_detect(
+            "h-cc",
+            {"counterclone_activity": 1.0},
+            context={"counterclone_participant": True, "source_type": "counterclone"},
+        )
+        assert no_anomalies == []
+
+    anomalies = baseline.update_and_detect(
+        "h-cc",
+        {"counterclone_activity": 4.5},
+        context={"counterclone_participant": True, "source_type": "counterclone"},
+    )
+
+    assert anomalies
+    assert anomalies[0].metric == "counterclone_activity"

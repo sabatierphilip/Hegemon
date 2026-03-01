@@ -15,6 +15,50 @@ class BaselineAnomaly:
     severity: int
 
 
+@dataclass
+class DynamicModelState:
+    fast_mean: float
+    resilient_mean: float
+    volatility: float
+    contamination_score: float
+
+
+class DynamicAutoModeller:
+    """Blend fast/reactive and resilient/slow models to resist poisoned baselines."""
+
+    def __init__(self):
+        self._state: dict[tuple[str, str], DynamicModelState] = {}
+
+    def update(self, key: tuple[str, str], current: float, trusted_signal: bool = False) -> DynamicModelState:
+        state = self._state.get(key)
+        if state is None:
+            state = DynamicModelState(
+                fast_mean=current,
+                resilient_mean=current,
+                volatility=max(0.25, abs(current) * 0.05),
+                contamination_score=0.0,
+            )
+            self._state[key] = state
+            return state
+
+        # Fast model adapts quickly to genuine behavior shifts.
+        fast_alpha = 0.28 if not trusted_signal else 0.34
+        state.fast_mean = (1.0 - fast_alpha) * state.fast_mean + fast_alpha * current
+
+        # Resilient model moves slowly and is harder to poison.
+        resilient_alpha = 0.08 if not trusted_signal else 0.22
+        state.resilient_mean = (1.0 - resilient_alpha) * state.resilient_mean + resilient_alpha * current
+
+        deviation = abs(current - state.fast_mean)
+        state.volatility = (state.volatility * 0.85) + (deviation * 0.15)
+
+        divergence = abs(state.fast_mean - state.resilient_mean)
+        poison_pressure = divergence / max(state.volatility, 0.25)
+        decay = 0.90 if trusted_signal else 0.94
+        state.contamination_score = max(0.0, (state.contamination_score * decay) + max(0.0, poison_pressure - 1.4))
+        return state
+
+
 class BehavioralBaseline:
     def __init__(self, threshold: float = 2.0, window: int = 30, min_history: int = 5):
         self.threshold = threshold
@@ -22,21 +66,34 @@ class BehavioralBaseline:
         self.min_history = min_history
         self.series: dict[tuple[str, str], deque[float]] = defaultdict(lambda: deque(maxlen=window))
         self._anchor_mean: dict[tuple[str, str], float] = {}
+        self._automodeller = DynamicAutoModeller()
 
-    def update_and_detect(self, host: str, metrics: dict[str, float]) -> list[BaselineAnomaly]:
+    def update_and_detect(
+        self,
+        host: str,
+        metrics: dict[str, float],
+        context: dict[str, float | bool | str] | None = None,
+    ) -> list[BaselineAnomaly]:
         anomalies: list[BaselineAnomaly] = []
+        trusted_signal = bool((context or {}).get("counterclone_participant", False))
         for metric, current in metrics.items():
             key = (host, metric)
             history = self.series[key]
             avg = mean(history) if history else current
 
             anchor = self._anchor_mean.get(key, avg)
-            protected_avg = max(avg, anchor)
+            dynamic_state = self._automodeller.update(key, current, trusted_signal=trusted_signal)
+            dynamic_reference = max(dynamic_state.fast_mean, dynamic_state.resilient_mean)
+            protected_avg = max(avg, anchor, dynamic_reference)
             ratio = (current / protected_avg) if protected_avg > 0 else 1.0
-            score = self._robust_score(list(history), current, anchor)
+            score = self._robust_score(list(history), current, max(anchor, dynamic_state.resilient_mean))
 
-            if len(history) >= self.min_history and score > self.threshold:
-                severity = min(100, int(45 + (score - self.threshold) * 18))
+            contamination_bias = min(2.5, dynamic_state.contamination_score / 4.0)
+            adjusted_score = score + contamination_bias
+            effective_threshold = self.threshold - min(0.55, contamination_bias * 0.35)
+
+            if len(history) >= self.min_history and adjusted_score > effective_threshold:
+                severity = min(100, int(45 + (adjusted_score - effective_threshold) * 18))
                 anomalies.append(BaselineAnomaly(metric, host, current, protected_avg, ratio, severity))
 
             history.append(current)

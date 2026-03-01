@@ -222,9 +222,19 @@ def run_cycle(
             "api_call_rate": float(event.get("api_call_count", 0) or 0),
             "network_egress": float(event.get("egress_mb", 0) or 0),
             "gpu_cpu": float(event.get("gpu_cpu", 0) or 0),
+            "counterclone_activity": 1.0 if bool(event.get("counterclone_participant", False)) else 0.0,
         }
         if any(metrics.values()):
-            baseline_alerts.extend(baseline.update_and_detect(host, metrics))
+            baseline_alerts.extend(
+                baseline.update_and_detect(
+                    host,
+                    metrics,
+                    context={
+                        "counterclone_participant": bool(event.get("counterclone_participant", False)),
+                        "source_type": str(event.get("source_type", "unknown")),
+                    },
+                )
+            )
 
     correlated = correlator.correlate(rule_alerts, baseline_alerts)
     attack_chains = sequence_model.evaluate(detector_events)
