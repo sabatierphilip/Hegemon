@@ -74,8 +74,8 @@ python scripts/download_and_seal_github_zip.py --zip /path/to/repo.zip --output 
 Notes:
 - Extracted files are not modified, so runtime behavior is preserved.
 - A `.seal/manifest.enc` file and `.seal/seal_meta.json` are created in the output directory automatically.
-- Default sealing key (AES-256-GCM, base64): `uPs8Q_C_nBEGtssLsy5cazP2PghacquTQ76hHL2FMiw=`.
--
+- A fresh random AES-256-GCM key is generated for each unzip operation when `--key` is not provided.
+- You can optionally pass `--key <base64-key>` to reuse a caller-managed key.
 
 ## Security principles
 
