@@ -910,7 +910,7 @@ def test_run_cycle_fast_tracks_containment_with_high_confidence(tmp_path):
             {
                 "simulated_mode": False,
                 "telemetry_index_path": str(index_path),
-                "containment_severity_threshold": 95,
+                "containment_severity_threshold": 99,
                 "fast_track_containment_threshold": 80,
                 "fast_track_risk_confidence": 0.2,
                 "rules_path": "rules",
@@ -1469,3 +1469,114 @@ def test_graph_detector_bounds_tracked_edge_memory():
 
     assert len(detector._known_edges) <= 50
     assert len(detector._edge_order) <= 50
+
+
+def test_attack_sequence_detects_fragmented_low_and_slow_exfiltration():
+    model = AttackSequenceModel(chain_window_minutes=60)
+    events = []
+    for idx in range(30):
+        events.append(
+            {
+                "host": "frag-1",
+                "@timestamp": f"2024-01-01T00:{idx:02d}:00+00:00",
+                "action": "db_read",
+                "resource": "database://customers/table",
+                "api_call_count": 5,
+            }
+        )
+    events.append(
+        {
+            "host": "frag-1",
+            "@timestamp": "2024-01-01T00:45:00+00:00",
+            "action": "network_send",
+            "resource": "198.51.100.10",
+            "egress_mb": 100,
+        }
+    )
+
+    alerts = model.evaluate(events)
+    assert alerts
+    assert alerts[0].host == "frag-1"
+    assert alerts[0].stages == ["discovery", "resource_abuse", "exfiltration"]
+
+
+def test_run_cycle_contains_distributed_shard_switch_attack(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+
+    events = [
+        {
+            "host": "node-a",
+            "user": "svc-red",
+            "process": "proc-a",
+            "action": "list_endpoints",
+            "resource": "internal://inventory",
+            "api_call_count": 120,
+        },
+        {
+            "host": "node-b",
+            "user": "svc-red",
+            "process": "proc-b",
+            "action": "read_config",
+            "resource": "internal://secrets-map",
+            "api_call_count": 120,
+        },
+        {
+            "host": "node-c",
+            "user": "svc-red",
+            "process": "proc-c",
+            "action": "query_table",
+            "resource": "database://prod/customers",
+            "api_call_count": 120,
+        },
+        {
+            "host": "node-c",
+            "user": "svc-red",
+            "process": "proc-c",
+            "action": "network_send",
+            "resource": "203.0.113.22",
+            "egress_mb": 900,
+        },
+    ]
+    for event in events:
+        ingestor.ingest("network_flow", event)
+
+    signature, cfg = _hardware_auth_for(
+        "node-a",
+        100,
+        [
+            "disable_outbound_traffic",
+            "revoke_rotate_api_keys",
+            "quarantine_host",
+            "forensic_snapshot_metadata",
+            "sinkhole_suspicious_destinations",
+            "block_lateral_movement_paths",
+        ],
+        ["user"],
+        authorize_all_containment=True,
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "graph_warmup_events": 2,
+                "baseline_min_history": 50,
+                "containment_severity_threshold": 99,
+                "fast_track_containment_threshold": 99,
+                "distributed_attack_containment_threshold": 70,
+                "distributed_attack_risk_confidence": 0.65,
+                "containment_simulation_mode": False,
+                "trusted_hardware_public_keys": cfg["trusted_hardware_public_keys"],
+                "containment_signature": signature,
+            }
+        )
+    )
+
+    assert state["distributed_attack_signal"]["is_distributed"] is True
+    assert state["distributed_attack_signal"]["shard_count"] >= 3
+    assert state["containment"] is not None
+    assert "quarantine_host" in state["containment"]["actions_executed"]
