@@ -20,6 +20,7 @@ from sentinel_containment.detection.mirror_clone import MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
+from sentinel_containment.security import HardwareKeyVerifier
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import IngestionService, discover_live_file_sources
 
@@ -130,6 +131,7 @@ class SentinelRuntime:
             self.audit,
             identity_store=settings.get("approval_identity_store", {}),
             required_approvals=int(settings.get("approval_quorum", 1)),
+            hardware_key_verifier=HardwareKeyVerifier(settings.get("trusted_hardware_public_keys", {})),
         )
 
         extra_sources = {
@@ -202,6 +204,9 @@ class SentinelRuntime:
             approvals=list(self.settings.get("automated_approvers", ["user"])),
             simulation_mode=False,
             hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
+            signature_bundle=event.get("containment_signature")
+            if isinstance(event.get("containment_signature"), dict)
+            else self.settings.get("containment_signature"),
         )
         payload = {
             "host": host,

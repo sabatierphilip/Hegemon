@@ -48,6 +48,7 @@ Main settings are in `config/config.yaml`:
 - `fast_track_containment_threshold`/`fast_track_risk_confidence` for immediate containment based on multi-signal confidence
 - `ingestion.*` for real source locations and ports across cloud, host, runtime, hypervisor, and counter-clone feeds
 - `approval_quorum` and `automated_approvers` to control single-person fast authorization
+- `trusted_hardware_public_keys` and `containment_signature` to require YubiKey/TPM-backed signatures before any containment execution
 - `honeypot_resources` for decoy assets that should never be accessed
 - `proto_agi_indicators` to tune high-risk autonomous behavior markers that trigger immediate containment
 - `audit_out_of_band_path` for append-only out-of-band audit sink
@@ -80,6 +81,7 @@ Notes:
 
 - Defensive-first containment with hard-response acceleration for high-risk incidents
 - Configurable approval quorum (default single-user for faster autonomous response)
+- Identity-bound execution: containment requires valid signatures from trusted hardware-bound keys (YubiKey/TPM)
 - Reversible actions where possible with stronger automatic isolation for severe events
 - Tamper-evident immutable hash-chain logs plus telemetry event signature-chain verification
 - No offensive actions against external infrastructure

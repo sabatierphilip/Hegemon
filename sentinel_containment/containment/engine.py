@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
+from sentinel_containment.security import HardwareKeyVerifier
 
 
 @dataclass
@@ -19,12 +20,14 @@ class ContainmentEngine:
         audit_log: ImmutableAuditLog,
         identity_store: dict[str, list[str]] | None = None,
         required_approvals: int = 1,
+        hardware_key_verifier: HardwareKeyVerifier | None = None,
     ):
         self.audit_log = audit_log
         self.contained_hosts: set[str] = set()
         self.identity_store = identity_store or {}
         self.required_approvals = max(1, int(required_approvals))
         self._alias_lookup = self._build_alias_lookup(self.identity_store)
+        self.hardware_key_verifier = hardware_key_verifier or HardwareKeyVerifier()
 
     def execute(
         self,
@@ -36,7 +39,25 @@ class ContainmentEngine:
         simulation_mode: bool = True,
         hard_quarantine_threshold: int = 90,
         simulation_context: dict[str, Any] | None = None,
+        signature_bundle: dict[str, Any] | None = None,
     ) -> ContainmentResult:
+        signature_verification = self.hardware_key_verifier.verify(
+            host=host,
+            severity=severity,
+            requested_actions=requested_actions,
+            approvals=approvals,
+            signature_bundle=signature_bundle,
+        )
+        if not signature_verification.allowed:
+            self.audit_log.append("containment_denied", {
+                "host": host,
+                "severity": severity,
+                "requested_actions": requested_actions,
+                "reason": "hardware_signature_required",
+                "message": signature_verification.message,
+            })
+            return ContainmentResult(False, [], f"Containment denied: {signature_verification.message}")
+
         unique_approvers = self._normalize_approvals(approvals)
         if severity >= high_impact_threshold and len(unique_approvers) < self.required_approvals:
             self.audit_log.append("containment_denied", {

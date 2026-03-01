@@ -1,4 +1,8 @@
+import base64
 from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from sentinel_containment.asset_mapper.discovery import AssetMapper
 from sentinel_containment.cloud.provider import CloudProviderAdapter
@@ -11,9 +15,48 @@ from sentinel_containment.detection.mirror_clone import MirrorAlert, MirrorClone
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
+from sentinel_containment.security.hardware_keys import HardwareKeyVerifier
 from sentinel_containment.runtime import SentinelRuntime
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import JSONLinesFileSource, discover_live_file_sources, parse_syslog_line
+
+
+def _hardware_auth_for(
+    host: str,
+    severity: int,
+    requested_actions: list[str],
+    approvals: list[str],
+    *,
+    authorize_all_containment: bool = False,
+) -> tuple[dict, dict]:
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(b"\x01" * 32)
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+    key_id = "test-hardware-key"
+    key_type = "yubikey"
+    digest = HardwareKeyVerifier.canonical_payload(
+        host,
+        severity,
+        requested_actions,
+        approvals,
+        key_id,
+        key_type,
+        authorize_all_containment=authorize_all_containment,
+    )
+    signature = base64.b64encode(private_key.sign(digest)).decode("utf-8")
+    bundle = {
+        "key_id": key_id,
+        "key_type": key_type,
+        "signature": signature,
+        "authorize_all_containment": authorize_all_containment,
+    }
+    settings_fragment = {
+        "trusted_hardware_public_keys": {key_id: public_pem},
+        "containment_signature": bundle,
+    }
+    return bundle, settings_fragment
 
 
 def test_asset_snapshot_contains_nodes(tmp_path):
@@ -30,17 +73,24 @@ def test_rule_engine_detects_excessive_calls():
 
 def test_containment_defaults_to_single_user_approval(tmp_path):
     audit = ImmutableAuditLog(tmp_path / "audit.log")
-    engine = ContainmentEngine(audit)
-    allowed = engine.execute("h1", 90, ["quarantine_host"], ["user"])
+    bundle, cfg = _hardware_auth_for("h1", 90, ["quarantine_host"], ["user"])
+    engine = ContainmentEngine(audit, hardware_key_verifier=HardwareKeyVerifier(cfg["trusted_hardware_public_keys"]))
+    allowed = engine.execute("h1", 90, ["quarantine_host"], ["user"], signature_bundle=bundle)
     assert allowed.approved
 
 
 def test_containment_honors_configured_quorum(tmp_path):
     audit = ImmutableAuditLog(tmp_path / "audit.log")
-    engine = ContainmentEngine(audit, required_approvals=2)
-    denied = engine.execute("h1", 90, ["quarantine_host"], ["alice"])
+    denied_bundle, cfg = _hardware_auth_for("h1", 90, ["quarantine_host"], ["alice"])
+    allowed_bundle, _ = _hardware_auth_for("h1", 90, ["quarantine_host"], ["alice", "bob"])
+    engine = ContainmentEngine(
+        audit,
+        required_approvals=2,
+        hardware_key_verifier=HardwareKeyVerifier(cfg["trusted_hardware_public_keys"]),
+    )
+    denied = engine.execute("h1", 90, ["quarantine_host"], ["alice"], signature_bundle=denied_bundle)
     assert not denied.approved
-    allowed = engine.execute("h1", 90, ["quarantine_host"], ["alice", "bob"])
+    allowed = engine.execute("h1", 90, ["quarantine_host"], ["alice", "bob"], signature_bundle=allowed_bundle)
     assert allowed.approved
 
 
@@ -132,13 +182,15 @@ def test_runtime_run_once_writes_latest_state(tmp_path):
                 "latest_state_path": str(state_path),
                 "rules_path": "rules",
                 "playbook_path": "playbooks/default_playbook.yaml",
-                "ingestion": {
-                    "syslog_host": "127.0.0.1",
-                    "syslog_port": 0,
-                    "cloudtrail_file": str(tmp_path / "c.jsonl"),
-                    "network_flow_file": str(tmp_path / "n.jsonl"),
-                    "model_api_file": str(tmp_path / "m.jsonl"),
-                },
+                    "ingestion": {
+                        "syslog_host": "127.0.0.1",
+                        "syslog_port": 0,
+                        "kernel_webhook_host": "127.0.0.1",
+                        "kernel_webhook_port": 0,
+                        "cloudtrail_file": str(tmp_path / "c.jsonl"),
+                        "network_flow_file": str(tmp_path / "n.jsonl"),
+                        "model_api_file": str(tmp_path / "m.jsonl"),
+                    },
             }
         )
     )
@@ -381,7 +433,8 @@ def test_attack_sequence_detects_multistage_chain():
 
 def test_containment_simulation_before_quarantine(tmp_path):
     audit = ImmutableAuditLog(tmp_path / "audit.log")
-    engine = ContainmentEngine(audit)
+    bundle, cfg = _hardware_auth_for("h2", 85, ["disable_outbound_traffic", "quarantine_host"], ["alice", "bob"])
+    engine = ContainmentEngine(audit, hardware_key_verifier=HardwareKeyVerifier(cfg["trusted_hardware_public_keys"]))
     result = engine.execute(
         "h2",
         85,
@@ -390,6 +443,7 @@ def test_containment_simulation_before_quarantine(tmp_path):
         simulation_mode=True,
         hard_quarantine_threshold=90,
         simulation_context={"blast_radius": {"impacted_hosts": ["h2"], "impacted_resources": ["model-a"]}},
+        signature_bundle=bundle,
     )
 
     assert result.approved
@@ -447,8 +501,14 @@ def test_rule_engine_detects_distributed_near_threshold_burst():
 
 def test_containment_approval_normalization_avoids_same_identity_double_vote(tmp_path):
     audit = ImmutableAuditLog(tmp_path / "audit.log")
-    engine = ContainmentEngine(audit, identity_store={"alice": ["Alice", "alice@corp"]}, required_approvals=2)
-    denied = engine.execute("h1", 95, ["quarantine_host"], ["Alice", "alice@corp"])
+    bundle, cfg = _hardware_auth_for("h1", 95, ["quarantine_host"], ["Alice", "alice@corp"])
+    engine = ContainmentEngine(
+        audit,
+        identity_store={"alice": ["Alice", "alice@corp"]},
+        required_approvals=2,
+        hardware_key_verifier=HardwareKeyVerifier(cfg["trusted_hardware_public_keys"]),
+    )
+    denied = engine.execute("h1", 95, ["quarantine_host"], ["Alice", "alice@corp"], signature_bundle=bundle)
 
     assert not denied.approved
 
@@ -531,6 +591,14 @@ def test_run_cycle_proto_agi_honeypot_triggers_immediate_kill_chain(tmp_path):
         },
     )
 
+    _, hardware_cfg = _hardware_auth_for(
+        "prod-model-9",
+        99,
+        ["quarantine_host"],
+        ["user"],
+        authorize_all_containment=True,
+    )
+
     state = run_cycle(
         Settings(
             {
@@ -541,6 +609,7 @@ def test_run_cycle_proto_agi_honeypot_triggers_immediate_kill_chain(tmp_path):
                 "playbook_path": "playbooks/default_playbook.yaml",
                 "honeypot_resources": ["decoy://llm-admin"],
                 "baseline_min_history": 50,
+                **hardware_cfg,
             }
         )
     )
@@ -778,6 +847,14 @@ def test_run_cycle_fast_tracks_containment_with_high_confidence(tmp_path):
         },
     )
 
+    _, hardware_cfg = _hardware_auth_for(
+        "h-fast",
+        95,
+        ["quarantine_host"],
+        ["user"],
+        authorize_all_containment=True,
+    )
+
     state = run_cycle(
         Settings(
             {
@@ -790,6 +867,7 @@ def test_run_cycle_fast_tracks_containment_with_high_confidence(tmp_path):
                 "playbook_path": "playbooks/default_playbook.yaml",
                 "baseline_min_history": 50,
                 "containment_simulation_mode": False,
+                **hardware_cfg,
             }
         )
     )
@@ -969,6 +1047,13 @@ def test_discover_live_file_sources_finds_present_inputs(tmp_path):
 
 def test_runtime_fast_lane_event_executes_immediate_containment(tmp_path):
     index_path = tmp_path / "telemetry_index.jsonl"
+    signature, hardware_cfg = _hardware_auth_for(
+        "prod-model-urgent",
+        96,
+        ["quarantine_host"],
+        ["user"],
+        authorize_all_containment=True,
+    )
     runtime = SentinelRuntime(
         Settings(
             {
@@ -977,6 +1062,7 @@ def test_runtime_fast_lane_event_executes_immediate_containment(tmp_path):
                 "rules_path": "rules",
                 "playbook_path": "playbooks/default_playbook.yaml",
                 "fast_lane": {"enabled": False},
+                **hardware_cfg,
                 "ingestion": {
                     "syslog_host": "127.0.0.1",
                     "syslog_port": 0,
@@ -996,6 +1082,7 @@ def test_runtime_fast_lane_event_executes_immediate_containment(tmp_path):
             "severity": 96,
             "honeypot_trigger": True,
             "source_type": "honeypot_interrupt",
+            "containment_signature": signature,
         }
     )
 

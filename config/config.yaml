@@ -36,6 +36,8 @@ burst_cycle_seconds: 0.1
 approval_quorum: 1
 automated_approvers:
   - user
+trusted_hardware_public_keys: {}
+containment_signature: null
 ingestion:
   index_path: data/telemetry_index.jsonl
   syslog_host: 0.0.0.0

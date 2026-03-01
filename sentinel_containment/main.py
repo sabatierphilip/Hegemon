@@ -18,11 +18,21 @@ from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
+from sentinel_containment.security import HardwareKeyVerifier
 from sentinel_containment.soar.workflow import SoarEngine
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 
 
 CLONE_ALLOWED_SYNTHETIC_ACTIONS = {"read", "list", "model_invoke"}
+
+
+def _build_hardware_key_verifier(settings: Settings) -> HardwareKeyVerifier:
+    return HardwareKeyVerifier(settings.get("trusted_hardware_public_keys", {}))
+
+
+def _containment_signature(settings: Settings) -> dict[str, Any] | None:
+    payload = settings.get("containment_signature")
+    return payload if isinstance(payload, dict) else None
 
 
 def execute_counter_clone_actions(
@@ -31,6 +41,7 @@ def execute_counter_clone_actions(
     containment: ContainmentEngine,
     ingestor: TelemetryIngestor,
     audit: ImmutableAuditLog,
+    signature_bundle: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Execute counter-clone actions with safety constraints and synthetic stream isolation.
 
@@ -57,6 +68,7 @@ def execute_counter_clone_actions(
                 requested_actions=["disable_outbound_traffic", "forensic_snapshot_metadata"],
                 approvals=["user"],
                 simulation_mode=True,
+                signature_bundle=signature_bundle,
             )
             _record(action, target, "executed", {"approved": result.approved, "actions": result.actions_executed})
             continue
@@ -218,6 +230,7 @@ def run_cycle(
         audit,
         identity_store=settings.get("approval_identity_store", {}),
         required_approvals=int(settings.get("approval_quorum", 1)),
+        hardware_key_verifier=_build_hardware_key_verifier(settings),
     )
     blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
@@ -291,6 +304,7 @@ def run_cycle(
                         containment=containment,
                         ingestor=ingestor,
                         audit=audit,
+                        signature_bundle=_containment_signature(settings),
                     )
                 )
 
@@ -321,6 +335,7 @@ def run_cycle(
                 containment=containment,
                 ingestor=ingestor,
                 audit=audit,
+                signature_bundle=_containment_signature(settings),
             )
         )
 
@@ -392,6 +407,7 @@ def run_cycle(
             simulation_mode=simulation_mode,
             hard_quarantine_threshold=int(settings.get("hard_quarantine_threshold", 90)),
             simulation_context={"blast_radius": asdict(blast_radius)},
+            signature_bundle=_containment_signature(settings),
         )
 
     state = {
