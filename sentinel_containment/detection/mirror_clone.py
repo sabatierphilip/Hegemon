@@ -55,6 +55,16 @@ class CloneDeployment:
     reason: str
 
 
+@dataclass
+class ReconDirective:
+    shard: str
+    confidence: float
+    markov_kill_chain_score: float
+    predicted_path: list[str]
+    target_resource: str
+    rationale: str
+
+
 class MirrorCloneDetector:
     """Builds per-identity scan/trace clones and can rapidly deploy executable counter-clones."""
 
@@ -80,6 +90,76 @@ class MirrorCloneDetector:
             lambda: defaultdict(lambda: defaultdict(int))
         )
         self._deployments: dict[str, CloneDeployment] = {}
+
+    def generate_autonomous_recon_directives(
+        self,
+        max_directives: int = 4,
+        min_markov_score: float = 0.35,
+    ) -> list[ReconDirective]:
+        directives: list[ReconDirective] = []
+        for shard, action_counts in self._action_counts.items():
+            if sum(action_counts.values()) < self.warmup_events:
+                continue
+
+            path, confidence = self._predict_markov_path(shard, horizon=4)
+            if not path:
+                continue
+            markov_score = self._markov_kill_chain_score(path)
+            if markov_score < min_markov_score:
+                continue
+
+            candidate_resources = self._resource_counts[shard].get(path[0], {})
+            target_resource = (
+                max(candidate_resources.items(), key=lambda item: item[1])[0]
+                if candidate_resources
+                else "synthetic://unknown"
+            )
+            directives.append(
+                ReconDirective(
+                    shard=shard,
+                    confidence=round(confidence, 3),
+                    markov_kill_chain_score=round(markov_score, 3),
+                    predicted_path=path,
+                    target_resource=target_resource,
+                    rationale=(
+                        "Autonomous hunter directive generated from Markov kill-chain backmodeling; "
+                        "counter-clone seeks rogue behavior before inbound alerts"
+                    ),
+                )
+            )
+
+        directives.sort(
+            key=lambda item: (item.markov_kill_chain_score, item.confidence),
+            reverse=True,
+        )
+        return directives[:max(0, max_directives)]
+
+    def execute_recon_directive(self, directive: ReconDirective) -> list[CounterCloneAction]:
+        host = directive.shard.split("|", 1)[0].replace("host:", "")
+        primary_action = directive.predicted_path[0] if directive.predicted_path else "unknown"
+        return [
+            CounterCloneAction(
+                shard=directive.shard,
+                action="launch_autonomous_recon",
+                target=f"{primary_action}@{directive.target_resource}",
+                rationale=directive.rationale,
+                priority=min(98, 72 + int(directive.markov_kill_chain_score * 20)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="backmodel_markov_kill_chain",
+                target="->".join(directive.predicted_path),
+                rationale="Continuously update rogue trajectory model and pre-compute interception points",
+                priority=min(97, 70 + int(directive.confidence * 20)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="emit_synthetic_probe",
+                target="synthetic://hunter/recon",
+                rationale=f"Active hunt probe against host {host}",
+                priority=68,
+            ),
+        ]
 
     def evaluate(self, event: dict[str, Any]) -> list[MirrorAlert]:
         shard = self._shard_key(event)
@@ -406,6 +486,47 @@ class MirrorCloneDetector:
         user = str(event.get("user", "unknown")).strip().lower()
         process = str(event.get("process", "unknown")).strip().lower()
         return f"host:{host}|user:{user}|proc:{process}"
+
+    def _predict_markov_path(self, shard: str, horizon: int = 4) -> tuple[list[str], float]:
+        priors = self._action_counts[shard]
+        if not priors:
+            return [], 0.0
+        total = float(sum(priors.values()))
+        current = max(priors.items(), key=lambda item: item[1])[0]
+        confidence = priors[current] / total if total else 0.0
+
+        path = [current]
+        for _ in range(max(0, horizon - 1)):
+            transitions = self._transitions[shard].get(current, {})
+            if not transitions:
+                break
+            t_total = float(sum(transitions.values()))
+            if t_total <= 0:
+                break
+            next_action, next_count = max(transitions.items(), key=lambda item: item[1])
+            confidence *= next_count / t_total
+            path.append(next_action)
+            current = next_action
+        return path, min(1.0, confidence)
+
+    @staticmethod
+    def _markov_kill_chain_score(path: list[str]) -> float:
+        stage_weights = {
+            "login_failure": 0.18,
+            "scan": 0.16,
+            "container_spawn": 0.22,
+            "model_invoke": 0.1,
+            "iam_privilege_change": 0.26,
+            "network_send": 0.3,
+            "autonomous_replication": 0.35,
+            "policy_evasion": 0.35,
+            "sandbox_escape": 0.4,
+        }
+        if not path:
+            return 0.0
+        score = sum(stage_weights.get(step, 0.05) for step in path)
+        progression_bonus = 0.15 if len(set(path)) >= 3 else 0.0
+        return min(1.0, score / max(1.0, len(path) * 0.3) + progression_bonus)
 
     @staticmethod
     def _scan_score(event: dict[str, Any]) -> float:
