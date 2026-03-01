@@ -198,6 +198,7 @@ def run_cycle(
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
 
     recent_events = ingestor.read_recent(limit=int(settings.get("telemetry_batch_limit", 200)))
+    detector_events = [event for event in recent_events if not bool(event.get("synthetic", False))]
     rule_alerts = []
     baseline_alerts = []
     graph_anomalies = []
@@ -207,9 +208,7 @@ def run_cycle(
     counter_clone_actions = []
     counter_clone_execution = []
 
-    for event in recent_events:
-        if bool(event.get("synthetic", False)):
-            continue
+    for event in detector_events:
         rule_alerts.extend(rules.evaluate(event))
         graph_anomalies.extend(graph_detector.evaluate(event))
         honeypot_alerts.extend(honeypot_detector.evaluate(event))
@@ -224,10 +223,10 @@ def run_cycle(
             baseline_alerts.extend(baseline.update_and_detect(host, metrics))
 
     correlated = correlator.correlate(rule_alerts, baseline_alerts)
-    attack_chains = sequence_model.evaluate(recent_events)
+    attack_chains = sequence_model.evaluate(detector_events)
     containment_result = None
     soar_actions = []
-    blast_radius = blast_radius_analyzer.analyze(recent_events, topology)
+    blast_radius = blast_radius_analyzer.analyze(detector_events, topology)
 
     baseline_ready = all(len(values) >= baseline.min_history for values in baseline.series.values()) if baseline.series else False
 
