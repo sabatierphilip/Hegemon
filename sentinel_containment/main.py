@@ -13,7 +13,7 @@ from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
-from sentinel_containment.detection.mirror_clone import MirrorCloneDetector, ReconDirective
+from sentinel_containment.detection.mirror_clone import MirrorCloneDetector, ReconDirective, StageTwoDirective
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
@@ -190,6 +190,32 @@ def execute_counter_clone_actions(
                 _record(action, target, "executed", {"phase": "acknowledged"})
             continue
 
+        if action == "deploy_mirror_swarm":
+            ingestor.ingest(
+                "clone_synthetic",
+                {
+                    "host": simulated_host,
+                    "user": "mirror-swarm",
+                    "process": "counter-clone",
+                    "action": "list",
+                    "resource": f"synthetic://swarm/{target}",
+                    "synthetic": True,
+                    "counterclone_participant": True,
+                    "counterclone_integrity_verified": True,
+                    "clone_deployment_id": deployment.get("deployment_id", "stage2"),
+                },
+            )
+            _record(action, target, "executed", {"mode": "stage2_swarm_deployed"})
+            continue
+
+        if action == "hunt_rogue_agent":
+            _record(action, target, "executed", {"mode": "stage2_hunt_active"})
+            continue
+
+        if action == "isolate_proto_agi_mesh":
+            _record(action, target, "simulated", {"mode": "proto_agi_mesh_isolation", "rule": "mesh_sinkhole"})
+            continue
+
         _record(action, target, "ignored", {"reason": "unsupported_action"})
 
     return execution_log
@@ -307,6 +333,7 @@ def run_cycle(
     counter_clone_actions = []
     counter_clone_execution = []
     autonomous_recon_directives = []
+    stage_two_counteroffensive_directives = []
 
     for event in detector_events:
         rule_alerts.extend(rules.evaluate(event))
@@ -402,6 +429,31 @@ def run_cycle(
             )
         )
 
+    stage_two_counteroffensive_directives = [
+        asdict(d)
+        for d in mirror_clone_detector.generate_stage_two_counteroffensive_directives(
+            max_directives=int(settings.get("stage_two_max_directives", 2)),
+            min_escalation_score=float(settings.get("stage_two_min_escalation_score", 0.45)),
+        )
+    ]
+    for directive in stage_two_counteroffensive_directives:
+        planned_actions = mirror_clone_detector.execute_stage_two_directive(StageTwoDirective(**directive))
+        counter_clone_actions.extend(planned_actions)
+        counter_clone_execution.extend(
+            execute_counter_clone_actions(
+                actions=[asdict(a) for a in planned_actions],
+                deployment={
+                    "deployment_id": f"stage2::{directive['shard']}",
+                    "shard": directive["shard"],
+                    "synthetic_probe_sequence": [],
+                },
+                containment=containment,
+                ingestor=ingestor,
+                audit=audit,
+                signature_bundle=_containment_signature(settings),
+            )
+        )
+
     immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
     risk_confidence = compute_risk_confidence(
         candidate_severity,
@@ -487,6 +539,7 @@ def run_cycle(
         "counter_clone_actions": [asdict(a) for a in counter_clone_actions],
         "counter_clone_execution": counter_clone_execution,
         "autonomous_recon_directives": autonomous_recon_directives,
+        "stage_two_counteroffensive_directives": stage_two_counteroffensive_directives,
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
         "risk_confidence": risk_confidence,

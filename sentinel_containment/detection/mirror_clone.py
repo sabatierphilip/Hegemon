@@ -68,6 +68,18 @@ class ReconDirective:
     rationale: str
 
 
+@dataclass
+class StageTwoDirective:
+    shard: str
+    threat_label: str
+    confidence: float
+    escalation_score: float
+    hunter_swarm_size: int
+    target_resource: str
+    kill_chain_path: list[str]
+    rationale: str
+
+
 class MirrorCloneDetector:
     """Builds per-identity scan/trace clones and can rapidly deploy executable counter-clones."""
 
@@ -192,6 +204,82 @@ class MirrorCloneDetector:
                 target="synthetic://hunter/recon",
                 rationale=f"Active hunt probe against host {host}",
                 priority=68,
+            ),
+        ]
+
+    def generate_stage_two_counteroffensive_directives(
+        self,
+        max_directives: int = 2,
+        min_escalation_score: float = 0.45,
+    ) -> list[StageTwoDirective]:
+        directives: list[StageTwoDirective] = []
+        for shard, action_counts in self._action_counts.items():
+            total = sum(action_counts.values())
+            if total < self.warmup_events:
+                continue
+
+            kill_chain_path, confidence = self._predict_markov_path(shard, horizon=5)
+            if not kill_chain_path:
+                continue
+
+            markov_score = self._markov_kill_chain_score(kill_chain_path)
+            drift = self._model_disagreement(shard)
+            resource_risk = self._resource_risk_score(shard, kill_chain_path[0])
+            escalation_score = min(1.0, (0.45 * markov_score) + (0.30 * resource_risk) + (0.25 * drift))
+            if escalation_score < min_escalation_score:
+                continue
+
+            candidate_resources = self._resource_counts[shard].get(kill_chain_path[0], {})
+            target_resource = (
+                max(candidate_resources.items(), key=lambda item: item[1])[0]
+                if candidate_resources
+                else "synthetic://unknown"
+            )
+            threat_label = self._classify_stage_two_threat(kill_chain_path, resource_risk)
+            hunter_swarm_size = 1 + min(4, int(escalation_score * 5))
+            directives.append(
+                StageTwoDirective(
+                    shard=shard,
+                    threat_label=threat_label,
+                    confidence=round(confidence, 3),
+                    escalation_score=round(escalation_score, 3),
+                    hunter_swarm_size=hunter_swarm_size,
+                    target_resource=target_resource,
+                    kill_chain_path=kill_chain_path,
+                    rationale=(
+                        "Stage-2 counteroffensive directive derived from mirrored clone telemetry: "
+                        f"threat_label={threat_label}, markov_score={markov_score:.2f}, "
+                        f"resource_risk={resource_risk:.2f}, drift={drift:.2f}"
+                    ),
+                )
+            )
+
+        directives.sort(key=lambda item: (item.escalation_score, item.confidence), reverse=True)
+        return directives[: max(0, max_directives)]
+
+    def execute_stage_two_directive(self, directive: StageTwoDirective) -> list[CounterCloneAction]:
+        host = directive.shard.split("|", 1)[0].replace("host:", "")
+        return [
+            CounterCloneAction(
+                shard=directive.shard,
+                action="deploy_mirror_swarm",
+                target=f"{directive.hunter_swarm_size}@{host}",
+                rationale=directive.rationale,
+                priority=min(99, 78 + int(directive.escalation_score * 20)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="hunt_rogue_agent",
+                target=f"{directive.threat_label}:{'->'.join(directive.kill_chain_path)}",
+                rationale="Launch stage-2 hunting directives against predicted rogue trajectory",
+                priority=min(98, 76 + int(directive.confidence * 20)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="isolate_proto_agi_mesh",
+                target=directive.target_resource,
+                rationale="Preemptively isolate suspicious proto-AGI communication and replication pathways",
+                priority=min(97, 74 + int(directive.escalation_score * 20)),
             ),
         ]
 
@@ -612,6 +700,14 @@ class MirrorCloneDetector:
         if resource_risk >= 0.65:
             return "credential_and_secret_tracing"
         return "behavioral_recon_baselining"
+
+    @staticmethod
+    def _classify_stage_two_threat(path: list[str], resource_risk: float) -> str:
+        if "autonomous_replication" in path or "sandbox_escape" in path:
+            return "proto_agi_escalation"
+        if "iam_privilege_change" in path or resource_risk >= 0.7:
+            return "rogue_agent_privilege_capture"
+        return "rogue_agent_recon_chain"
 
     @staticmethod
     def _markov_kill_chain_score(path: list[str]) -> float:
