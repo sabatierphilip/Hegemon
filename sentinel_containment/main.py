@@ -21,6 +21,44 @@ from sentinel_containment.soar.workflow import SoarEngine
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 
 
+def compute_risk_confidence(
+    candidate_severity: int,
+    rule_alerts: list,
+    baseline_alerts: list,
+    graph_anomalies: list,
+    attack_chains: list,
+    honeypot_alerts: list,
+    mirror_alerts: list,
+    blast_radius_score: int,
+) -> float:
+    """Blend severity, detector consensus, and blast radius into a normalized risk confidence."""
+    signal_buckets = [
+        bool(rule_alerts),
+        bool(baseline_alerts),
+        bool(graph_anomalies),
+        bool(attack_chains),
+        bool(honeypot_alerts),
+        bool(mirror_alerts),
+    ]
+    detector_consensus = sum(1 for s in signal_buckets if s) / len(signal_buckets)
+    severity_norm = max(0.0, min(float(candidate_severity) / 100.0, 1.0))
+    blast_norm = max(0.0, min(float(blast_radius_score) / 100.0, 1.0))
+    return round((severity_norm * 0.55) + (detector_consensus * 0.30) + (blast_norm * 0.15), 4)
+
+
+def should_simulate_containment(settings: Settings, severity: int, blast_radius_score: int, immediate: bool) -> bool:
+    simulation_default = bool(settings.get("containment_simulation_mode", False))
+    if immediate or not simulation_default:
+        return False
+
+    force_hard_threshold = int(settings.get("force_hard_containment_threshold", 80))
+    force_hard_blast_radius = int(settings.get("force_hard_containment_blast_radius", 70))
+    if severity >= force_hard_threshold or blast_radius_score >= force_hard_blast_radius:
+        return False
+
+    return True
+
+
 def run_cycle(
     settings: Settings,
     baseline: BehavioralBaseline | None = None,
@@ -117,10 +155,22 @@ def run_cycle(
                 counter_clone_actions.extend(mirror_clone_detector.execute_counter_clone(deployment))
 
     immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
+    risk_confidence = compute_risk_confidence(
+        candidate_severity,
+        rule_alerts,
+        baseline_alerts,
+        graph_anomalies,
+        attack_chains,
+        honeypot_alerts,
+        mirror_alerts,
+        blast_radius.estimated_impact_score,
+    )
     should_contain = False
     if immediate_honeypot_containment:
         should_contain = True
     elif candidate_severity and baseline_ready and candidate_severity >= int(settings.get("containment_severity_threshold", 70)):
+        should_contain = True
+    elif candidate_severity >= int(settings.get("fast_track_containment_threshold", 85)) and risk_confidence >= float(settings.get("fast_track_risk_confidence", 0.65)):
         should_contain = True
 
     if should_contain:
@@ -146,16 +196,30 @@ def run_cycle(
                 "disable_outbound_traffic",
                 "revoke_rotate_api_keys",
                 "pause_model_serving_container",
+                "sinkhole_suspicious_destinations",
+                "block_lateral_movement_paths",
                 "quarantine_host",
                 "forensic_snapshot_metadata",
             ]
+        elif candidate_severity >= int(settings.get("hard_response_action_threshold", 85)):
+            requested_actions.extend([
+                "sinkhole_suspicious_destinations",
+                "block_lateral_movement_paths",
+            ])
+
+        simulation_mode = should_simulate_containment(
+            settings,
+            severity=candidate_severity,
+            blast_radius_score=blast_radius.estimated_impact_score,
+            immediate=immediate_honeypot_containment,
+        )
 
         containment_result = containment.execute(
             host=target_host,
             severity=candidate_severity,
             requested_actions=requested_actions,
             approvals=["alice", "bob"],
-            simulation_mode=bool(settings.get("containment_simulation_mode", True)) and not immediate_honeypot_containment,
+            simulation_mode=simulation_mode,
             hard_quarantine_threshold=int(settings.get("hard_quarantine_threshold", 90)),
             simulation_context={"blast_radius": asdict(blast_radius)},
         )
@@ -173,6 +237,7 @@ def run_cycle(
         "counter_clone_actions": [asdict(a) for a in counter_clone_actions],
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
+        "risk_confidence": risk_confidence,
         "credential_blast_radius": asdict(blast_radius),
         "containment": asdict(containment_result) if containment_result else None,
         "baseline_ready": baseline_ready,
@@ -186,7 +251,7 @@ def run_cycle(
 
 def run_forever(config_path: str = "config/config.yaml") -> None:
     settings = Settings.load(config_path)
-    interval = int(settings.get("refresh_minutes", 5)) * 60
+    interval = int(settings.get("refresh_minutes", 1)) * 60
     baseline = BehavioralBaseline(
         threshold=float(settings.get("anomaly_threshold", 2.0)),
         window=int(settings.get("baseline_window", 30)),
@@ -212,7 +277,7 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
         rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
     )
     while True:
-        run_cycle(
+        state = run_cycle(
             settings,
             baseline=baseline,
             rules=rules,
@@ -222,7 +287,10 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
             honeypot_detector=honeypot_detector,
             mirror_clone_detector=mirror_clone_detector,
         )
-        time.sleep(interval)
+        burst_threshold = int(settings.get("burst_cycle_severity_threshold", 80))
+        burst_interval_seconds = int(settings.get("burst_cycle_seconds", 20))
+        cycle_interval = burst_interval_seconds if state.get("candidate_severity", 0) >= burst_threshold else interval
+        time.sleep(cycle_interval)
 
 
 if __name__ == "__main__":
