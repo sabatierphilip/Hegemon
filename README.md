@@ -17,7 +17,7 @@ What starts automatically:
 - Probabilistic MITRE-aware attack chain extraction
 - Learned graph edge novelty with temporal and structural drift scoring
 - Credential blast-radius estimation and containment simulation before hard quarantine
-- Immutable audit logging
+- Immutable audit logging with immediate out-of-band mirroring support
 - Flask dashboard (`http://localhost:5000`) and `/graph`
 
 ## Docker single-command deployment
@@ -43,6 +43,9 @@ Main settings are in `config/config.yaml`:
 - `containment_simulation_mode` to stage soft-containment before hard host quarantine
 - `hard_quarantine_threshold` to force quarantine only at critical severity
 - `ingestion.*` for real source locations and ports
+- `honeypot_resources` for decoy assets that should never be accessed
+- `audit_out_of_band_path` for append-only out-of-band audit sink
+- `approval_identity_store` for canonical approval identity normalization
 - `dashboard_host`/`dashboard_port` for web UI
 
 ## Security principles

@@ -17,6 +17,7 @@ class CredentialBlastRadiusAnalyzer:
     """Estimates the spread if suspicious credentials were abused laterally."""
 
     suspicious_action_tokens = ("login", "privilege", "token", "credential", "iam")
+    suspicious_resource_tokens = ("secret", "token", "credential", "vault", "kms", "key")
 
     def analyze(self, events: list[dict[str, Any]], topology: dict[str, Any]) -> BlastRadiusReport:
         suspicious_users: set[str] = set()
@@ -28,8 +29,12 @@ class CredentialBlastRadiusAnalyzer:
             user = str(event.get("user", "unknown"))
             host = str(event.get("host", "unknown"))
             resource = str(event.get("resource", "unknown"))
+            metadata = event.get("metadata", {})
+            metadata_text = " ".join(f"{k}:{v}" for k, v in metadata.items()).lower() if isinstance(metadata, dict) else str(metadata).lower()
 
             high_risk = any(token in action for token in self.suspicious_action_tokens)
+            high_risk = high_risk or any(token in resource.lower() for token in self.suspicious_resource_tokens)
+            high_risk = high_risk or any(token in metadata_text for token in self.suspicious_resource_tokens + self.suspicious_action_tokens)
             high_risk = high_risk or float(event.get("egress_mb", 0) or 0) > 600
             high_risk = high_risk or float(event.get("api_call_count", 0) or 0) > 700
 

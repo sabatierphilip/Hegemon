@@ -6,3 +6,19 @@ detection:
     action: model_invoke
   greater_than:
     api_call_count: 500
+  dynamic_velocity:
+    metric: api_call_count
+    baseline_window_seconds: 900
+    min_samples: 4
+    multiplier: 10
+    identity_fields:
+      - user
+      - host
+  distributed_burst:
+    metric: api_call_count
+    identity_field: user
+    max_per_identity: 500
+    baseline_window_seconds: 900
+    min_identities: 4
+    min_total_api_calls: 1200
+    multiplier: 3
