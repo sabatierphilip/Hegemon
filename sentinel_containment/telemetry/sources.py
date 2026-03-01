@@ -4,6 +4,7 @@ import http.server
 import json
 import logging
 import os
+import stat
 import socketserver
 import threading
 import time
@@ -170,6 +171,20 @@ class JSONLinesFileSource:
     integrity_key: str | None = None
     _offset: int = 0
 
+    def _file_guard_verified(self) -> bool:
+        try:
+            st = self.path.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        # Reject world-writable telemetry feeds to reduce collector tampering risk.
+        if bool(st.st_mode & stat.S_IWOTH):
+            return False
+        return True
+
     def _verify_counterclone_integrity(self, payload: dict[str, Any]) -> bool:
         if self.source_type != "counterclone":
             return False
@@ -181,6 +196,7 @@ class JSONLinesFileSource:
 
         candidate = dict(payload)
         candidate.pop("counterclone_file_signature", None)
+        candidate.pop("collector_file_guard_verified", None)
         canonical = json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode("utf-8")
         expected = hmac.new(self.integrity_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, signature)
@@ -199,6 +215,7 @@ class JSONLinesFileSource:
                 try:
                     payload = json.loads(line)
                     if isinstance(payload, dict):
+                        payload["collector_file_guard_verified"] = self._file_guard_verified()
                         if self.source_type == "counterclone":
                             payload["counterclone_integrity_verified"] = self._verify_counterclone_integrity(payload)
                         self.ingestor.ingest(self.source_type, payload)
