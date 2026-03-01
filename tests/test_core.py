@@ -964,12 +964,12 @@ def test_run_cycle_executes_counter_clone_with_safety_whitelist(tmp_path):
     assert all(d.get("action") in {"read", "list", "model_invoke"} for d in synthetic_events)
 
 
-def test_run_cycle_skips_synthetic_events_across_all_analytics(tmp_path):
+def test_run_cycle_detects_untrusted_synthetic_events(tmp_path):
     index_path = tmp_path / "telemetry_index.jsonl"
     ingestor = TelemetryIngestor(index_path)
 
-    # Synthetic events should not trigger detector pipelines, attack-chain modeling,
-    # or blast-radius analysis.
+    # Untrusted synthetic events are fed through analytics to prevent synthetic-flag
+    # based blind spots and baseline poisoning.
     for event in [
         {
             "host": "h-synth",
@@ -1021,14 +1021,67 @@ def test_run_cycle_skips_synthetic_events_across_all_analytics(tmp_path):
     )
 
     assert state["events_processed"] == 3
+    assert state["alerts"]
+    assert state["attack_chains"]
+    assert state["candidate_severity"] > 0
+    assert state["credential_blast_radius"]["compromised_credentials"]
+
+
+def test_run_cycle_skips_only_integrity_verified_counterclone_synthetic(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+
+    for event in [
+        {
+            "host": "h-synth-trusted",
+            "user": "clone-shadow",
+            "process": "counter-clone",
+            "action": "list",
+            "resource": "synthetic://baseline/list",
+            "synthetic": True,
+            "counterclone_participant": True,
+            "counterclone_integrity_verified": True,
+            "api_call_count": 999,
+            "egress_mb": 999,
+            "gpu_cpu": 99,
+        },
+        {
+            "host": "h-synth-trusted",
+            "user": "clone-shadow",
+            "process": "counter-clone",
+            "action": "read",
+            "resource": "synthetic://baseline/read",
+            "synthetic": True,
+            "counterclone_participant": True,
+            "counterclone_integrity_verified": True,
+            "api_call_count": 999,
+            "egress_mb": 999,
+            "gpu_cpu": 99,
+        },
+    ]:
+        ingestor.ingest("clone_synthetic", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+            }
+        )
+    )
+
+    assert state["events_processed"] == 2
     assert state["alerts"] == []
+    assert state["baseline_anomalies"] == []
     assert state["graph_anomalies"] == []
     assert state["attack_chains"] == []
     assert state["honeypot_alerts"] == []
     assert state["mirror_alerts"] == []
     assert state["credential_blast_radius"]["compromised_credentials"] == []
-    assert state["credential_blast_radius"]["impacted_hosts"] == []
-    assert state["credential_blast_radius"]["impacted_resources"] == []
 
 
 def test_dynamic_automodeller_resists_infected_baseline_rebasing():
