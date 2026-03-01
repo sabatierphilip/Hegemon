@@ -11,6 +11,7 @@ from sentinel_containment.detection.correlator import AlertCorrelator
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.honeypot import HoneypotDetector
+from sentinel_containment.detection.mirror_clone import MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.main import run_cycle
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
@@ -52,6 +53,11 @@ class SentinelRuntime:
             settings.get("honeypot_resources", []),
             settings.get("proto_agi_indicators", []),
         )
+        self.mirror_clone_detector = MirrorCloneDetector(
+            warmup_events=int(settings.get("clone_warmup_events", 6)),
+            min_prediction_confidence=float(settings.get("clone_min_prediction_confidence", 0.65)),
+            rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
+        )
 
         self.ingestion_service = IngestionService(
             ingestor=ingestor,
@@ -71,6 +77,7 @@ class SentinelRuntime:
             graph_detector=self.graph_detector,
             sequence_model=self.sequence_model,
             honeypot_detector=self.honeypot_detector,
+            mirror_clone_detector=self.mirror_clone_detector,
         )
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")

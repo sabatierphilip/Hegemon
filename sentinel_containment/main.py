@@ -187,8 +187,41 @@ def run_cycle(
 def run_forever(config_path: str = "config/config.yaml") -> None:
     settings = Settings.load(config_path)
     interval = int(settings.get("refresh_minutes", 5)) * 60
+    baseline = BehavioralBaseline(
+        threshold=float(settings.get("anomaly_threshold", 2.0)),
+        window=int(settings.get("baseline_window", 30)),
+        min_history=int(settings.get("baseline_min_history", 5)),
+    )
+    rules = RuleEngine(
+        Path(settings.get("rules_path", "rules")),
+        dedup_window_seconds=int(settings.get("alert_dedup_window_seconds", 300)),
+    )
+    correlator = AlertCorrelator()
+    graph_detector = GraphAnomalyDetector(
+        warmup_events=int(settings.get("graph_warmup_events", 5)),
+        novelty_weight=float(settings.get("graph_novelty_weight", 1.6)),
+    )
+    sequence_model = AttackSequenceModel(chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30)))
+    honeypot_detector = HoneypotDetector(
+        settings.get("honeypot_resources", []),
+        settings.get("proto_agi_indicators", []),
+    )
+    mirror_clone_detector = MirrorCloneDetector(
+        warmup_events=int(settings.get("clone_warmup_events", 6)),
+        min_prediction_confidence=float(settings.get("clone_min_prediction_confidence", 0.65)),
+        rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
+    )
     while True:
-        run_cycle(settings)
+        run_cycle(
+            settings,
+            baseline=baseline,
+            rules=rules,
+            correlator=correlator,
+            graph_detector=graph_detector,
+            sequence_model=sequence_model,
+            honeypot_detector=honeypot_detector,
+            mirror_clone_detector=mirror_clone_detector,
+        )
         time.sleep(interval)
 
 

@@ -125,6 +125,90 @@ def test_runtime_run_once_writes_latest_state(tmp_path):
     assert state["events_processed"] >= 1
 
 
+
+def test_runtime_persists_mirror_clone_detector_across_cycles(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "host-m",
+            "user": "svc-m",
+            "action": "model_invoke",
+            "resource": "model-a",
+            "api_call_count": 120,
+            "egress_mb": 5,
+            "gpu_cpu": 10,
+        },
+    )
+
+    runtime = SentinelRuntime(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "latest_state_path": str(tmp_path / "latest_state.json"),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "ingestion": {
+                    "syslog_host": "127.0.0.1",
+                    "syslog_port": 0,
+                    "cloudtrail_file": str(tmp_path / "c.jsonl"),
+                    "network_flow_file": str(tmp_path / "n.jsonl"),
+                    "model_api_file": str(tmp_path / "m.jsonl"),
+                },
+            }
+        )
+    )
+
+    detector_id = id(runtime.mirror_clone_detector)
+    runtime.run_once()
+    first_seen_count = runtime.mirror_clone_detector._seen_events
+
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "host-m",
+            "user": "svc-m",
+            "action": "model_download",
+            "resource": "repo://weights-v2",
+        },
+    )
+    runtime.run_once()
+
+    assert id(runtime.mirror_clone_detector) == detector_id
+    assert runtime.mirror_clone_detector._seen_events > first_seen_count
+
+
+def test_run_forever_reuses_detector_instances(monkeypatch):
+    from sentinel_containment import main
+
+    calls = []
+
+    def fake_run_cycle(settings, **kwargs):
+        calls.append(kwargs)
+        return {}
+
+    def fake_sleep(_):
+        if len(calls) >= 2:
+            raise RuntimeError("stop-loop")
+
+    monkeypatch.setattr(main, "run_cycle", fake_run_cycle)
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+
+    try:
+        main.run_forever("config/config.yaml")
+    except RuntimeError as exc:
+        assert str(exc) == "stop-loop"
+
+    assert len(calls) == 2
+    first_call = calls[0]
+    second_call = calls[1]
+    assert first_call["baseline"] is second_call["baseline"]
+    assert first_call["graph_detector"] is second_call["graph_detector"]
+    assert first_call["mirror_clone_detector"] is second_call["mirror_clone_detector"]
+
+
 def test_rule_engine_dedup_window_suppresses_duplicates():
     engine = RuleEngine(dedup_window_seconds=300)
     event = {
