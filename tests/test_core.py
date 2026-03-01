@@ -1296,6 +1296,59 @@ def test_mirror_clone_generates_autonomous_recon_directives():
     assert any(a.action == "backmodel_markov_kill_chain" for a in actions)
 
 
+
+
+def test_mirror_clone_stage_two_counteroffensive_directives():
+    detector = MirrorCloneDetector(warmup_events=1)
+    events = [
+        {"host": "hunt-s2", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "prod-cluster"},
+        {"host": "hunt-s2", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-s2", "user": "svc", "process": "agent", "action": "sandbox_escape", "resource": "runtime"},
+        {"host": "hunt-s2", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+    ]
+    for event in events:
+        detector.evaluate(event)
+
+    directives = detector.generate_stage_two_counteroffensive_directives(max_directives=2, min_escalation_score=0.2)
+
+    assert directives
+    assert directives[0].threat_label == "proto_agi_escalation"
+    assert directives[0].hunter_swarm_size >= 1
+
+    actions = detector.execute_stage_two_directive(directives[0])
+    assert any(a.action == "deploy_mirror_swarm" for a in actions)
+    assert any(a.action == "isolate_proto_agi_mesh" for a in actions)
+
+
+def test_run_cycle_emits_stage_two_counteroffensive_directives(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    for event in [
+        {"host": "hunt-s2-run", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "prod-cluster"},
+        {"host": "hunt-s2-run", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-s2-run", "user": "svc", "process": "agent", "action": "sandbox_escape", "resource": "runtime"},
+        {"host": "hunt-s2-run", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+    ]:
+        ingestor.ingest("model_api", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+                "stage_two_min_escalation_score": 0.2,
+            }
+        )
+    )
+
+    assert state["stage_two_counteroffensive_directives"]
+    assert any(a["action"] == "deploy_mirror_swarm" for a in state["counter_clone_actions"])
+    assert any(r["action"] == "isolate_proto_agi_mesh" for r in state["counter_clone_execution"])
+
 def test_mirror_clone_model_invoke_hoarding_crosses_recon_threshold():
     score = MirrorCloneDetector._markov_kill_chain_score(["model_invoke", "model_invoke", "model_invoke", "model_invoke"])
     assert score >= 0.35
