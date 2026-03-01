@@ -12,6 +12,7 @@ from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
+from sentinel_containment.detection.mirror_clone import MirrorCloneDetector
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
@@ -28,6 +29,7 @@ def run_cycle(
     graph_detector: GraphAnomalyDetector | None = None,
     sequence_model: AttackSequenceModel | None = None,
     honeypot_detector: HoneypotDetector | None = None,
+    mirror_clone_detector: MirrorCloneDetector | None = None,
 ) -> dict:
     out_of_band = settings.get("audit_out_of_band_path")
     audit = ImmutableAuditLog(out_of_band_path=Path(out_of_band) if out_of_band else None)
@@ -56,6 +58,11 @@ def run_cycle(
         settings.get("honeypot_resources", []),
         settings.get("proto_agi_indicators", []),
     )
+    mirror_clone_detector = mirror_clone_detector or MirrorCloneDetector(
+        warmup_events=int(settings.get("clone_warmup_events", 6)),
+        min_prediction_confidence=float(settings.get("clone_min_prediction_confidence", 0.65)),
+        rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
+    )
     containment = ContainmentEngine(audit, identity_store=settings.get("approval_identity_store", {}))
     blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
@@ -65,11 +72,15 @@ def run_cycle(
     baseline_alerts = []
     graph_anomalies = []
     honeypot_alerts = []
+    mirror_alerts = []
+    clone_deployments = []
+    counter_clone_actions = []
 
     for event in recent_events:
         rule_alerts.extend(rules.evaluate(event))
         graph_anomalies.extend(graph_detector.evaluate(event))
         honeypot_alerts.extend(honeypot_detector.evaluate(event))
+        mirror_alerts.extend(mirror_clone_detector.evaluate(event))
         host = event.get("host", "unknown")
         metrics = {
             "api_call_rate": float(event.get("api_call_count", 0) or 0),
@@ -96,6 +107,14 @@ def run_cycle(
         candidate_severity = max(candidate_severity, max(c.severity for c in attack_chains))
     if honeypot_alerts:
         candidate_severity = max(candidate_severity, max(a.severity for a in honeypot_alerts))
+    if mirror_alerts:
+        candidate_severity = max(candidate_severity, max(a.severity for a in mirror_alerts))
+        deploy_threshold = int(settings.get("clone_deploy_severity_threshold", 75))
+        for alert in mirror_alerts:
+            if alert.severity >= deploy_threshold:
+                deployment = mirror_clone_detector.deploy_counter_clone(alert)
+                clone_deployments.append(deployment)
+                counter_clone_actions.extend(mirror_clone_detector.execute_counter_clone(deployment))
 
     immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
     should_contain = False
@@ -111,6 +130,8 @@ def run_cycle(
             target_host = rule_alerts[0].event.get("host", "unknown")
         elif honeypot_alerts:
             target_host = honeypot_alerts[0].event.get("host", "unknown")
+        elif clone_deployments:
+            target_host = clone_deployments[0].shard.split("|", 1)[0].replace("host:", "")
 
         requested_actions = [
             "disable_outbound_traffic",
@@ -147,6 +168,9 @@ def run_cycle(
         "graph_anomalies": [asdict(a) for a in graph_anomalies],
         "attack_chains": [asdict(c) for c in attack_chains],
         "honeypot_alerts": [asdict(a) for a in honeypot_alerts],
+        "mirror_alerts": [asdict(a) for a in mirror_alerts],
+        "clone_deployments": [asdict(d) for d in clone_deployments],
+        "counter_clone_actions": [asdict(a) for a in counter_clone_actions],
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
         "credential_blast_radius": asdict(blast_radius),

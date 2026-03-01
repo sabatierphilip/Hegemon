@@ -26,6 +26,7 @@ class GraphAnomalyDetector:
         self.novelty_weight = novelty_weight
         self._processed_events = 0
         self._known_edges: set[tuple[str, str, str]] = set()
+        self._known_edge_patterns: set[tuple[str, str]] = set()
         self._node_degree: dict[str, int] = {}
         self._neighbors: dict[str, set[str]] = defaultdict(set)
         self._relation_counts: dict[str, int] = defaultdict(int)
@@ -42,14 +43,20 @@ class GraphAnomalyDetector:
 
         source, target, relation = edge
         key = (source, target, relation)
+        edge_pattern = (source, relation)
         source_degree = self._node_degree.get(source, 0)
         target_degree = self._node_degree.get(target, 0)
+        known_pattern = edge_pattern in self._known_edge_patterns
 
         embedding = self._edge_embedding(source, target, relation)
         embed_distance = self._embedding_distance(embedding)
         temporal_drift = self._temporal_drift(relation)
         structural_outlier = self._structural_outlier(source, target)
-        first_seen_bonus = 1.0 if key not in self._known_edges else 0.15
+        first_seen_bonus = 1.0 if key not in self._known_edges and not known_pattern else 0.15
+
+        if known_pattern and key not in self._known_edges:
+            embed_distance *= 0.6
+            structural_outlier *= 0.35
 
         combined = (
             0.35 * min(1.0, embed_distance / 3.0)
@@ -57,6 +64,8 @@ class GraphAnomalyDetector:
             + 0.20 * structural_outlier
             + 0.20 * first_seen_bonus
         ) * self.novelty_weight
+        if known_pattern and key not in self._known_edges:
+            combined *= 0.5
         novelty_score = min(1.0, combined)
 
         anomalies: list[GraphEdgeAnomaly] = []
@@ -79,7 +88,7 @@ class GraphAnomalyDetector:
                 )
             )
 
-        self._update_models(source, target, relation, key, embedding, source_degree, target_degree)
+        self._update_models(source, target, relation, key, edge_pattern, embedding, source_degree, target_degree)
         self._processed_events += 1
         return anomalies
 
@@ -89,11 +98,13 @@ class GraphAnomalyDetector:
         target: str,
         relation: str,
         key: tuple[str, str, str],
+        edge_pattern: tuple[str, str],
         embedding: list[float],
         source_degree: int,
         target_degree: int,
     ) -> None:
         self._known_edges.add(key)
+        self._known_edge_patterns.add(edge_pattern)
         self._node_degree[source] = source_degree + 1
         self._node_degree[target] = target_degree + 1
         self._neighbors[source].add(target)
@@ -157,7 +168,7 @@ class GraphAnomalyDetector:
         resource = str(event.get("resource", "unknown"))
 
         if action == "unknown" and resource == "unknown":
-            return None
+            return (f"host:{host}", "telemetry:null_event", "unknown_activity")
 
         if user != "unknown" and host != "unknown":
             return (f"user:{user}", f"host:{host}", "accesses")

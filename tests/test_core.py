@@ -5,7 +5,9 @@ from sentinel_containment.cloud.provider import CloudProviderAdapter
 from sentinel_containment.config import Settings
 from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
+from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
+from sentinel_containment.detection.mirror_clone import MirrorAlert, MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
@@ -199,6 +201,39 @@ def test_correlator_privilege_weighting_beats_model_only():
     assert iam_score.severity > model_score.severity
 
 
+def test_baseline_detects_deviation_when_mad_collapses_to_zero():
+    baseline = BehavioralBaseline(threshold=2.0, window=30, min_history=5)
+    for _ in range(30):
+        baseline.update_and_detect("h1", {"api_call_rate": 100.0})
+
+    anomalies = baseline.update_and_detect("h1", {"api_call_rate": 150.0})
+
+    assert anomalies
+    assert anomalies[0].metric == "api_call_rate"
+
+
+def test_baseline_resists_fast_window_flush_rebasing():
+    baseline = BehavioralBaseline(threshold=2.0, window=30, min_history=5)
+    for _ in range(30):
+        baseline.update_and_detect("h1", {"api_call_rate": 50.0})
+
+    for _ in range(30):
+        baseline.update_and_detect("h1", {"api_call_rate": 0.1})
+
+    anomalies = baseline.update_and_detect("h1", {"api_call_rate": 9.9})
+
+    assert anomalies
+
+
+def test_graph_detector_tracks_unknown_events_instead_of_dropping_them():
+    detector = GraphAnomalyDetector(warmup_events=1)
+    detector.evaluate({"host": "h1", "action": "unknown", "resource": "unknown"})
+    alerts = detector.evaluate({"host": "h9", "action": "unknown", "resource": "unknown"})
+
+    assert alerts
+    assert alerts[0].relation == "unknown_activity"
+
+
 def test_graph_detector_flags_novel_edges_after_warmup():
     detector = GraphAnomalyDetector(warmup_events=2)
     no_alerts_1 = detector.evaluate({"host": "h1", "user": "u1", "action": "model_invoke"})
@@ -208,6 +243,15 @@ def test_graph_detector_flags_novel_edges_after_warmup():
     assert no_alerts_1 == []
     assert no_alerts_2 == []
     assert alerts and "Graph edge outlier" in alerts[0].reason
+
+
+def test_graph_detector_service_activity_does_not_alert_on_every_new_resource():
+    detector = GraphAnomalyDetector(warmup_events=2)
+    detector.evaluate({"host": "h1", "action": "model_invoke", "resource": "model-a"})
+    detector.evaluate({"host": "h1", "action": "model_invoke", "resource": "model-b"})
+    alerts = detector.evaluate({"host": "h1", "action": "model_invoke", "resource": "model-c"})
+
+    assert alerts == []
 
 
 def test_attack_sequence_detects_multistage_chain():
@@ -402,3 +446,194 @@ def test_run_cycle_proto_agi_honeypot_triggers_immediate_kill_chain(tmp_path):
     assert state["honeypot_alerts"][0]["classification"] == "proto_agi_honeypot_tripwire"
     assert state["honeypot_alerts"][0]["kill_chain_recommended"] is True
     assert "recursive self-improvement" in state["honeypot_alerts"][0]["matched_indicators"]
+
+
+def test_mirror_clone_deploys_counter_clone_with_minutes_sla():
+    detector = MirrorCloneDetector(warmup_events=1, rapid_clone_minutes=2)
+    seed = [
+        {"host": "h1", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h1", "user": "svc", "process": "agent", "action": "model_invoke", "resource": "m1"},
+        {"host": "h1", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+    ]
+    for e in seed:
+        detector.evaluate(e)
+
+    alerts = detector.evaluate({"host": "h1", "user": "svc", "process": "agent", "action": "network_send", "resource": "8.8.8.8"})
+    deployment = detector.deploy_counter_clone(alerts[0])
+
+    assert deployment.ready_in_minutes == 2
+    assert deployment.predicted_next_actions
+    assert deployment.deployment_id.startswith("clone::host:h1")
+    assert "generate_counterfactual_evasion_paths" in deployment.phases
+    assert deployment.synthetic_probe_sequence and deployment.containment_targets
+    assert deployment.captured_clone.transition_model
+    assert deployment.simulated_attack_path
+
+
+def test_run_cycle_emits_clone_deployments(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    for event in [
+        {"host": "h1", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h1", "user": "svc", "process": "agent", "action": "model_invoke", "resource": "m1"},
+        {"host": "h1", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h1", "user": "svc", "process": "agent", "action": "network_send", "resource": "8.8.8.8"},
+    ]:
+        ingestor.ingest("model_api", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "containment_severity_threshold": 70,
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+                "clone_min_prediction_confidence": 0.6,
+                "clone_deploy_severity_threshold": 70,
+                "clone_rapid_deploy_minutes": 2,
+            }
+        )
+    )
+
+    assert state["clone_deployments"]
+    assert state["clone_deployments"][0]["ready_in_minutes"] == 2
+    assert "phases" in state["clone_deployments"][0]
+    assert state["clone_deployments"][0]["synthetic_probe_sequence"]
+    assert state["counter_clone_actions"]
+    assert any(a["action"] == "prestage_containment" for a in state["counter_clone_actions"])
+    assert any(a["action"] == "block_simulated_path" for a in state["counter_clone_actions"])
+
+
+def test_mirror_clone_detector_flags_repeated_null_probe_traces():
+    detector = MirrorCloneDetector(warmup_events=1)
+    detector.evaluate({"host": "h1", "action": "model_invoke", "resource": "m"})
+    detector.evaluate({"host": "h1", "action": "unknown", "resource": "unknown"})
+    detector.evaluate({"host": "h1", "action": "unknown", "resource": "unknown"})
+    alerts = detector.evaluate({"host": "h1", "action": "unknown", "resource": "unknown"})
+
+    assert alerts
+    assert any("null-event probes" in a.reason for a in alerts)
+
+
+def test_mirror_clone_detector_flags_trace_divergence_from_prediction():
+    detector = MirrorCloneDetector(warmup_events=1, min_prediction_confidence=0.7)
+
+    training = [
+        {"host": "h1", "action": "login_success", "resource": "ssh"},
+        {"host": "h1", "action": "model_invoke", "resource": "m1"},
+        {"host": "h1", "action": "login_success", "resource": "ssh"},
+        {"host": "h1", "action": "model_invoke", "resource": "m1"},
+        {"host": "h1", "action": "login_success", "resource": "ssh"},
+    ]
+    for event in training:
+        detector.evaluate(event)
+
+    alerts = detector.evaluate({"host": "h1", "action": "network_send", "resource": "8.8.8.8"})
+
+    assert alerts
+    assert any("Trace divergence" in a.reason for a in alerts)
+
+
+def test_run_cycle_emits_mirror_alerts(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    for event in [
+        {"host": "h1", "action": "login_success", "resource": "ssh"},
+        {"host": "h1", "action": "unknown", "resource": "unknown"},
+        {"host": "h1", "action": "unknown", "resource": "unknown"},
+        {"host": "h1", "action": "unknown", "resource": "unknown"},
+    ]:
+        ingestor.ingest("model_api", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "containment_severity_threshold": 70,
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+            }
+        )
+    )
+
+    assert state["mirror_alerts"]
+
+
+def test_mirror_clone_deception_risk_increases_with_model_disagreement():
+    detector = MirrorCloneDetector(warmup_events=1, rapid_clone_minutes=2)
+
+    training = [
+        {"host": "h2", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h2", "user": "svc", "process": "agent", "action": "model_invoke", "resource": "m1"},
+        {"host": "h2", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h2", "user": "svc", "process": "agent", "action": "network_send", "resource": "8.8.8.8"},
+        {"host": "h2", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+    ]
+    for event in training:
+        detector.evaluate(event)
+
+    detector.evaluate({"host": "h2", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-x"})
+    alert = MirrorAlert(
+        shard="host:h2|user:svc|proc:agent",
+        mode="trace",
+        severity=88,
+        confidence=0.78,
+        reason="synthetic divergence alert",
+        event={"host": "h2", "action": "iam_privilege_change", "resource": "role-x"},
+    )
+    deployment = detector.deploy_counter_clone(alert)
+
+    assert deployment.deception_risk > 0
+    assert isinstance(deployment.phases, list) and deployment.phases
+
+
+def test_execute_counter_clone_returns_prioritized_actions():
+    detector = MirrorCloneDetector(warmup_events=1, rapid_clone_minutes=2)
+    for event in [
+        {"host": "h3", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h3", "user": "svc", "process": "agent", "action": "model_invoke", "resource": "m1"},
+        {"host": "h3", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h3", "user": "svc", "process": "agent", "action": "network_send", "resource": "8.8.4.4"},
+    ]:
+        detector.evaluate(event)
+
+    deployment = detector.deploy_counter_clone(
+        MirrorAlert(
+            shard="host:h3|user:svc|proc:agent",
+            mode="trace",
+            severity=90,
+            confidence=0.8,
+            reason="synthetic",
+            event={"host": "h3"},
+        )
+    )
+    actions = detector.execute_counter_clone(deployment)
+
+    assert actions
+    assert actions[0].priority >= actions[-1].priority
+    assert any(a.action == "emit_synthetic_probe" for a in actions)
+    assert any(a.action == "block_simulated_path" for a in actions)
+
+
+def test_capture_rogue_clone_builds_behavioral_copy():
+    detector = MirrorCloneDetector(warmup_events=1)
+    for event in [
+        {"host": "h4", "user": "svc", "process": "agent", "action": "login_success", "resource": "ssh"},
+        {"host": "h4", "user": "svc", "process": "agent", "action": "model_invoke", "resource": "m2"},
+        {"host": "h4", "user": "svc", "process": "agent", "action": "network_send", "resource": "10.0.0.1"},
+        {"host": "h4", "user": "svc", "process": "agent", "action": "model_invoke", "resource": "m2"},
+    ]:
+        detector.evaluate(event)
+
+    clone = detector.capture_rogue_clone("host:h4|user:svc|proc:agent", confidence=0.83)
+
+    assert clone.action_priors
+    assert clone.transition_model
+    assert clone.likely_resources
+    assert clone.behavioral_signature
