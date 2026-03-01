@@ -1,13 +1,100 @@
 from __future__ import annotations
 
 import json
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 from sentinel_containment.config import Settings
 
 app = Flask(__name__)
+
+
+@dataclass
+class _ClientRateState:
+    recent_requests: deque[float] = field(default_factory=deque)
+
+
+class EventTriggeredBurstGuard:
+    """Adaptive request guard that hardens limits when a flood burst is detected."""
+
+    def __init__(
+        self,
+        *,
+        base_window_seconds: float = 1.0,
+        base_limit: int = 60,
+        trigger_window_seconds: float = 5.0,
+        trigger_limit: int = 800,
+        burst_window_seconds: float = 1.0,
+        burst_limit: int = 6,
+        burst_duration_seconds: float = 30.0,
+        now_fn=time.monotonic,
+    ) -> None:
+        self.base_window_seconds = base_window_seconds
+        self.base_limit = base_limit
+        self.trigger_window_seconds = trigger_window_seconds
+        self.trigger_limit = trigger_limit
+        self.burst_window_seconds = burst_window_seconds
+        self.burst_limit = burst_limit
+        self.burst_duration_seconds = burst_duration_seconds
+        self.now_fn = now_fn
+        self._client_state: dict[str, _ClientRateState] = defaultdict(_ClientRateState)
+        self._global_recent_requests: deque[float] = deque()
+        self._burst_mode_until = 0.0
+
+    def _trim_window(self, timestamps: deque[float], now: float, window: float) -> None:
+        lower_bound = now - window
+        while timestamps and timestamps[0] < lower_bound:
+            timestamps.popleft()
+
+    def allow(self, client_id: str) -> bool:
+        now = self.now_fn()
+        self._trim_window(self._global_recent_requests, now, self.trigger_window_seconds)
+
+        if len(self._global_recent_requests) >= self.trigger_limit:
+            self._burst_mode_until = max(self._burst_mode_until, now + self.burst_duration_seconds)
+
+        in_burst_mode = now < self._burst_mode_until
+        state = self._client_state[client_id]
+        window = self.burst_window_seconds if in_burst_mode else self.base_window_seconds
+        limit = self.burst_limit if in_burst_mode else self.base_limit
+
+        self._trim_window(state.recent_requests, now, window)
+
+        if len(state.recent_requests) >= limit:
+            self._global_recent_requests.append(now)
+            return False
+
+        state.recent_requests.append(now)
+        self._global_recent_requests.append(now)
+        return True
+
+
+def _build_request_guard() -> EventTriggeredBurstGuard:
+    settings = Settings.load()
+    return EventTriggeredBurstGuard(
+        base_window_seconds=float(settings.get("web_rate_base_window_seconds", 1.0)),
+        base_limit=int(settings.get("web_rate_base_limit", 60)),
+        trigger_window_seconds=float(settings.get("web_rate_trigger_window_seconds", 5.0)),
+        trigger_limit=int(settings.get("web_rate_trigger_limit", 800)),
+        burst_window_seconds=float(settings.get("web_rate_burst_window_seconds", 1.0)),
+        burst_limit=int(settings.get("web_rate_burst_limit", 6)),
+        burst_duration_seconds=float(settings.get("web_rate_burst_duration_seconds", 30.0)),
+    )
+
+
+_request_guard = _build_request_guard()
+
+
+@app.before_request
+def enforce_request_throttle():
+    client_id = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+    client_id = client_id.split(",")[0].strip()
+    if not _request_guard.allow(client_id):
+        return jsonify({"error": "rate_limited", "message": "Event-triggered burst protection active"}), 429
 
 HTML = """
 <!doctype html>

@@ -11,6 +11,13 @@ telemetry_batch_limit: 200
 latest_state_path: data/latest_state.json
 dashboard_host: 0.0.0.0
 dashboard_port: 5000
+web_rate_base_window_seconds: 1.0
+web_rate_base_limit: 60
+web_rate_trigger_window_seconds: 5.0
+web_rate_trigger_limit: 800
+web_rate_burst_window_seconds: 1.0
+web_rate_burst_limit: 6
+web_rate_burst_duration_seconds: 30.0
 graph_warmup_events: 5
 graph_novelty_weight: 1.6
 attack_chain_window_minutes: 30

@@ -53,6 +53,7 @@ Main settings are in `config/config.yaml`:
 - `audit_out_of_band_path` for append-only out-of-band audit sink
 - `approval_identity_store` for canonical approval identity normalization
 - `dashboard_host`/`dashboard_port` for web UI
+- `web_rate_*` settings for adaptive event-triggered burst throttling that defends dashboard/API endpoints from request-flood DoS
 
 
 ## GitHub zip download + cryptographic sealing
