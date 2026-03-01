@@ -28,6 +28,10 @@ class HardwareKeyVerifier:
     def __init__(self, trusted_public_keys: dict[str, str] | None = None):
         self._trusted_public_keys = trusted_public_keys or {}
 
+    @property
+    def enabled(self) -> bool:
+        return bool(self._trusted_public_keys)
+
     @staticmethod
     def canonical_payload(
         host: str,

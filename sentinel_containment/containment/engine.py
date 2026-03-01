@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
-from sentinel_containment.security import HardwareKeyVerifier
+from sentinel_containment.security import HardwareKeyVerifier, HumanConfirmationVerifier
 
 
 @dataclass
@@ -21,6 +21,7 @@ class ContainmentEngine:
         identity_store: dict[str, list[str]] | None = None,
         required_approvals: int = 1,
         hardware_key_verifier: HardwareKeyVerifier | None = None,
+        human_confirmation_verifier: HumanConfirmationVerifier | None = None,
     ):
         self.audit_log = audit_log
         self.contained_hosts: set[str] = set()
@@ -28,6 +29,7 @@ class ContainmentEngine:
         self.required_approvals = max(1, int(required_approvals))
         self._alias_lookup = self._build_alias_lookup(self.identity_store)
         self.hardware_key_verifier = hardware_key_verifier or HardwareKeyVerifier()
+        self.human_confirmation_verifier = human_confirmation_verifier or HumanConfirmationVerifier()
 
     def execute(
         self,
@@ -40,23 +42,42 @@ class ContainmentEngine:
         hard_quarantine_threshold: int = 90,
         simulation_context: dict[str, Any] | None = None,
         signature_bundle: dict[str, Any] | None = None,
+        confirmation_bundle: dict[str, Any] | None = None,
     ) -> ContainmentResult:
-        signature_verification = self.hardware_key_verifier.verify(
+        if self.hardware_key_verifier.enabled:
+            signature_verification = self.hardware_key_verifier.verify(
+                host=host,
+                severity=severity,
+                requested_actions=requested_actions,
+                approvals=approvals,
+                signature_bundle=signature_bundle,
+            )
+            if not signature_verification.allowed:
+                self.audit_log.append("containment_denied", {
+                    "host": host,
+                    "severity": severity,
+                    "requested_actions": requested_actions,
+                    "reason": "hardware_signature_required",
+                    "message": signature_verification.message,
+                })
+                return ContainmentResult(False, [], f"Containment denied: {signature_verification.message}")
+
+        confirmation_verification = self.human_confirmation_verifier.verify(
             host=host,
             severity=severity,
             requested_actions=requested_actions,
             approvals=approvals,
-            signature_bundle=signature_bundle,
+            confirmation_bundle=confirmation_bundle,
         )
-        if not signature_verification.allowed:
+        if not confirmation_verification.allowed:
             self.audit_log.append("containment_denied", {
                 "host": host,
                 "severity": severity,
                 "requested_actions": requested_actions,
-                "reason": "hardware_signature_required",
-                "message": signature_verification.message,
+                "reason": "human_confirmation_required",
+                "message": confirmation_verification.message,
             })
-            return ContainmentResult(False, [], f"Containment denied: {signature_verification.message}")
+            return ContainmentResult(False, [], f"Containment denied: {confirmation_verification.message}")
 
         unique_approvers = self._normalize_approvals(approvals)
         if severity >= high_impact_threshold and len(unique_approvers) < self.required_approvals:

@@ -18,7 +18,7 @@ from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
-from sentinel_containment.security import HardwareKeyVerifier
+from sentinel_containment.security import HardwareKeyVerifier, HumanConfirmationVerifier
 from sentinel_containment.soar.workflow import SoarEngine
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 
@@ -30,8 +30,21 @@ def _build_hardware_key_verifier(settings: Settings) -> HardwareKeyVerifier:
     return HardwareKeyVerifier(settings.get("trusted_hardware_public_keys", {}))
 
 
+def _build_human_confirmation_verifier(settings: Settings) -> HumanConfirmationVerifier:
+    return HumanConfirmationVerifier(
+        shared_secret=str(settings.get("human_confirmation_shared_secret", "")),
+        prompt_count=int(settings.get("human_confirmation_prompt_count", 2)),
+        question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
+    )
+
+
 def _containment_signature(settings: Settings) -> dict[str, Any] | None:
     payload = settings.get("containment_signature")
+    return payload if isinstance(payload, dict) else None
+
+
+def _containment_confirmation(settings: Settings) -> dict[str, Any] | None:
+    payload = settings.get("containment_confirmation")
     return payload if isinstance(payload, dict) else None
 
 
@@ -213,6 +226,8 @@ def run_cycle(
     graph_detector = graph_detector or GraphAnomalyDetector(
         warmup_events=int(settings.get("graph_warmup_events", 5)),
         novelty_weight=float(settings.get("graph_novelty_weight", 1.6)),
+        warmup_min_distinct_sources=int(settings.get("graph_warmup_min_distinct_sources", 2)),
+        warmup_min_relations=int(settings.get("graph_warmup_min_relations", 1)),
     )
     sequence_model = sequence_model or AttackSequenceModel(
         chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
@@ -231,6 +246,7 @@ def run_cycle(
         identity_store=settings.get("approval_identity_store", {}),
         required_approvals=int(settings.get("approval_quorum", 1)),
         hardware_key_verifier=_build_hardware_key_verifier(settings),
+        human_confirmation_verifier=_build_human_confirmation_verifier(settings),
     )
     blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
@@ -410,6 +426,7 @@ def run_cycle(
             hard_quarantine_threshold=int(settings.get("hard_quarantine_threshold", 90)),
             simulation_context={"blast_radius": asdict(blast_radius)},
             signature_bundle=_containment_signature(settings),
+            confirmation_bundle=_containment_confirmation(settings),
         )
 
     state = {
@@ -455,6 +472,8 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
     graph_detector = GraphAnomalyDetector(
         warmup_events=int(settings.get("graph_warmup_events", 5)),
         novelty_weight=float(settings.get("graph_novelty_weight", 1.6)),
+        warmup_min_distinct_sources=int(settings.get("graph_warmup_min_distinct_sources", 2)),
+        warmup_min_relations=int(settings.get("graph_warmup_min_relations", 1)),
     )
     sequence_model = AttackSequenceModel(chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30)))
     honeypot_detector = HoneypotDetector(
