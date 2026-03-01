@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import math
 from statistics import mean, median
 
 
@@ -21,15 +23,24 @@ class DynamicModelState:
     resilient_mean: float
     volatility: float
     contamination_score: float
+    last_update_ts: float
 
 
 class DynamicAutoModeller:
     """Blend fast/reactive and resilient/slow models to resist poisoned baselines."""
 
-    def __init__(self):
+    def __init__(self, contamination_half_life_seconds: float = 180.0):
         self._state: dict[tuple[str, str], DynamicModelState] = {}
+        self._half_life = max(30.0, float(contamination_half_life_seconds))
 
-    def update(self, key: tuple[str, str], current: float, trusted_signal: bool = False) -> DynamicModelState:
+    def update(
+        self,
+        key: tuple[str, str],
+        current: float,
+        trusted_signal: bool = False,
+        event_ts: str | None = None,
+    ) -> DynamicModelState:
+        current_ts = self._to_epoch_seconds(event_ts)
         state = self._state.get(key)
         if state is None:
             state = DynamicModelState(
@@ -37,6 +48,7 @@ class DynamicAutoModeller:
                 resilient_mean=current,
                 volatility=max(0.25, abs(current) * 0.05),
                 contamination_score=0.0,
+                last_update_ts=current_ts,
             )
             self._state[key] = state
             return state
@@ -54,19 +66,38 @@ class DynamicAutoModeller:
 
         divergence = abs(state.fast_mean - state.resilient_mean)
         poison_pressure = divergence / max(state.volatility, 0.25)
-        decay = 0.90 if trusted_signal else 0.94
+        elapsed_seconds = max(0.0, current_ts - state.last_update_ts)
+        decay = math.exp(-math.log(2.0) * (elapsed_seconds / self._half_life))
+        if trusted_signal:
+            decay = max(0.82, decay)
         state.contamination_score = max(0.0, (state.contamination_score * decay) + max(0.0, poison_pressure - 1.4))
+        state.last_update_ts = current_ts
         return state
+
+    @staticmethod
+    def _to_epoch_seconds(event_ts: str | None) -> float:
+        if not event_ts:
+            return 0.0
+        try:
+            return datetime.fromisoformat(event_ts.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
 
 
 class BehavioralBaseline:
-    def __init__(self, threshold: float = 2.0, window: int = 30, min_history: int = 5):
+    def __init__(
+        self,
+        threshold: float = 2.0,
+        window: int = 30,
+        min_history: int = 5,
+        contamination_half_life_seconds: float = 180.0,
+    ):
         self.threshold = threshold
         self.window = window
         self.min_history = min_history
         self.series: dict[tuple[str, str], deque[float]] = defaultdict(lambda: deque(maxlen=window))
         self._anchor_mean: dict[tuple[str, str], float] = {}
-        self._automodeller = DynamicAutoModeller()
+        self._automodeller = DynamicAutoModeller(contamination_half_life_seconds=contamination_half_life_seconds)
 
     def update_and_detect(
         self,
@@ -75,14 +106,22 @@ class BehavioralBaseline:
         context: dict[str, float | bool | str] | None = None,
     ) -> list[BaselineAnomaly]:
         anomalies: list[BaselineAnomaly] = []
-        trusted_signal = bool((context or {}).get("counterclone_participant", False))
+        source_type = str((context or {}).get("source_type", "unknown"))
+        trusted_signal = bool((context or {}).get("counterclone_participant", False)) and source_type == "counterclone"
+        trusted_signal = trusted_signal and bool((context or {}).get("counterclone_integrity_verified", False))
+        event_ts = str((context or {}).get("event_timestamp", "")) or None
         for metric, current in metrics.items():
             key = (host, metric)
             history = self.series[key]
             avg = mean(history) if history else current
 
             anchor = self._anchor_mean.get(key, avg)
-            dynamic_state = self._automodeller.update(key, current, trusted_signal=trusted_signal)
+            dynamic_state = self._automodeller.update(
+                key,
+                current,
+                trusted_signal=trusted_signal,
+                event_ts=event_ts,
+            )
             dynamic_reference = max(dynamic_state.fast_mean, dynamic_state.resilient_mean)
             protected_avg = max(avg, anchor, dynamic_reference)
             ratio = (current / protected_avg) if protected_avg > 0 else 1.0

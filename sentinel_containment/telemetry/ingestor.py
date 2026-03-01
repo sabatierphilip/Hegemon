@@ -59,6 +59,7 @@ class TelemetryIngestor:
             "telemetry_scope": raw_event.get("telemetry_scope", source_type),
             "source_type": source_type,
             "counterclone_participant": bool(raw_event.get("counterclone_participant", source_type == "counterclone")),
+            "counterclone_integrity_verified": bool(raw_event.get("counterclone_integrity_verified", False)),
             "hypervisor_visible": bool(raw_event.get("hypervisor_visible", source_type == "hypervisor")),
             "integrity": {
                 "prev_chain_hash": prev_chain_hash,

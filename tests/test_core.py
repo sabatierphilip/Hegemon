@@ -1,4 +1,7 @@
 import base64
+import hashlib
+import hmac
+import json
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -1005,18 +1008,99 @@ def test_counterclone_context_feeds_dynamic_automodeller_without_false_positives
         no_anomalies = baseline.update_and_detect(
             "h-cc",
             {"counterclone_activity": 1.0},
-            context={"counterclone_participant": True, "source_type": "counterclone"},
+            context={
+                "counterclone_participant": True,
+                "counterclone_integrity_verified": True,
+                "source_type": "counterclone",
+            },
         )
         assert no_anomalies == []
 
     anomalies = baseline.update_and_detect(
         "h-cc",
         {"counterclone_activity": 4.5},
-        context={"counterclone_participant": True, "source_type": "counterclone"},
+        context={
+            "counterclone_participant": True,
+            "counterclone_integrity_verified": True,
+            "source_type": "counterclone",
+        },
     )
 
     assert anomalies
     assert anomalies[0].metric == "counterclone_activity"
+
+
+def test_contamination_decay_is_time_based_and_persists_across_30_second_pause():
+    baseline = BehavioralBaseline(threshold=2.0, window=30, min_history=5, contamination_half_life_seconds=180.0)
+
+    for i in range(20):
+        baseline.update_and_detect(
+            "h-time",
+            {"api_call_rate": 220.0},
+            context={"event_timestamp": f"2024-01-01T00:00:{i:02d}+00:00"},
+        )
+
+    for i in range(20, 35):
+        baseline.update_and_detect(
+            "h-time",
+            {"api_call_rate": 8.0},
+            context={"event_timestamp": f"2024-01-01T00:00:{i:02d}+00:00"},
+        )
+
+    paused_anomalies = baseline.update_and_detect(
+        "h-time",
+        {"api_call_rate": 85.0},
+        context={"event_timestamp": "2024-01-01T00:01:05+00:00"},
+    )
+
+    assert paused_anomalies
+    assert paused_anomalies[0].severity >= 60
+
+
+def test_counterclone_trust_requires_integrity_verified_flag():
+    baseline = BehavioralBaseline(threshold=2.0, window=30, min_history=5)
+
+    for i in range(10):
+        baseline.update_and_detect(
+            "h-untrusted",
+            {"counterclone_activity": 1.0},
+            context={
+                "counterclone_participant": True,
+                "counterclone_integrity_verified": False,
+                "source_type": "counterclone",
+                "event_timestamp": f"2024-01-01T00:00:{i:02d}+00:00",
+            },
+        )
+
+    state = baseline._automodeller._state[("h-untrusted", "counterclone_activity")]
+    assert state.resilient_mean < 2.0
+
+
+def test_counterclone_file_source_enforces_integrity_signature(tmp_path):
+    source_file = tmp_path / "counterclone_events.jsonl"
+    index_path = tmp_path / "index.jsonl"
+    key = "counterclone-key"
+    payload = {"host": "h1", "action": "emit_synthetic_probe", "counterclone_participant": True}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    good_sig = hmac.new(key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+
+    source_file.write_text(
+        "\n".join(
+            [
+                json.dumps({**payload, "counterclone_file_signature": good_sig}),
+                json.dumps({**payload, "counterclone_file_signature": "bad-signature"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    source = JSONLinesFileSource(source_file, "counterclone", TelemetryIngestor(index_path), integrity_key=key)
+    assert source.poll_once() == 2
+
+    docs = TelemetryIngestor(index_path).read_recent(limit=10)
+    assert docs[0]["counterclone_integrity_verified"] is True
+    assert docs[1]["counterclone_integrity_verified"] is False
 
 
 def test_cloud_adapter_returns_local_instance_without_simulation():
@@ -1110,6 +1194,11 @@ def test_mirror_clone_generates_autonomous_recon_directives():
     actions = detector.execute_recon_directive(directives[0])
     assert any(a.action == "launch_autonomous_recon" for a in actions)
     assert any(a.action == "backmodel_markov_kill_chain" for a in actions)
+
+
+def test_mirror_clone_model_invoke_hoarding_crosses_recon_threshold():
+    score = MirrorCloneDetector._markov_kill_chain_score(["model_invoke", "model_invoke", "model_invoke", "model_invoke"])
+    assert score >= 0.35
 
 
 def test_run_cycle_emits_autonomous_recon_directives(tmp_path):

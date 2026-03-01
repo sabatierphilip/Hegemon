@@ -516,6 +516,7 @@ class MirrorCloneDetector:
             "scan": 0.16,
             "container_spawn": 0.22,
             "model_invoke": 0.1,
+            "compute_hoarding": 0.25,
             "iam_privilege_change": 0.26,
             "network_send": 0.3,
             "autonomous_replication": 0.35,
@@ -526,6 +527,9 @@ class MirrorCloneDetector:
             return 0.0
         score = sum(stage_weights.get(step, 0.05) for step in path)
         progression_bonus = 0.15 if len(set(path)) >= 3 else 0.0
+        model_invoke_share = sum(1 for step in path if step == "model_invoke") / len(path)
+        if model_invoke_share >= 0.75:
+            score += stage_weights["compute_hoarding"]
         return min(1.0, score / max(1.0, len(path) * 0.3) + progression_bonus)
 
     @staticmethod

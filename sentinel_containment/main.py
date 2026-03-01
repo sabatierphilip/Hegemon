@@ -266,7 +266,9 @@ def run_cycle(
                     metrics,
                     context={
                         "counterclone_participant": bool(event.get("counterclone_participant", False)),
+                        "counterclone_integrity_verified": bool(event.get("counterclone_integrity_verified", False)),
                         "source_type": str(event.get("source_type", "unknown")),
+                        "event_timestamp": str(event.get("@timestamp", "")),
                     },
                 )
             )
