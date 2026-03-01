@@ -259,6 +259,37 @@ def should_simulate_containment(settings: Settings, severity: int, blast_radius_
     return True
 
 
+def distributed_attack_signal(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Estimate whether activity is intentionally sharded across identities."""
+    shards: set[tuple[str, str, str]] = set()
+    suspicious_actions = 0
+    egress_events = 0
+    for event in events:
+        host = str(event.get("host", "unknown"))
+        user = str(event.get("user", "unknown"))
+        process = str(event.get("process", "unknown"))
+        shards.add((host, user, process))
+
+        action = str(event.get("action", "")).lower()
+        resource = str(event.get("resource", "")).lower()
+        payload = f"{action} {resource}"
+        if any(token in payload for token in ("scan", "list", "read", "query", "network_send", "egress", "upload")):
+            suspicious_actions += 1
+        if float(event.get("egress_mb", 0) or 0) >= 80 or action in {"network_send", "upload", "egress"}:
+            egress_events += 1
+
+    shard_count = len(shards)
+    suspicious_density = (suspicious_actions / max(1, len(events))) if events else 0.0
+    score = min(1.0, (shard_count / 4.0) * 0.55 + suspicious_density * 0.30 + min(1.0, egress_events / 2.0) * 0.15)
+    return {
+        "shard_count": shard_count,
+        "suspicious_density": round(suspicious_density, 4),
+        "egress_events": egress_events,
+        "score": round(score, 4),
+        "is_distributed": shard_count >= 3 and suspicious_density >= 0.45,
+    }
+
+
 def run_cycle(
     settings: Settings,
     baseline: BehavioralBaseline | None = None,
@@ -465,12 +496,24 @@ def run_cycle(
         mirror_alerts,
         blast_radius.estimated_impact_score,
     )
+    distributed_signal = distributed_attack_signal(detector_events)
+    if distributed_signal["is_distributed"]:
+        severity_boost = int(8 + distributed_signal["score"] * 12)
+        candidate_severity = min(100, candidate_severity + severity_boost)
+        risk_confidence = min(1.0, round(risk_confidence + 0.12 + distributed_signal["score"] * 0.10, 4))
+
     should_contain = False
     if immediate_honeypot_containment:
         should_contain = True
     elif candidate_severity and baseline_ready and candidate_severity >= int(settings.get("containment_severity_threshold", 70)):
         should_contain = True
     elif candidate_severity >= int(settings.get("fast_track_containment_threshold", 85)) and risk_confidence >= float(settings.get("fast_track_risk_confidence", 0.65)):
+        should_contain = True
+    elif (
+        distributed_signal["is_distributed"]
+        and candidate_severity >= int(settings.get("distributed_attack_containment_threshold", 78))
+        and risk_confidence >= float(settings.get("distributed_attack_risk_confidence", 0.68))
+    ):
         should_contain = True
 
     if should_contain:
@@ -543,6 +586,7 @@ def run_cycle(
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
         "risk_confidence": risk_confidence,
+        "distributed_attack_signal": distributed_signal,
         "credential_blast_radius": asdict(blast_radius),
         "containment": asdict(containment_result) if containment_result else None,
         "baseline_ready": baseline_ready,
