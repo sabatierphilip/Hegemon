@@ -48,6 +48,7 @@ class ContainmentEngine:
             "disable_iam_sessions",
             "quarantine_host",
             "pause_model_serving_container",
+            "kill_active_model_sessions",
             "forensic_snapshot_metadata",
         }
 

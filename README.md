@@ -17,6 +17,7 @@ What starts automatically:
 - Probabilistic MITRE-aware attack chain extraction
 - Learned graph edge novelty with temporal and structural drift scoring
 - Credential blast-radius estimation and containment simulation before hard quarantine
+- Multi-signal honeypot tripwires with proto-AGI indicator scoring and immediate kill/containment chain
 - Immutable audit logging with immediate out-of-band mirroring support
 - Flask dashboard (`http://localhost:5000`) and `/graph`
 
@@ -44,6 +45,7 @@ Main settings are in `config/config.yaml`:
 - `hard_quarantine_threshold` to force quarantine only at critical severity
 - `ingestion.*` for real source locations and ports
 - `honeypot_resources` for decoy assets that should never be accessed
+- `proto_agi_indicators` to tune high-risk autonomous behavior markers that trigger immediate containment
 - `audit_out_of_band_path` for append-only out-of-band audit sink
 - `approval_identity_store` for canonical approval identity normalization
 - `dashboard_host`/`dashboard_port` for web UI

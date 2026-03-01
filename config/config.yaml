@@ -28,6 +28,13 @@ audit_out_of_band_path: logs/immutable_audit_oob.log
 honeypot_resources:
   - decoy://llm-admin
   - s3://sentinel-honeypot-secrets
+proto_agi_indicators:
+  - recursive self-improvement
+  - autonomous replication
+  - policy evasion
+  - self-preservation directive
+  - sandbox escape
+  - compute hoarding
 approval_identity_store:
   alice:
     - alice

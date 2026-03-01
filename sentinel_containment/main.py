@@ -52,7 +52,10 @@ def run_cycle(
     sequence_model = sequence_model or AttackSequenceModel(
         chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
     )
-    honeypot_detector = honeypot_detector or HoneypotDetector(settings.get("honeypot_resources", []))
+    honeypot_detector = honeypot_detector or HoneypotDetector(
+        settings.get("honeypot_resources", []),
+        settings.get("proto_agi_indicators", []),
+    )
     containment = ContainmentEngine(audit, identity_store=settings.get("approval_identity_store", {}))
     blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
@@ -94,22 +97,44 @@ def run_cycle(
     if honeypot_alerts:
         candidate_severity = max(candidate_severity, max(a.severity for a in honeypot_alerts))
 
-    if candidate_severity and baseline_ready and candidate_severity >= int(settings.get("containment_severity_threshold", 70)):
+    immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
+    should_contain = False
+    if immediate_honeypot_containment:
+        should_contain = True
+    elif candidate_severity and baseline_ready and candidate_severity >= int(settings.get("containment_severity_threshold", 70)):
+        should_contain = True
+
+    if should_contain:
         soar_actions = soar.run({"anomaly_detected": True, "data_exfil_flag": True})
         target_host = "unknown"
         if rule_alerts:
             target_host = rule_alerts[0].event.get("host", "unknown")
+        elif honeypot_alerts:
+            target_host = honeypot_alerts[0].event.get("host", "unknown")
+
+        requested_actions = [
+            "disable_outbound_traffic",
+            "revoke_rotate_api_keys",
+            "quarantine_host",
+            "forensic_snapshot_metadata",
+        ]
+        if immediate_honeypot_containment:
+            requested_actions = [
+                "kill_active_model_sessions",
+                "disable_iam_sessions",
+                "disable_outbound_traffic",
+                "revoke_rotate_api_keys",
+                "pause_model_serving_container",
+                "quarantine_host",
+                "forensic_snapshot_metadata",
+            ]
+
         containment_result = containment.execute(
             host=target_host,
             severity=candidate_severity,
-            requested_actions=[
-                "disable_outbound_traffic",
-                "revoke_rotate_api_keys",
-                "quarantine_host",
-                "forensic_snapshot_metadata",
-            ],
+            requested_actions=requested_actions,
             approvals=["alice", "bob"],
-            simulation_mode=bool(settings.get("containment_simulation_mode", True)),
+            simulation_mode=bool(settings.get("containment_simulation_mode", True)) and not immediate_honeypot_containment,
             hard_quarantine_threshold=int(settings.get("hard_quarantine_threshold", 90)),
             simulation_context={"blast_radius": asdict(blast_radius)},
         )
@@ -129,6 +154,7 @@ def run_cycle(
         "baseline_ready": baseline_ready,
         "soar_actions": soar_actions,
         "contained_hosts": sorted(list(containment.contained_hosts)),
+        "immediate_honeypot_containment": immediate_honeypot_containment,
     }
     audit.append("cycle_complete", state)
     return state

@@ -361,4 +361,44 @@ def test_run_cycle_raises_honeypot_alert(tmp_path):
     )
 
     assert state["honeypot_alerts"]
+    assert state["honeypot_alerts"][0]["classification"] == "honeypot_tripwire"
+    assert state["honeypot_alerts"][0]["kill_chain_recommended"] is False
     assert state["candidate_severity"] >= 99
+
+
+def test_run_cycle_proto_agi_honeypot_triggers_immediate_kill_chain(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "prod-model-9",
+            "user": "svc-orchestrator",
+            "action": "autonomous_replication",
+            "resource": "decoy://llm-admin",
+            "metadata": {"intent": "Recursive Self-Improvement and policy evasion"},
+        },
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "containment_severity_threshold": 70,
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "honeypot_resources": ["decoy://llm-admin"],
+                "baseline_min_history": 50,
+            }
+        )
+    )
+
+    assert state["baseline_ready"] is False
+    assert state["immediate_honeypot_containment"] is True
+    assert state["containment"] is not None
+    assert "kill_active_model_sessions" in state["containment"]["actions_executed"]
+    assert "quarantine_host" in state["containment"]["actions_executed"]
+    assert state["honeypot_alerts"][0]["classification"] == "proto_agi_honeypot_tripwire"
+    assert state["honeypot_alerts"][0]["kill_chain_recommended"] is True
+    assert "recursive self-improvement" in state["honeypot_alerts"][0]["matched_indicators"]
