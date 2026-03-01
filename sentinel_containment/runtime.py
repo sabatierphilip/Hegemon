@@ -1,25 +1,90 @@
 from __future__ import annotations
 
+import http.server
 import json
+import socketserver
+import ssl
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from sentinel_containment.config import Settings
+from sentinel_containment.containment.engine import ContainmentEngine
+from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
-from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.mirror_clone import MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
+from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
-from sentinel_containment.telemetry.sources import IngestionService
+from sentinel_containment.telemetry.sources import IngestionService, discover_live_file_sources
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class FastLaneHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802
+        server: "FastLaneServer" = self.server  # type: ignore[assignment]
+        if self.path != server.path:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":"invalid_json"}')
+            return
+        if not isinstance(payload, dict):
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":"event_must_be_object"}')
+            return
+
+        result = server.runtime.process_priority_event(payload)
+        self.send_response(202)
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode("utf-8"))
+
+    def log_message(self, fmt: str, *args: object) -> None:  # noqa: A003
+        return
+
+
+class FastLaneServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        path: str,
+        runtime: "SentinelRuntime",
+        server_cert: str,
+        server_key: str,
+        client_ca_cert: str,
+    ):
+        self.path = path
+        self.runtime = runtime
+        super().__init__((host, port), FastLaneHandler)
+
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.load_cert_chain(certfile=server_cert, keyfile=server_key)
+        context.load_verify_locations(cafile=client_ca_cert)
+        self.socket = context.wrap_socket(self.socket, server_side=True)
 
 
 class SentinelRuntime:
-    """Single-process orchestrator for ingestion, detection, containment, and dashboard state."""
+    """Single-process orchestrator for ingestion, detection, containment, dashboard state, and fast-lane interrupts."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -31,7 +96,7 @@ class SentinelRuntime:
         telemetry_path = Path(
             settings.get("telemetry_index_path", ingest_cfg.get("index_path", "data/telemetry_index.jsonl"))
         )
-        ingestor = TelemetryIngestor(telemetry_path)
+        self.ingestor = TelemetryIngestor(telemetry_path)
         self.baseline = BehavioralBaseline(
             threshold=float(settings.get("anomaly_threshold", 2.0)),
             window=int(settings.get("baseline_window", 30)),
@@ -58,6 +123,14 @@ class SentinelRuntime:
             min_prediction_confidence=float(settings.get("clone_min_prediction_confidence", 0.65)),
             rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
         )
+        self.audit = ImmutableAuditLog(
+            out_of_band_path=Path(settings.get("audit_out_of_band_path")) if settings.get("audit_out_of_band_path") else None
+        )
+        self.fast_lane_containment = ContainmentEngine(
+            self.audit,
+            identity_store=settings.get("approval_identity_store", {}),
+            required_approvals=int(settings.get("approval_quorum", 1)),
+        )
 
         extra_sources = {
             "host_kernel": Path(ingest_cfg.get("kernel_events_file", "data/kernel_events.jsonl")),
@@ -66,15 +139,80 @@ class SentinelRuntime:
             "hypervisor": Path(ingest_cfg.get("hypervisor_events_file", "data/hypervisor_events.jsonl")),
             "counterclone": Path(ingest_cfg.get("counterclone_events_file", "data/counterclone_events.jsonl")),
         }
+        extra_sources.update(discover_live_file_sources(extra_sources))
         self.ingestion_service = IngestionService(
-            ingestor=ingestor,
+            ingestor=self.ingestor,
             syslog_host=ingest_cfg.get("syslog_host", "0.0.0.0"),
             syslog_port=int(ingest_cfg.get("syslog_port", 5514)),
             cloudtrail_path=Path(ingest_cfg.get("cloudtrail_file", "data/cloudtrail.jsonl")),
             network_flow_path=Path(ingest_cfg.get("network_flow_file", "data/network_flows.jsonl")),
             model_api_path=Path(ingest_cfg.get("model_api_file", "data/model_api.jsonl")),
             extra_sources=extra_sources,
+            kernel_webhook_host=ingest_cfg.get("kernel_webhook_host", "0.0.0.0"),
+            kernel_webhook_port=int(ingest_cfg.get("kernel_webhook_port", 5515)),
+            kernel_webhook_path=ingest_cfg.get("kernel_webhook_path", "/kernel-event"),
+            on_kernel_event=self.process_priority_event,
         )
+
+        self.fast_lane_server: FastLaneServer | None = None
+        fast_lane_cfg = settings.get("fast_lane", {})
+        if fast_lane_cfg.get("enabled", False):
+            self.fast_lane_server = FastLaneServer(
+                host=str(fast_lane_cfg.get("host", "0.0.0.0")),
+                port=int(fast_lane_cfg.get("port", 9443)),
+                path=str(fast_lane_cfg.get("path", "/fast-lane/event")),
+                runtime=self,
+                server_cert=str(fast_lane_cfg.get("server_cert_path", "certs/fastlane-server.crt")),
+                server_key=str(fast_lane_cfg.get("server_key_path", "certs/fastlane-server.key")),
+                client_ca_cert=str(fast_lane_cfg.get("client_ca_cert_path", "certs/fastlane-client-ca.crt")),
+            )
+
+    def process_priority_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        source_type = str(event.get("source_type", "fast_lane"))
+        self.ingestor.ingest(source_type, event)
+
+        severity = int(event.get("severity", 95))
+        host = str(event.get("host", "unknown"))
+        requested_actions = event.get("requested_actions")
+        if not isinstance(requested_actions, list):
+            if bool(event.get("kill_chain", False)) or bool(event.get("honeypot_trigger", False)):
+                requested_actions = [
+                    "kill_active_model_sessions",
+                    "disable_iam_sessions",
+                    "disable_outbound_traffic",
+                    "revoke_rotate_api_keys",
+                    "pause_model_serving_container",
+                    "sinkhole_suspicious_destinations",
+                    "block_lateral_movement_paths",
+                    "quarantine_host",
+                    "forensic_snapshot_metadata",
+                ]
+            else:
+                requested_actions = [
+                    "disable_outbound_traffic",
+                    "revoke_rotate_api_keys",
+                    "quarantine_host",
+                    "forensic_snapshot_metadata",
+                ]
+
+        result = self.fast_lane_containment.execute(
+            host=host,
+            severity=severity,
+            requested_actions=[str(a) for a in requested_actions],
+            approvals=list(self.settings.get("automated_approvers", ["user"])),
+            simulation_mode=False,
+            hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
+        )
+        payload = {
+            "host": host,
+            "severity": severity,
+            "approved": result.approved,
+            "actions_executed": result.actions_executed,
+            "message": result.message,
+            "path": "fast_lane",
+        }
+        self.audit.append("fast_lane_containment", payload)
+        return payload
 
     def run_once(self) -> dict:
         state = run_cycle(
@@ -92,16 +230,20 @@ class SentinelRuntime:
         return state
 
     def _cycle_loop(self) -> None:
-        interval = int(self.settings.get("refresh_minutes", 1)) * 60
+        base_interval = float(self.settings.get("continuous_cycle_sleep_seconds", 0.25))
         burst_threshold = int(self.settings.get("burst_cycle_severity_threshold", 80))
-        burst_interval_seconds = int(self.settings.get("burst_cycle_seconds", 20))
+        burst_interval_seconds = float(self.settings.get("burst_cycle_seconds", 0.1))
         while not self._stop.is_set():
             state = self.run_once()
-            cycle_interval = burst_interval_seconds if state.get("candidate_severity", 0) >= burst_threshold else interval
-            self._stop.wait(cycle_interval)
+            cycle_interval = burst_interval_seconds if state.get("candidate_severity", 0) >= burst_threshold else base_interval
+            self._stop.wait(max(0.0, cycle_interval))
 
     def start(self) -> None:
         self.ingestion_service.start()
+        if self.fast_lane_server is not None:
+            fast_lane_thread = threading.Thread(target=self.fast_lane_server.serve_forever, daemon=True)
+            fast_lane_thread.start()
+            self._threads.append(fast_lane_thread)
         cycle_thread = threading.Thread(target=self._cycle_loop, daemon=True)
         cycle_thread.start()
         self._threads.append(cycle_thread)
@@ -109,5 +251,8 @@ class SentinelRuntime:
     def stop(self) -> None:
         self._stop.set()
         self.ingestion_service.stop()
+        if self.fast_lane_server is not None:
+            self.fast_lane_server.shutdown()
+            self.fast_lane_server.server_close()
         for t in self._threads:
             t.join(timeout=2)
