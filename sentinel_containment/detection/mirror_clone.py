@@ -60,8 +60,11 @@ class ReconDirective:
     shard: str
     confidence: float
     markov_kill_chain_score: float
+    trajectory_score: float
     predicted_path: list[str]
+    branch_paths: list[list[str]]
     target_resource: str
+    objective: str
     rationale: str
 
 
@@ -108,28 +111,45 @@ class MirrorCloneDetector:
             if markov_score < min_markov_score:
                 continue
 
+            branch_paths = self._predict_markov_branches(shard, horizon=4, beam_width=3)
+            branch_scores = [self._markov_kill_chain_score(branch) for branch, _ in branch_paths]
+            transition_drift = self._model_disagreement(shard)
+            resource_risk = self._resource_risk_score(shard, path[0])
+            trajectory_score = self._trajectory_score(
+                confidence,
+                markov_score,
+                max(branch_scores) if branch_scores else 0.0,
+                transition_drift,
+                resource_risk,
+            )
+
             candidate_resources = self._resource_counts[shard].get(path[0], {})
             target_resource = (
                 max(candidate_resources.items(), key=lambda item: item[1])[0]
                 if candidate_resources
                 else "synthetic://unknown"
             )
+            objective = self._hunt_objective(path, resource_risk)
             directives.append(
                 ReconDirective(
                     shard=shard,
                     confidence=round(confidence, 3),
                     markov_kill_chain_score=round(markov_score, 3),
+                    trajectory_score=round(trajectory_score, 3),
                     predicted_path=path,
+                    branch_paths=[branch for branch, _ in branch_paths],
                     target_resource=target_resource,
+                    objective=objective,
                     rationale=(
-                        "Autonomous hunter directive generated from Markov kill-chain backmodeling; "
-                        "counter-clone seeks rogue behavior before inbound alerts"
+                        f"Autonomous hunter directive generated from multi-branch Markov trajectory modeling "
+                        f"with transition drift={transition_drift:.2f} and resource-risk={resource_risk:.2f}; "
+                        f"objective={objective}"
                     ),
                 )
             )
 
         directives.sort(
-            key=lambda item: (item.markov_kill_chain_score, item.confidence),
+            key=lambda item: (item.trajectory_score, item.markov_kill_chain_score, item.confidence),
             reverse=True,
         )
         return directives[:max(0, max_directives)]
@@ -143,7 +163,7 @@ class MirrorCloneDetector:
                 action="launch_autonomous_recon",
                 target=f"{primary_action}@{directive.target_resource}",
                 rationale=directive.rationale,
-                priority=min(98, 72 + int(directive.markov_kill_chain_score * 20)),
+                priority=min(98, 72 + int(directive.trajectory_score * 20)),
             ),
             CounterCloneAction(
                 shard=directive.shard,
@@ -151,6 +171,20 @@ class MirrorCloneDetector:
                 target="->".join(directive.predicted_path),
                 rationale="Continuously update rogue trajectory model and pre-compute interception points",
                 priority=min(97, 70 + int(directive.confidence * 20)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="simulate_branch_intercepts",
+                target=" || ".join("->".join(path) for path in directive.branch_paths[:3]) or "unknown",
+                rationale="Proactively stage branch-specific interception for alternate clone routes",
+                priority=min(96, 68 + int(directive.markov_kill_chain_score * 24)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="seed_honeypot_route",
+                target=directive.target_resource,
+                rationale=f"Objective={directive.objective}: bait high-risk clone path into controlled synthetic route",
+                priority=min(95, 66 + int(directive.trajectory_score * 18)),
             ),
             CounterCloneAction(
                 shard=directive.shard,
@@ -508,6 +542,76 @@ class MirrorCloneDetector:
             path.append(next_action)
             current = next_action
         return path, min(1.0, confidence)
+
+    def _predict_markov_branches(self, shard: str, horizon: int = 4, beam_width: int = 3) -> list[tuple[list[str], float]]:
+        priors = self._action_counts[shard]
+        total_priors = float(sum(priors.values()))
+        if total_priors <= 0:
+            return []
+
+        beam: list[tuple[list[str], float]] = [([action], count / total_priors) for action, count in priors.items()]
+        beam.sort(key=lambda item: item[1], reverse=True)
+        beam = beam[: max(1, beam_width)]
+
+        for _ in range(max(0, horizon - 1)):
+            expanded: list[tuple[list[str], float]] = []
+            for path, score in beam:
+                current = path[-1]
+                transitions = self._transitions[shard].get(current, {})
+                t_total = float(sum(transitions.values()))
+                if t_total <= 0:
+                    expanded.append((path, score))
+                    continue
+
+                ranked = sorted(transitions.items(), key=lambda item: item[1], reverse=True)[: max(1, beam_width)]
+                for next_action, next_count in ranked:
+                    expanded.append((path + [next_action], score * (next_count / t_total)))
+
+            expanded.sort(key=lambda item: item[1], reverse=True)
+            beam = expanded[: max(1, beam_width)]
+
+        return beam
+
+    def _resource_risk_score(self, shard: str, action: str) -> float:
+        resources = self._resource_counts[shard].get(action, {})
+        if not resources:
+            return 0.1
+
+        high_risk_tokens = ("admin", "root", "prod", "secret", "token", "iam", "8.", "http://", "https://")
+        total = float(sum(resources.values()))
+        weighted = 0.0
+        for name, count in resources.items():
+            lowered = name.lower()
+            token_hits = sum(1 for token in high_risk_tokens if token in lowered)
+            density = min(1.0, token_hits / 3.0)
+            weighted += (count / total) * (0.25 + 0.75 * density)
+        return min(1.0, weighted)
+
+    @staticmethod
+    def _trajectory_score(
+        confidence: float,
+        markov_score: float,
+        branch_score: float,
+        transition_drift: float,
+        resource_risk: float,
+    ) -> float:
+        return min(
+            1.0,
+            (0.25 * confidence)
+            + (0.30 * markov_score)
+            + (0.15 * branch_score)
+            + (0.15 * transition_drift)
+            + (0.15 * resource_risk),
+        )
+
+    @staticmethod
+    def _hunt_objective(path: list[str], resource_risk: float) -> str:
+        high_impact_actions = {"iam_privilege_change", "sandbox_escape", "autonomous_replication", "network_send"}
+        if any(step in high_impact_actions for step in path):
+            return "preempt_lateral_and_egress"
+        if resource_risk >= 0.65:
+            return "credential_and_secret_tracing"
+        return "behavioral_recon_baselining"
 
     @staticmethod
     def _markov_kill_chain_score(path: list[str]) -> float:

@@ -134,6 +134,36 @@ def execute_counter_clone_actions(
             _record(action, target, "executed", {"model": "markov", "status": "updated"})
             continue
 
+        if action == "simulate_branch_intercepts":
+            intercepts = [segment.strip() for segment in target.split("||") if segment.strip()]
+            _record(
+                action,
+                target,
+                "executed",
+                {
+                    "branch_count": len(intercepts),
+                    "status": "intercepts_staged",
+                },
+            )
+            continue
+
+        if action == "seed_honeypot_route":
+            ingestor.ingest(
+                "clone_synthetic",
+                {
+                    "host": simulated_host,
+                    "user": "clone-hunter",
+                    "process": "counter-clone",
+                    "action": "list",
+                    "resource": f"synthetic://honeypot/{target}",
+                    "synthetic": True,
+                    "counterclone_participant": True,
+                    "clone_deployment_id": deployment.get("deployment_id", "autonomous-recon"),
+                },
+            )
+            _record(action, target, "executed", {"status": "deception_seeded"})
+            continue
+
         if action == "run_phase":
             if target == "activate_deception_hardening":
                 for baseline_action in ("list", "read", "model_invoke"):
