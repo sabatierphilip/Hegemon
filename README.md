@@ -69,7 +69,7 @@ Notes:
 - Extracted files are not modified, so runtime behavior is preserved.
 - A `.seal/manifest.enc` file and `.seal/seal_meta.json` are created in the output directory automatically.
 - Default sealing key (AES-256-GCM, base64): `uPs8Q_C_nBEGtssLsy5cazP2PghacquTQ76hHL2FMiw=`.
-- "AES-800" is not a standardized AES mode/key-size; this tool uses AES-256-GCM.
+-
 
 ## Security principles
 
