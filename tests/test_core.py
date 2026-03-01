@@ -813,25 +813,48 @@ def test_run_cycle_executes_counter_clone_with_safety_whitelist(tmp_path):
     assert all(d.get("action") in {"read", "list", "model_invoke"} for d in synthetic_events)
 
 
-def test_run_cycle_skips_synthetic_events_in_detectors(tmp_path):
+def test_run_cycle_skips_synthetic_events_across_all_analytics(tmp_path):
     index_path = tmp_path / "telemetry_index.jsonl"
     ingestor = TelemetryIngestor(index_path)
 
-    # Synthetic events should not trigger detector pipelines.
-    ingestor.ingest(
-        "clone_synthetic",
+    # Synthetic events should not trigger detector pipelines, attack-chain modeling,
+    # or blast-radius analysis.
+    for event in [
         {
             "host": "h-synth",
             "user": "clone-shadow",
             "process": "counter-clone",
-            "action": "model_invoke",
-            "resource": "synthetic://primary_path",
+            "action": "login_success",
+            "resource": "synthetic://entry",
             "synthetic": True,
             "api_call_count": 999,
             "egress_mb": 999,
             "gpu_cpu": 99,
         },
-    )
+        {
+            "host": "h-synth",
+            "user": "clone-shadow",
+            "process": "counter-clone",
+            "action": "model_invoke",
+            "resource": "synthetic://execution",
+            "synthetic": True,
+            "api_call_count": 999,
+            "egress_mb": 999,
+            "gpu_cpu": 99,
+        },
+        {
+            "host": "h-synth",
+            "user": "clone-shadow",
+            "process": "counter-clone",
+            "action": "network_send",
+            "resource": "synthetic://exfil",
+            "synthetic": True,
+            "api_call_count": 999,
+            "egress_mb": 999,
+            "gpu_cpu": 99,
+        },
+    ]:
+        ingestor.ingest("clone_synthetic", event)
 
     state = run_cycle(
         Settings(
@@ -846,8 +869,12 @@ def test_run_cycle_skips_synthetic_events_in_detectors(tmp_path):
         )
     )
 
-    assert state["events_processed"] == 1
+    assert state["events_processed"] == 3
     assert state["alerts"] == []
     assert state["graph_anomalies"] == []
+    assert state["attack_chains"] == []
     assert state["honeypot_alerts"] == []
     assert state["mirror_alerts"] == []
+    assert state["credential_blast_radius"]["compromised_credentials"] == []
+    assert state["credential_blast_radius"]["impacted_hosts"] == []
+    assert state["credential_blast_radius"]["impacted_resources"] == []
