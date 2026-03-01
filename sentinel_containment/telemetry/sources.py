@@ -7,6 +7,8 @@ import os
 import socketserver
 import threading
 import time
+import hmac
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -165,7 +167,23 @@ class JSONLinesFileSource:
     source_type: str
     ingestor: TelemetryIngestor
     poll_interval_seconds: float = 1.0
+    integrity_key: str | None = None
     _offset: int = 0
+
+    def _verify_counterclone_integrity(self, payload: dict[str, Any]) -> bool:
+        if self.source_type != "counterclone":
+            return False
+        if not self.integrity_key:
+            return False
+        signature = str(payload.get("counterclone_file_signature", "")).strip()
+        if not signature:
+            return False
+
+        candidate = dict(payload)
+        candidate.pop("counterclone_file_signature", None)
+        canonical = json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        expected = hmac.new(self.integrity_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
 
     def poll_once(self) -> int:
         if not self.path.exists():
@@ -181,6 +199,8 @@ class JSONLinesFileSource:
                 try:
                     payload = json.loads(line)
                     if isinstance(payload, dict):
+                        if self.source_type == "counterclone":
+                            payload["counterclone_integrity_verified"] = self._verify_counterclone_integrity(payload)
                         self.ingestor.ingest(self.source_type, payload)
                         processed += 1
                 except json.JSONDecodeError:
@@ -210,6 +230,7 @@ class IngestionService:
         kernel_webhook_port: int = 5515,
         kernel_webhook_path: str = "/kernel-event",
         on_kernel_event: Callable[[dict[str, Any]], None] | None = None,
+        counterclone_integrity_key: str | None = None,
     ):
         self.ingestor = ingestor
         self.syslog_server = SyslogUDPServer(syslog_host, syslog_port, ingestor)
@@ -227,7 +248,14 @@ class IngestionService:
             JSONLinesFileSource(model_api_path, "model_api", ingestor),
         ]
         for source_type, path in (extra_sources or {}).items():
-            self.file_sources.append(JSONLinesFileSource(path, source_type, ingestor))
+            self.file_sources.append(
+                JSONLinesFileSource(
+                    path,
+                    source_type,
+                    ingestor,
+                    integrity_key=counterclone_integrity_key,
+                )
+            )
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:

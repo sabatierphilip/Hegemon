@@ -154,6 +154,7 @@ class SentinelRuntime:
             kernel_webhook_port=int(ingest_cfg.get("kernel_webhook_port", 5515)),
             kernel_webhook_path=ingest_cfg.get("kernel_webhook_path", "/kernel-event"),
             on_kernel_event=self.process_priority_event,
+            counterclone_integrity_key=ingest_cfg.get("counterclone_integrity_key"),
         )
 
         self.fast_lane_server: FastLaneServer | None = None
