@@ -104,6 +104,7 @@ class MirrorCloneDetector:
         self._resource_counts: dict[str, dict[str, dict[str, int]]] = defaultdict(
             lambda: defaultdict(lambda: defaultdict(int))
         )
+        self._unique_resources: dict[str, set[str]] = defaultdict(set)
         self._deployments: dict[str, CloneDeployment] = {}
 
     def generate_autonomous_recon_directives(
@@ -225,7 +226,11 @@ class MirrorCloneDetector:
             markov_score = self._markov_kill_chain_score(kill_chain_path)
             drift = self._model_disagreement(shard)
             resource_risk = self._resource_risk_score(shard, kill_chain_path[0])
-            escalation_score = min(1.0, (0.45 * markov_score) + (0.30 * resource_risk) + (0.25 * drift))
+            sustained_abuse = self._sustained_compute_abuse_score(shard)
+            escalation_score = min(
+                1.0,
+                (0.35 * markov_score) + (0.20 * resource_risk) + (0.20 * drift) + (0.25 * sustained_abuse),
+            )
             if escalation_score < min_escalation_score:
                 continue
 
@@ -249,7 +254,7 @@ class MirrorCloneDetector:
                     rationale=(
                         "Stage-2 counteroffensive directive derived from mirrored clone telemetry: "
                         f"threat_label={threat_label}, markov_score={markov_score:.2f}, "
-                        f"resource_risk={resource_risk:.2f}, drift={drift:.2f}"
+                        f"resource_risk={resource_risk:.2f}, drift={drift:.2f}, sustained_abuse={sustained_abuse:.2f}"
                     ),
                 )
             )
@@ -560,6 +565,7 @@ class MirrorCloneDetector:
             self._transitions[shard][previous][action] += 1
         self._action_counts[shard][action] += 1
         self._resource_counts[shard][action][resource] += 1
+        self._unique_resources[shard].add(resource)
         self._last_action[shard] = action
 
     def _predict_next_action(self, shard: str, previous_action: str) -> tuple[str | None, float]:
@@ -674,6 +680,13 @@ class MirrorCloneDetector:
             density = min(1.0, token_hits / 3.0)
             weighted += (count / total) * (0.25 + 0.75 * density)
         return min(1.0, weighted)
+
+    def _sustained_compute_abuse_score(self, shard: str) -> float:
+        unique_resources = len(self._unique_resources[shard])
+        baseline = 3
+        if unique_resources <= baseline:
+            return 0.0
+        return min(1.0, (unique_resources - baseline) / 6.0)
 
     @staticmethod
     def _trajectory_score(

@@ -25,12 +25,17 @@ class HardwareKeyVerifier:
     Trusted key material is supplied as key_id -> PEM encoded public key.
     """
 
-    def __init__(self, trusted_public_keys: dict[str, str] | None = None):
+    def __init__(self, trusted_public_keys: dict[str, str] | None = None, fail_closed: bool = True):
         self._trusted_public_keys = trusted_public_keys or {}
+        self._fail_closed = bool(fail_closed)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self._trusted_public_keys)
 
     @property
     def enabled(self) -> bool:
-        return bool(self._trusted_public_keys)
+        return self._fail_closed or self.configured
 
     @staticmethod
     def canonical_payload(
@@ -63,6 +68,8 @@ class HardwareKeyVerifier:
         signature_bundle: dict[str, Any] | None,
     ) -> SignatureVerificationResult:
         if not signature_bundle:
+            if not self._trusted_public_keys:
+                return SignatureVerificationResult(False, "containment blocked: no trusted hardware keys configured")
             return SignatureVerificationResult(False, "containment signature required")
 
         key_id = str(signature_bundle.get("key_id", "")).strip()

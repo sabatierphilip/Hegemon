@@ -21,14 +21,20 @@ class HumanConfirmationVerifier:
         shared_secret: str | None = None,
         prompt_count: int = 2,
         question_salt: str = "human-presence-gate",
+        fail_closed: bool = True,
     ):
         self.shared_secret = (shared_secret or "").strip()
         self.prompt_count = max(1, int(prompt_count))
         self.question_salt = str(question_salt)
+        self._fail_closed = bool(fail_closed)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.shared_secret)
 
     @property
     def enabled(self) -> bool:
-        return bool(self.shared_secret)
+        return self._fail_closed or self.configured
 
     def verify(
         self,
@@ -39,7 +45,9 @@ class HumanConfirmationVerifier:
         approvals: list[str],
         confirmation_bundle: dict[str, Any] | None,
     ) -> ConfirmationVerificationResult:
-        if not self.enabled:
+        if not self.shared_secret:
+            if self._fail_closed:
+                return ConfirmationVerificationResult(False, "human confirmation blocked: shared secret not configured")
             return ConfirmationVerificationResult(True, "human confirmation disabled")
 
         if not confirmation_bundle:

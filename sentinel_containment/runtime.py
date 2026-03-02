@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import secrets
 import socketserver
 import ssl
 import threading
@@ -138,11 +139,15 @@ class SentinelRuntime:
             self.audit,
             identity_store=settings.get("approval_identity_store", {}),
             required_approvals=int(settings.get("approval_quorum", 1)),
-            hardware_key_verifier=HardwareKeyVerifier(settings.get("trusted_hardware_public_keys", {})),
+            hardware_key_verifier=HardwareKeyVerifier(
+                settings.get("trusted_hardware_public_keys", {}),
+                fail_closed=bool(settings.get("hardware_key_fail_closed", True)),
+            ),
             human_confirmation_verifier=HumanConfirmationVerifier(
                 shared_secret=str(settings.get("human_confirmation_shared_secret", "")),
                 prompt_count=int(settings.get("human_confirmation_prompt_count", 2)),
                 question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
+                fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
             ),
         )
 
@@ -171,15 +176,33 @@ class SentinelRuntime:
 
         self.fast_lane_server: FastLaneServer | None = None
         p2p_cfg = settings.get("peer_verification", {})
-        process_keys = {str(k): str(v) for k, v in p2p_cfg.get("process_keys", {}).items()}
-        if not process_keys:
-            process_keys = {
-                "ingestion_service": "p2p-ingestion-service",
-                "detection_engine": "p2p-detection-engine",
-                "containment_engine": "p2p-containment-engine",
-                "web_dashboard": "p2p-web-dashboard",
-                "fast_lane_gateway": "p2p-fast-lane-gateway",
-            }
+        configured_peer_ids = p2p_cfg.get("peer_ids", [
+            "ingestion_service",
+            "detection_engine",
+            "containment_engine",
+            "web_dashboard",
+            "fast_lane_gateway",
+        ])
+        process_keys: dict[str, str] = {}
+        for peer_id in configured_peer_ids:
+            normalized = str(peer_id).strip()
+            if not normalized:
+                continue
+            env_key = f"HEGEMON_P2P_KEY_{normalized.upper()}"
+            process_keys[normalized] = str(settings.env(env_key, secrets.token_hex(32)))
+
+        configured_legacy_keys = {str(k): str(v) for k, v in p2p_cfg.get("process_keys", {}).items()}
+        if configured_legacy_keys:
+            self.audit.append(
+                "peer_verification_warning",
+                {
+                    "reason": "deprecated_process_keys_in_config",
+                    "message": "peer_verification.process_keys is deprecated; use HEGEMON_P2P_KEY_<PEER_ID> env vars",
+                },
+            )
+            for pid, key in configured_legacy_keys.items():
+                process_keys.setdefault(pid, key)
+
         self.peer_mesh = PeerVerificationMesh(
             process_keys=process_keys,
             max_clock_skew_seconds=int(p2p_cfg.get("max_clock_skew_seconds", 30)),
