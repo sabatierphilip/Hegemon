@@ -51,61 +51,60 @@ class GraphAnomalyDetector:
         self._warmup_relations: set[str] = set()
 
     def evaluate(self, event: dict[str, Any]) -> list[GraphEdgeAnomaly]:
-        edge = self._event_edge(event)
-        if edge is None:
+        edges = self._event_edges(event)
+        if not edges:
             self._processed_events += 1
             return []
-
-        source, target, relation = edge
-        key = (source, target, relation)
-        edge_pattern = (source, relation)
-        source_degree = self._node_degree.get(source, 0)
-        target_degree = self._node_degree.get(target, 0)
-        known_pattern = edge_pattern in self._known_edge_patterns
-
-        embedding = self._edge_embedding(source, target, relation)
-        embed_distance = self._embedding_distance(embedding)
-        temporal_drift = self._temporal_drift(relation)
-        structural_outlier = self._structural_outlier(source, target)
-        first_seen_bonus = 1.0 if key not in self._known_edges and not known_pattern else 0.15
-
-        if known_pattern and key not in self._known_edges:
-            embed_distance *= 0.6
-            structural_outlier *= 0.35
-
-        combined = (
-            0.35 * min(1.0, embed_distance / 3.0)
-            + 0.25 * temporal_drift
-            + 0.20 * structural_outlier
-            + 0.20 * first_seen_bonus
-        ) * self.novelty_weight
-        if known_pattern and key not in self._known_edges:
-            combined *= 0.5
-        novelty_score = min(1.0, combined)
-
         anomalies: list[GraphEdgeAnomaly] = []
-        self._warmup_sources.add(source)
-        self._warmup_relations.add(relation)
-        warmed_up = self._is_warmed_up()
-        if warmed_up and novelty_score >= 0.55:
-            severity = min(97, 52 + int(novelty_score * 45))
-            reason = (
-                f"Graph edge outlier: {source} -> {target} ({relation}); "
-                f"embed={embed_distance:.2f}, drift={temporal_drift:.2f}, structural={structural_outlier:.2f}"
-            )
-            anomalies.append(
-                GraphEdgeAnomaly(
-                    source=source,
-                    target=target,
-                    relation=relation,
-                    severity=severity,
-                    novelty_score=round(novelty_score, 3),
-                    reason=reason,
-                    event=event,
-                )
-            )
+        for source, target, relation in edges:
+            key = (source, target, relation)
+            edge_pattern = (source, relation)
+            source_degree = self._node_degree.get(source, 0)
+            target_degree = self._node_degree.get(target, 0)
+            known_pattern = edge_pattern in self._known_edge_patterns
 
-        self._update_models(source, target, relation, key, edge_pattern, embedding, source_degree, target_degree)
+            embedding = self._edge_embedding(source, target, relation)
+            embed_distance = self._embedding_distance(embedding)
+            temporal_drift = self._temporal_drift(relation)
+            structural_outlier = self._structural_outlier(source, target)
+            first_seen_bonus = 1.0 if key not in self._known_edges and not known_pattern else 0.15
+
+            if known_pattern and key not in self._known_edges:
+                embed_distance *= 0.6
+                structural_outlier *= 0.35
+
+            combined = (
+                0.35 * min(1.0, embed_distance / 3.0)
+                + 0.25 * temporal_drift
+                + 0.20 * structural_outlier
+                + 0.20 * first_seen_bonus
+            ) * self.novelty_weight
+            if known_pattern and key not in self._known_edges:
+                combined *= 0.5
+            novelty_score = min(1.0, combined)
+
+            self._warmup_sources.add(source)
+            self._warmup_relations.add(relation)
+            warmed_up = self._is_warmed_up()
+            if warmed_up and novelty_score >= 0.55:
+                severity = min(97, 52 + int(novelty_score * 45))
+                reason = (
+                    f"Graph edge outlier: {source} -> {target} ({relation}); "
+                    f"embed={embed_distance:.2f}, drift={temporal_drift:.2f}, structural={structural_outlier:.2f}"
+                )
+                anomalies.append(
+                    GraphEdgeAnomaly(
+                        source=source,
+                        target=target,
+                        relation=relation,
+                        severity=severity,
+                        novelty_score=round(novelty_score, 3),
+                        reason=reason,
+                        event=event,
+                    )
+                )
+
+            self._update_models(source, target, relation, key, edge_pattern, embedding, source_degree, target_degree)
         self._processed_events += 1
         return anomalies
 
@@ -233,7 +232,7 @@ class GraphAnomalyDetector:
         return 1.0 - jaccard
 
     @staticmethod
-    def _event_edge(event: dict[str, Any]) -> tuple[str, str, str] | None:
+    def _event_edges(event: dict[str, Any]) -> list[tuple[str, str, str]]:
         host = str(event.get("host", "unknown"))
         user = str(event.get("user", "unknown"))
         process = str(event.get("process", "unknown"))
@@ -241,14 +240,26 @@ class GraphAnomalyDetector:
         resource = str(event.get("resource", "unknown"))
 
         if action == "unknown" and resource == "unknown":
-            return (f"host:{host}", "telemetry:null_event", "unknown_activity")
+            return [(f"host:{host}", "telemetry:null_event", "unknown_activity")]
 
+        edges: list[tuple[str, str, str]] = []
         if user != "unknown" and host != "unknown":
-            return (f"user:{user}", f"host:{host}", "accesses")
+            edges.append((f"user:{user}", f"host:{host}", "accesses"))
         if process != "unknown" and host != "unknown":
-            return (f"process:{process}", f"host:{host}", "runs_on")
+            edges.append((f"process:{process}", f"host:{host}", "runs_on"))
+        if host != "unknown" and resource != "unknown":
+            edges.append((f"host:{host}", f"resource:{resource}", action))
+        if process != "unknown" and resource != "unknown":
+            edges.append((f"process:{process}", f"resource:{resource}", f"{action}_resource"))
 
-        return (f"host:{host}", f"resource:{resource}", action)
+        deduped: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for edge in edges:
+            if edge in seen:
+                continue
+            seen.add(edge)
+            deduped.append(edge)
+        return deduped
 
 
 @dataclass

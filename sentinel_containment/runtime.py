@@ -20,7 +20,12 @@ from sentinel_containment.detection.mirror_clone import MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
-from sentinel_containment.security import HardwareKeyVerifier, HumanConfirmationVerifier
+from sentinel_containment.security import (
+    FriendlyPeerRegistry,
+    HardwareKeyVerifier,
+    HumanConfirmationVerifier,
+    PeerVerificationMesh,
+)
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import IngestionService, discover_live_file_sources
 
@@ -165,6 +170,29 @@ class SentinelRuntime:
         )
 
         self.fast_lane_server: FastLaneServer | None = None
+        p2p_cfg = settings.get("peer_verification", {})
+        process_keys = {str(k): str(v) for k, v in p2p_cfg.get("process_keys", {}).items()}
+        if not process_keys:
+            process_keys = {
+                "ingestion_service": "p2p-ingestion-service",
+                "detection_engine": "p2p-detection-engine",
+                "containment_engine": "p2p-containment-engine",
+                "web_dashboard": "p2p-web-dashboard",
+                "fast_lane_gateway": "p2p-fast-lane-gateway",
+            }
+        self.peer_mesh = PeerVerificationMesh(
+            process_keys=process_keys,
+            max_clock_skew_seconds=int(p2p_cfg.get("max_clock_skew_seconds", 30)),
+        )
+        self._peer_verification_interval = float(p2p_cfg.get("interval_seconds", 5.0))
+        self._next_peer_verification_due = 0.0
+
+        friendly_cfg = settings.get("friendly_enrollment", {})
+        self.friendly_registry = FriendlyPeerRegistry(
+            enrollment_user=str(friendly_cfg.get("enrollment_user", "user")),
+            trusted_user_public_keys={str(k): str(v) for k, v in friendly_cfg.get("trusted_user_public_keys", {}).items()},
+        )
+
         fast_lane_cfg = settings.get("fast_lane", {})
         if fast_lane_cfg.get("enabled", False):
             self.fast_lane_server = FastLaneServer(
@@ -230,6 +258,70 @@ class SentinelRuntime:
         self.audit.append("fast_lane_containment", payload)
         return payload
 
+    def _run_peer_verification(self) -> dict[str, Any]:
+        result = self.peer_mesh.run_attestation_cycle()
+        payload = {
+            "verified": result.ok,
+            "verified_pairs": result.verified_pairs,
+            "failures": result.failures,
+            "mesh_size": len(self.peer_mesh.process_ids),
+        }
+        self.ingestor.ingest(
+            "host_runtime",
+            {
+                "host": self.settings.get("system_name", "hegemon"),
+                "process": "peer-verification-mesh",
+                "action": "p2p_attestation_cycle",
+                "resource": "hegemon_processes",
+                "collector_level": "runtime",
+                "peer_verification": payload,
+                "counterclone_participant": True,
+                "counterclone_integrity_verified": result.ok,
+            },
+        )
+        if not result.ok:
+            self.audit.append("peer_verification_failed", payload)
+        return payload
+
+    def enroll_friendly_software(
+        self,
+        *,
+        requested_by: str,
+        software_id: str,
+        peer_key: str,
+        endpoints: list[str],
+        signature_bundle: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        enrollment = self.friendly_registry.enroll(
+            requested_by=requested_by,
+            software_id=software_id,
+            peer_key=peer_key,
+            endpoints=endpoints,
+            signature_bundle=signature_bundle,
+        )
+        payload = {
+            "requested_by": requested_by,
+            "software_id": software_id,
+            "accepted": enrollment.accepted,
+            "message": enrollment.message,
+        }
+        if enrollment.accepted and enrollment.record:
+            self.peer_mesh.add_or_update_peer(software_id, peer_key)
+            patrol = {
+                "host": self.settings.get("system_name", "hegemon"),
+                "process": "friendly-patrol",
+                "action": "guard_friendly_software",
+                "resource": software_id,
+                "collector_level": "counterclone",
+                "counterclone_participant": True,
+                "counterclone_integrity_verified": True,
+                "patrol_targets": self.friendly_registry.patrol_targets(),
+            }
+            self.ingestor.ingest("counterclone", patrol)
+            payload["patrol_targets"] = self.friendly_registry.patrol_targets()
+        self.audit.append("friendly_enrollment", payload)
+        return payload
+
     def run_once(self) -> dict:
         state = run_cycle(
             self.settings,
@@ -251,6 +343,10 @@ class SentinelRuntime:
         burst_interval_seconds = float(self.settings.get("burst_cycle_seconds", 0.1))
         while not self._stop.is_set():
             state = self.run_once()
+            now = time.time()
+            if now >= self._next_peer_verification_due:
+                self._run_peer_verification()
+                self._next_peer_verification_due = now + self._peer_verification_interval
             cycle_interval = burst_interval_seconds if state.get("candidate_severity", 0) >= burst_threshold else base_interval
             self._stop.wait(max(0.0, cycle_interval))
 

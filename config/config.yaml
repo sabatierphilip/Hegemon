@@ -22,6 +22,7 @@ graph_warmup_events: 5
 graph_novelty_weight: 1.6
 graph_warmup_min_distinct_sources: 2
 graph_warmup_min_relations: 1
+graph_horizons_minutes: [5, 30, 180]
 attack_chain_window_minutes: 30
 containment_simulation_mode: false
 hard_quarantine_threshold: 85
@@ -85,3 +86,17 @@ fast_lane:
   server_cert_path: certs/fastlane-server.crt
   server_key_path: certs/fastlane-server.key
   client_ca_cert_path: certs/fastlane-client-ca.crt
+
+peer_verification:
+  interval_seconds: 5
+  max_clock_skew_seconds: 30
+  process_keys:
+    ingestion_service: p2p-ingestion-service
+    detection_engine: p2p-detection-engine
+    containment_engine: p2p-containment-engine
+    web_dashboard: p2p-web-dashboard
+    fast_lane_gateway: p2p-fast-lane-gateway
+
+friendly_enrollment:
+  enrollment_user: user
+  trusted_user_public_keys: {}
