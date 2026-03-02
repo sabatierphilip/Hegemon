@@ -162,6 +162,7 @@ def test_hardware_key_auto_configure_api(tmp_path: Path, auth_headers):
         "rules_path": str(tmp_path / "rules"),
         "hardware_key_fail_closed": False,
         "trusted_hardware_public_keys": {},
+        "auto_configure_hardware_keys_on_startup": False,
         "ingestion": {
             "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
             "network_flow_file": str(tmp_path / "network_flows.jsonl"),
@@ -208,6 +209,7 @@ def test_hardware_key_auto_configure_enables_containment_execution(tmp_path: Pat
         "trusted_hardware_public_keys": {},
         "hardware_key_fail_closed": True,
         "human_confirmation_fail_closed": False,
+        "auto_configure_hardware_keys_on_startup": False,
         "ingestion": {
             "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
             "network_flow_file": str(tmp_path / "network_flows.jsonl"),
@@ -262,6 +264,48 @@ def test_hardware_key_auto_configure_enables_containment_execution(tmp_path: Pat
     payload = after.get_json()
     assert payload["executed"] is True
     assert "quarantine_host" in payload["actions_executed"]
+
+    runtime.ingestion_service.syslog_server.server_close()
+    runtime.ingestion_service.kernel_webhook_server.server_close()
+
+
+def test_human_gate_toggle_api_defaults_off_and_can_enable(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+
+    client = app.test_client()
+
+    status = client.get("/api/human-gate/status", headers=auth_headers)
+    assert status.status_code == 200
+    assert status.get_json()["human_required"] is False
+
+    enabled = client.post("/api/human-gate/toggle", json={"human_required": True}, headers=auth_headers)
+    assert enabled.status_code == 200
+    assert enabled.get_json()["human_required"] is True
+
+    disabled = client.post("/api/human-gate/toggle", json={"human_required": False}, headers=auth_headers)
+    assert disabled.status_code == 200
+    disabled_payload = disabled.get_json()
+    assert disabled_payload["human_required"] is False
+    assert runtime.get_hardware_key_setup_notice()["completed"] is True
 
     runtime.ingestion_service.syslog_server.server_close()
     runtime.ingestion_service.kernel_webhook_server.server_close()

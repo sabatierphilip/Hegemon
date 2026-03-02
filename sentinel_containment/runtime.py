@@ -187,6 +187,7 @@ class SentinelRuntime:
         )
 
         self._telemetry_setup_notice: dict[str, Any] = {"required": True, "granted": False, "completed": False, "details": []}
+        self._human_required = bool(settings.get("human_required_default", False))
         self._hardware_key_setup_notice: dict[str, Any] = {
             "required": True,
             "configured": self.fast_lane_containment.hardware_key_verifier.configured,
@@ -292,6 +293,28 @@ class SentinelRuntime:
                     server_key=str(server_key),
                     client_ca_cert=str(client_ca),
                 )
+
+        if bool(self.settings.get("auto_grant_telemetry_permission", True)) and not self._human_required:
+            self.apply_telemetry_permission(True)
+        if bool(self.settings.get("auto_configure_hardware_keys_on_startup", True)):
+            self.auto_configure_hardware_keys(True)
+
+    def get_human_gate_status(self) -> dict[str, Any]:
+        return {
+            "human_required": self._human_required,
+            "completed": not self._human_required,
+            "details": ["operator_decision_required"] if self._human_required else ["fully_autonomous_mode"],
+        }
+
+    def set_human_gate(self, human_required: bool) -> dict[str, Any]:
+        self._human_required = bool(human_required)
+        self.settings.data["human_required_default"] = self._human_required
+        if not self._human_required:
+            self.apply_telemetry_permission(True)
+            self.auto_configure_hardware_keys(True)
+        payload = self.get_human_gate_status()
+        self.audit.append("human_gate_updated", payload)
+        return payload
 
     def get_containment_decision_status(self) -> dict[str, Any]:
         with self._containment_decision_lock:
@@ -402,6 +425,28 @@ class SentinelRuntime:
         with self._containment_decision_lock:
             if self._containment_decision.get("pending", False):
                 return
+            if not self._human_required:
+                auto_result = self.fast_lane_containment.execute(
+                    host=host,
+                    severity=severity,
+                    requested_actions=recommended_actions,
+                    approvals=list(self.settings.get("automated_approvers", ["user"])),
+                    simulation_mode=False,
+                    hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
+                    signature_bundle=self.settings.get("containment_signature"),
+                    confirmation_bundle=self.settings.get("containment_confirmation"),
+                )
+                self.audit.append(
+                    "containment_auto_approved",
+                    {
+                        "host": host,
+                        "severity": severity,
+                        "approved": auto_result.approved,
+                        "actions_executed": auto_result.actions_executed,
+                        "message": auto_result.message,
+                    },
+                )
+                return
             self.fast_lane_containment.execute(
                 host=host,
                 severity=max(70, min(89, severity)),
@@ -438,6 +483,19 @@ class SentinelRuntime:
                 "details": ["operator_declined_auto_config"],
             }
             self.audit.append("hardware_key_autoconfig_declined", self._hardware_key_setup_notice)
+            return dict(self._hardware_key_setup_notice)
+
+        existing_signature = self.settings.get("containment_signature")
+        if self.fast_lane_containment.hardware_key_verifier.configured and isinstance(existing_signature, dict):
+            key_id = str(existing_signature.get("key_id", "auto-ed25519-local")).strip() or "auto-ed25519-local"
+            self._hardware_key_setup_notice = {
+                "required": True,
+                "configured": True,
+                "completed": True,
+                "details": ["hardware_key_profile_already_configured"],
+                "key_id": key_id,
+                "local_only": True,
+            }
             return dict(self._hardware_key_setup_notice)
 
         key_id = str(self.settings.get("auto_hardware_key_id", "auto-ed25519-local")).strip() or "auto-ed25519-local"
