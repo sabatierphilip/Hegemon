@@ -76,6 +76,8 @@ class AttackSequenceModel:
 
     def evaluate(self, events: list[dict[str, Any]]) -> list[AttackChainAlert]:
         for event in events:
+            if self._is_trusted_operator_response(event):
+                continue
             host = str(event.get("host", "unknown"))
             stage, stage_confidence = self._infer_stage(event)
             timestamp = parse_event_time(event)
@@ -231,6 +233,19 @@ class AttackSequenceModel:
         chain_events = [first_read, mid_read, exfil_event]
         confidence = min(0.98, 0.62 + min(0.18, len(candidate_reads) / 80.0) + min(0.18, cumulative_reads / 400.0))
         return ["discovery", "resource_abuse", "exfiltration"], chain_events, confidence
+
+    @staticmethod
+    def _is_trusted_operator_response(event: dict[str, Any]) -> bool:
+        if bool(event.get("operator_response", False)):
+            return True
+        process = str(event.get("process", "")).lower()
+        user = str(event.get("user", "")).lower()
+        action = str(event.get("action", "")).lower()
+        operator_markers = ("soc", "incident", "responder", "blue-team", "defender")
+        containment_actions = ("quarantine", "revoke", "disable", "forensic", "containment")
+        return any(marker in process or marker in user for marker in operator_markers) and any(
+            token in action for token in containment_actions
+        )
 
     def _build_transition_matrix(self) -> dict[tuple[str, str], float]:
         transitions: dict[tuple[str, str], float] = {}

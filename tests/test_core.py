@@ -1580,3 +1580,53 @@ def test_run_cycle_contains_distributed_shard_switch_attack(tmp_path):
     assert state["distributed_attack_signal"]["shard_count"] >= 3
     assert state["containment"] is not None
     assert "quarantine_host" in state["containment"]["actions_executed"]
+
+
+def test_containment_fails_closed_with_default_unconfigured_verifiers(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    engine = ContainmentEngine(audit)
+    denied = engine.execute("h1", 90, ["quarantine_host"], ["user"])
+    assert denied.approved is False
+
+
+def test_stage_two_escalation_accounts_for_resource_cardinality():
+    sparse = MirrorCloneDetector(warmup_events=3, min_prediction_confidence=0.1)
+    dense = MirrorCloneDetector(warmup_events=3, min_prediction_confidence=0.1)
+
+    sparse_events = [
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-a"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-a"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-a"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-a"},
+    ]
+    dense_events = [
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-a"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-b"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-c"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-d"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-e"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-f"},
+        {"host": "h-card", "user": "u", "process": "p", "action": "model_invoke", "resource": "cluster-g"},
+    ]
+    for event in sparse_events:
+        sparse.evaluate(event)
+    for event in dense_events:
+        dense.evaluate(event)
+
+    sparse_directive = sparse.generate_stage_two_counteroffensive_directives(min_escalation_score=0.0)[0]
+    dense_directive = dense.generate_stage_two_counteroffensive_directives(min_escalation_score=0.0)[0]
+    assert dense_directive.escalation_score > sparse_directive.escalation_score
+
+
+def test_distributed_signal_flags_single_shard_high_density_strategy():
+    from sentinel_containment.main import distributed_attack_signal
+
+    events = [
+        {"host": "solo", "user": "u", "process": "p", "action": "list", "resource": "internal://a"},
+        {"host": "solo", "user": "u", "process": "p", "action": "read", "resource": "internal://b"},
+        {"host": "solo", "user": "u", "process": "p", "action": "query", "resource": "internal://c"},
+        {"host": "solo", "user": "u", "process": "p", "action": "network_send", "resource": "198.51.100.3", "egress_mb": 90},
+    ]
+    signal = distributed_attack_signal(events)
+    assert signal["concentrated_single_shard"] is True
+    assert signal["is_distributed"] is True

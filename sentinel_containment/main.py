@@ -29,7 +29,10 @@ CLONE_ALLOWED_SYNTHETIC_ACTIONS = {"read", "list", "model_invoke"}
 
 
 def _build_hardware_key_verifier(settings: Settings) -> HardwareKeyVerifier:
-    return HardwareKeyVerifier(settings.get("trusted_hardware_public_keys", {}))
+    return HardwareKeyVerifier(
+        settings.get("trusted_hardware_public_keys", {}),
+        fail_closed=bool(settings.get("hardware_key_fail_closed", True)),
+    )
 
 
 def _build_human_confirmation_verifier(settings: Settings) -> HumanConfirmationVerifier:
@@ -37,6 +40,7 @@ def _build_human_confirmation_verifier(settings: Settings) -> HumanConfirmationV
         shared_secret=str(settings.get("human_confirmation_shared_secret", "")),
         prompt_count=int(settings.get("human_confirmation_prompt_count", 2)),
         question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
+        fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
     )
 
 
@@ -282,13 +286,21 @@ def distributed_attack_signal(events: list[dict[str, Any]]) -> dict[str, Any]:
 
     shard_count = len(shards)
     suspicious_density = (suspicious_actions / max(1, len(events))) if events else 0.0
-    score = min(1.0, (shard_count / 4.0) * 0.55 + suspicious_density * 0.30 + min(1.0, egress_events / 2.0) * 0.15)
+    concentrated_single_shard = shard_count == 1 and suspicious_density >= 0.85 and egress_events >= 1
+    score = min(
+        1.0,
+        (shard_count / 4.0) * 0.45
+        + suspicious_density * 0.30
+        + min(1.0, egress_events / 2.0) * 0.15
+        + (0.10 if concentrated_single_shard else 0.0),
+    )
     return {
         "shard_count": shard_count,
         "suspicious_density": round(suspicious_density, 4),
         "egress_events": egress_events,
+        "concentrated_single_shard": concentrated_single_shard,
         "score": round(score, 4),
-        "is_distributed": shard_count >= 3 and suspicious_density >= 0.45,
+        "is_distributed": (shard_count >= 3 and suspicious_density >= 0.45) or concentrated_single_shard,
     }
 
 
