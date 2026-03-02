@@ -156,6 +156,22 @@ HTML = """
     <button id=\"run-btn\" style=\"margin-top:8px;padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;\">Run</button>
   </div>
 
+  <div class="panel">
+    <h3>Containment Decision Gate</h3>
+    <div class="small" id="containment-status">
+      {% if containment_decision.pending %}
+      Active containment hold on {{ containment_decision.host }}. Review simulation details and choose.
+      {% else %}
+      No operator decision currently pending.
+      {% endif %}
+    </div>
+    <div class="json" style="margin-top:8px;"><pre id="containment-simulation">{{ containment_decision_json }}</pre></div>
+    <div style="margin-top:8px;display:flex;gap:8px;">
+      <button id="containment-yes" style="padding:8px 12px;background:#22543d;color:#d8e2ff;border:1px solid #2f855a;border-radius:8px;cursor:pointer;">Yes, Execute</button>
+      <button id="containment-no" style="padding:8px 12px;background:#5a1f2b;color:#ffdce5;border:1px solid #8b2f45;border-radius:8px;cursor:pointer;">No, Release Hold</button>
+    </div>
+  </div>
+
   <div class=\"grid\">
     <div class=\"card\"><div class=\"muted\">Events Processed</div><div class=\"kpi\">{{ events_processed }}</div></div>
     <div class=\"card\"><div class=\"muted\">Rule Alerts</div><div class=\"kpi\">{{ alerts_count }}</div></div>
@@ -220,7 +236,31 @@ async function startWithPermission(){
   const body=await resp.json();
   status.textContent = body.completed ? "Dynamic telemetry deployment completed." : "Telemetry permission not granted.";
 }
+
+function updateDecisionUI(payload){
+  const status=document.getElementById("containment-status");
+  const sim=document.getElementById("containment-simulation");
+  if(status){
+    if(payload.pending){
+      status.textContent = `Active containment hold on ${payload.host || "unknown"}. Review simulation details and choose.`;
+    }else{
+      status.textContent = payload.message || "No operator decision currently pending.";
+    }
+  }
+  if(sim){
+    sim.textContent = JSON.stringify(payload, null, 2);
+  }
+}
+
+async function decideContainment(execute){
+  const resp=await fetch("/api/containment/decision",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({execute})});
+  const body=await resp.json();
+  updateDecisionUI(body);
+}
+
 document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
+document.getElementById("containment-yes")?.addEventListener("click",()=>decideContainment(true));
+document.getElementById("containment-no")?.addEventListener("click",()=>decideContainment(false));
 </script>
 </body>
 </html>
@@ -268,6 +308,8 @@ def dashboard():
         contained_hosts=json.dumps(state.get("contained_hosts", []), indent=2),
         soar_actions=json.dumps(state.get("soar_actions", []), indent=2),
         topology=json.dumps(state.get("topology", {}), indent=2),
+        containment_decision=state.get("containment_decision", {}),
+        containment_decision_json=json.dumps(state.get("containment_decision", {}), indent=2),
         severity_class=_severity_class,
     )
 
@@ -302,3 +344,19 @@ def telemetry_permission_apply():
         return jsonify({"required": True, "granted": granted, "completed": False, "details": ["runtime_not_initialized"]}), 503
     return jsonify(_runtime.apply_telemetry_permission(granted))
 
+
+
+@app.get("/api/containment/decision")
+def containment_decision_status():
+    if _runtime is None:
+        return jsonify({"pending": False, "message": "runtime_not_initialized"}), 503
+    return jsonify(_runtime.get_containment_decision_status())
+
+
+@app.post("/api/containment/decision")
+def containment_decision_apply():
+    payload = request.get_json(silent=True) or {}
+    execute = bool(payload.get("execute", False))
+    if _runtime is None:
+        return jsonify({"pending": False, "executed": False, "message": "runtime_not_initialized"}), 503
+    return jsonify(_runtime.apply_containment_decision(execute))

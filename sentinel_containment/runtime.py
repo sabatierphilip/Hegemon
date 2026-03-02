@@ -184,6 +184,17 @@ class SentinelRuntime:
 
         self._telemetry_setup_notice: dict[str, Any] = {"required": True, "granted": False, "completed": False, "details": []}
         self._dynamic_threads: list[threading.Thread] = []
+        self._containment_decision: dict[str, Any] = {
+            "pending": False,
+            "host": None,
+            "severity": 0,
+            "reason": "",
+            "simulation": {},
+            "recommended_actions": [],
+            "hold_active": False,
+        }
+        self._containment_decision_lock = threading.Lock()
+        self._holding_hosts: set[str] = set()
 
         self.fast_lane_server: FastLaneServer | None = None
         p2p_cfg = settings.get("peer_verification", {})
@@ -272,44 +283,138 @@ class SentinelRuntime:
                     client_ca_cert=str(client_ca),
                 )
 
-    def apply_telemetry_permission(self, granted: bool) -> dict[str, Any]:
-        details: list[str] = []
-        if granted:
-            details = self._setup_dynamic_telemetry_sources()
-        self._telemetry_setup_notice = {
-            "required": True,
-            "granted": bool(granted),
-            "completed": bool(granted),
-            "details": details,
-        }
-        self.audit.append("telemetry_permission", self._telemetry_setup_notice)
-        return dict(self._telemetry_setup_notice)
+    def get_containment_decision_status(self) -> dict[str, Any]:
+        with self._containment_decision_lock:
+            payload = dict(self._containment_decision)
+            payload["holding_hosts"] = sorted(self._holding_hosts)
+            return payload
 
-    def get_telemetry_setup_notice(self) -> dict[str, Any]:
-        return dict(self._telemetry_setup_notice)
+    def apply_containment_decision(self, execute: bool) -> dict[str, Any]:
+        with self._containment_decision_lock:
+            if not self._containment_decision.get("pending", False):
+                return {
+                    "pending": False,
+                    "executed": False,
+                    "released": False,
+                    "message": "No containment decision pending",
+                    "holding_hosts": sorted(self._holding_hosts),
+                }
 
-    def _setup_dynamic_telemetry_sources(self) -> list[str]:
-        ingest_cfg = self.settings.get("ingestion", {})
-        details: list[str] = []
+            host = str(self._containment_decision.get("host") or "unknown")
+            severity = int(self._containment_decision.get("severity", 0) or 0)
+            recommended_actions = [str(a) for a in self._containment_decision.get("recommended_actions", [])]
+            response: dict[str, Any] = {
+                "pending": False,
+                "host": host,
+                "severity": severity,
+            }
 
-        autodiscovery = discover_live_file_sources({fs.source_type: fs.path for fs in self.ingestion_service.file_sources})
-        for source_type, path in autodiscovery.items():
-            if self.ingestion_service.add_file_source(
-                source_type,
-                path,
-                counterclone_integrity_key=ingest_cfg.get("counterclone_integrity_key"),
-            ):
-                details.append(f"attached_file_source:{source_type}:{path}")
+            if execute:
+                result = self.fast_lane_containment.execute(
+                    host=host,
+                    severity=severity,
+                    requested_actions=recommended_actions,
+                    approvals=list(self.settings.get("automated_approvers", ["user"])),
+                    simulation_mode=False,
+                    hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
+                    signature_bundle=self.settings.get("containment_signature"),
+                    confirmation_bundle=self.settings.get("containment_confirmation"),
+                )
+                response.update(
+                    {
+                        "executed": result.approved,
+                        "released": False,
+                        "actions_executed": result.actions_executed,
+                        "message": result.message,
+                    }
+                )
+            else:
+                self.fast_lane_containment.contained_hosts.discard(host)
+                response.update(
+                    {
+                        "executed": False,
+                        "released": True,
+                        "actions_executed": ["release_containment_hold"],
+                        "message": "Containment hold released by operator decision",
+                    }
+                )
 
-        dynamic_source = DynamicSystemTelemetrySource(
-            self.ingestor,
-            poll_interval_seconds=float(ingest_cfg.get("dynamic_system_poll_seconds", 10.0)),
+            self._holding_hosts.discard(host)
+            self._containment_decision = {
+                "pending": False,
+                "host": None,
+                "severity": 0,
+                "reason": "",
+                "simulation": {},
+                "recommended_actions": [],
+                "hold_active": False,
+            }
+            response["holding_hosts"] = sorted(self._holding_hosts)
+            self.audit.append("containment_manual_decision", response)
+            return response
+
+    def _update_containment_decision_from_state(self, state: dict[str, Any]) -> None:
+        containment_state = state.get("containment") or {}
+        should_prompt = bool(containment_state) and (
+            bool(state.get("honeypot_alerts")) or bool(state.get("mirror_alerts")) or "simulate_quarantine_host" in containment_state.get("actions_executed", [])
         )
-        t = threading.Thread(target=dynamic_source.run_forever, args=(lambda: self._stop.is_set(),), daemon=True)
-        t.start()
-        self._dynamic_threads.append(t)
-        details.append("enabled_dynamic_system_runtime")
-        return details
+        if not should_prompt:
+            return
+
+        host = "unknown"
+        alerts = state.get("alerts") or []
+        honeypot_alerts = state.get("honeypot_alerts") or []
+        if alerts:
+            host = str((alerts[0] or {}).get("event", {}).get("host", "unknown"))
+        elif honeypot_alerts:
+            host = str((honeypot_alerts[0] or {}).get("event", {}).get("host", "unknown"))
+
+        severity = int(state.get("candidate_severity", 0) or 0)
+        recommended_actions = [
+            "disable_outbound_traffic",
+            "revoke_rotate_api_keys",
+            "quarantine_host",
+            "forensic_snapshot_metadata",
+        ]
+        if bool(honeypot_alerts) or bool(state.get("mirror_alerts")):
+            recommended_actions = [
+                "kill_active_model_sessions",
+                "disable_iam_sessions",
+                "disable_outbound_traffic",
+                "revoke_rotate_api_keys",
+                "pause_model_serving_container",
+                "sinkhole_suspicious_destinations",
+                "block_lateral_movement_paths",
+                "quarantine_host",
+                "forensic_snapshot_metadata",
+            ]
+
+        with self._containment_decision_lock:
+            if self._containment_decision.get("pending", False):
+                return
+            self.fast_lane_containment.execute(
+                host=host,
+                severity=max(70, min(89, severity)),
+                requested_actions=["disable_outbound_traffic", "forensic_snapshot_metadata"],
+                approvals=list(self.settings.get("automated_approvers", ["user"])),
+                simulation_mode=False,
+                hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
+                signature_bundle=self.settings.get("containment_signature"),
+                confirmation_bundle=self.settings.get("containment_confirmation"),
+            )
+            self._holding_hosts.add(host)
+            self._containment_decision = {
+                "pending": True,
+                "host": host,
+                "severity": severity,
+                "reason": "malware_or_rogue_agent_detected",
+                "simulation": containment_state,
+                "recommended_actions": recommended_actions,
+                "hold_active": True,
+            }
+            pending_payload = dict(self._containment_decision)
+            pending_payload["holding_hosts"] = sorted(self._holding_hosts)
+            self.audit.append("containment_decision_pending", pending_payload)
 
     def apply_telemetry_permission(self, granted: bool) -> dict[str, Any]:
         details: list[str] = []
@@ -479,6 +584,8 @@ class SentinelRuntime:
             honeypot_detector=self.honeypot_detector,
             mirror_clone_detector=self.mirror_clone_detector,
         )
+        self._update_containment_decision_from_state(state)
+        state["containment_decision"] = self.get_containment_decision_status()
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return state
