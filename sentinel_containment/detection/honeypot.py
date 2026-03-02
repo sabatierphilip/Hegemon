@@ -16,7 +16,7 @@ class HoneypotAlert:
 
 
 class HoneypotDetector:
-    """Flags interactions with decoy assets that should never be touched."""
+    """Flags interactions with decoy assets and scores adversarial tradecraft sophistication."""
 
     def __init__(self, decoy_resources: list[str] | None = None, proto_agi_indicators: list[str] | None = None):
         self.decoy_resources = {resource.strip().lower() for resource in (decoy_resources or []) if resource.strip()}
@@ -30,6 +30,13 @@ class HoneypotDetector:
         ]
         indicators = proto_agi_indicators or default_indicators
         self.proto_agi_indicators = {indicator.strip().lower() for indicator in indicators if indicator.strip()}
+        self._advanced_tactics = {
+            "credential_dump": ["credential dump", "lsass", "token theft", "vault export"],
+            "stealth_channel": ["dns tunnel", "covert channel", "domain fronting", "steganography"],
+            "defense_evasion": ["disable edr", "tamper", "hook bypass", "unhook"],
+            "lateral_movement": ["wmic", "pass-the-hash", "remote service create", "lateral"],
+            "command_staging": ["powershell -enc", "base64", "living off the land", "lolbin"],
+        }
 
     def _metadata_blob(self, event: dict[str, Any]) -> str:
         metadata = event.get("metadata", {})
@@ -38,9 +45,17 @@ class HoneypotDetector:
             str(event.get("process", "")),
             str(event.get("user_agent", "")),
             str(event.get("message", "")),
+            str(event.get("command_line", "")),
             str(metadata),
         ]
         return " ".join(fields).lower()
+
+    def _match_advanced_tactics(self, blob: str) -> list[str]:
+        matches = []
+        for tactic, indicators in self._advanced_tactics.items():
+            if any(marker in blob for marker in indicators):
+                matches.append(tactic)
+        return sorted(matches)
 
     def evaluate(self, event: dict[str, Any]) -> list[HoneypotAlert]:
         if not self.decoy_resources:
@@ -49,19 +64,34 @@ class HoneypotDetector:
         resource = str(event.get("resource", "")).strip().lower()
         metadata_blob = self._metadata_blob(event)
         matched_indicators = sorted(indicator for indicator in self.proto_agi_indicators if indicator in metadata_blob)
+        matched_tactics = self._match_advanced_tactics(metadata_blob)
 
         for decoy in self.decoy_resources:
             if decoy and (decoy in resource or decoy in metadata_blob):
-                classification = "proto_agi_honeypot_tripwire" if matched_indicators else "honeypot_tripwire"
-                kill_chain_recommended = bool(matched_indicators)
+                if matched_indicators:
+                    classification = "proto_agi_honeypot_tripwire"
+                    kill_chain_recommended = True
+                    severity = 100
+                    reason = f"Honeypot decoy triggered with proto-AGI indicators: {decoy}"
+                elif len(matched_tactics) >= 2:
+                    classification = "advanced_honeypot_intrusion"
+                    kill_chain_recommended = True
+                    severity = min(100, 96 + len(matched_tactics))
+                    reason = f"Sophisticated decoy intrusion detected ({','.join(matched_tactics)}): {decoy}"
+                else:
+                    classification = "honeypot_tripwire"
+                    kill_chain_recommended = False
+                    severity = 99
+                    reason = f"Honeypot resource touched: {decoy}"
+
                 return [
                     HoneypotAlert(
                         resource=resource or "unknown",
-                        severity=100 if kill_chain_recommended else 99,
-                        reason=f"Honeypot resource touched: {decoy}",
+                        severity=severity,
+                        reason=reason,
                         classification=classification,
                         kill_chain_recommended=kill_chain_recommended,
-                        matched_indicators=matched_indicators,
+                        matched_indicators=sorted(set(matched_indicators + matched_tactics)),
                         event=event,
                     )
                 ]
