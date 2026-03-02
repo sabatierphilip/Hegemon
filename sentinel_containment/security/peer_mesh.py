@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,61 @@ class PeerAttestationResult:
     ok: bool
     verified_pairs: int
     failures: list[dict[str, Any]]
+    external_verification: list[dict[str, Any]]
+
+
+class ExternalAttestationVerifier(ABC):
+    """Provider contract for out-of-band node attestation verification."""
+
+    provider_name: str
+
+    @abstractmethod
+    def verify(self, peer_id: str, evidence: dict[str, Any] | None) -> tuple[bool, str]:
+        raise NotImplementedError
+
+
+class TPMQuoteVerifier(ExternalAttestationVerifier):
+    """Validates TPM quote-like measurements against expected digests."""
+
+    provider_name = "tpm_quote"
+
+    def __init__(self, trusted_measurements: dict[str, str]):
+        self._trusted_measurements = {str(k): str(v).strip().lower() for k, v in trusted_measurements.items()}
+
+    def verify(self, peer_id: str, evidence: dict[str, Any] | None) -> tuple[bool, str]:
+        trusted_measurement = self._trusted_measurements.get(peer_id)
+        if not trusted_measurement:
+            return False, "missing_trusted_tpm_reference"
+        measurement = str((evidence or {}).get("measurement", "")).strip().lower()
+        if not measurement:
+            return False, "missing_tpm_measurement"
+        if not hmac.compare_digest(measurement, trusted_measurement):
+            return False, "tpm_measurement_mismatch"
+        return True, "verified"
+
+
+class CloudAttestationVerifier(ExternalAttestationVerifier):
+    """Validates cloud-native attestation claims from trusted issuers."""
+
+    provider_name = "cloud_attestation"
+
+    def __init__(self, trusted_issuers: list[str], required_nonce_prefix: str = "hegemon"):
+        self._trusted_issuers = {str(i).strip().lower() for i in trusted_issuers if str(i).strip()}
+        self._required_nonce_prefix = str(required_nonce_prefix).strip().lower()
+
+    def verify(self, peer_id: str, evidence: dict[str, Any] | None) -> tuple[bool, str]:
+        issuer = str((evidence or {}).get("issuer", "")).strip().lower()
+        nonce = str((evidence or {}).get("nonce", "")).strip().lower()
+        workload = str((evidence or {}).get("workload", "")).strip()
+        if not issuer:
+            return False, "missing_cloud_issuer"
+        if issuer not in self._trusted_issuers:
+            return False, "untrusted_cloud_issuer"
+        if not nonce.startswith(self._required_nonce_prefix):
+            return False, "invalid_cloud_nonce"
+        if workload != peer_id:
+            return False, "workload_mismatch"
+        return True, "verified"
 
 
 @dataclass
@@ -30,9 +86,15 @@ class FriendlyEnrollmentResult:
 class PeerVerificationMesh:
     """Dynamic HMAC-backed peer attestation mesh for runtime process integrity."""
 
-    def __init__(self, process_keys: dict[str, str], max_clock_skew_seconds: int = 30):
+    def __init__(
+        self,
+        process_keys: dict[str, str],
+        max_clock_skew_seconds: int = 30,
+        external_verifiers: list[ExternalAttestationVerifier] | None = None,
+    ):
         self._process_keys = dict(process_keys)
         self._max_clock_skew_seconds = max(5, int(max_clock_skew_seconds))
+        self._external_verifiers = list(external_verifiers or [])
 
     @property
     def process_ids(self) -> list[str]:
@@ -50,12 +112,15 @@ class PeerVerificationMesh:
         self,
         now: float | None = None,
         observed_peer_keys: dict[str, str] | None = None,
+        external_attestations: dict[str, dict[str, dict[str, Any]]] | None = None,
     ) -> PeerAttestationResult:
         ts = float(now if now is not None else time.time())
         peers = self.process_ids
         observed_keys = observed_peer_keys or {}
         failures: list[dict[str, Any]] = []
+        external_verification: list[dict[str, Any]] = []
         verified_pairs = 0
+        peer_external_evidence = external_attestations or {}
         for challenger in peers:
             for responder in peers:
                 if challenger == responder:
@@ -78,7 +143,33 @@ class PeerVerificationMesh:
                 age = abs(time.time() - challenge["timestamp"])
                 if age > self._max_clock_skew_seconds:
                     failures.append({"challenger": challenger, "responder": responder, "reason": "clock_skew_exceeded"})
-        return PeerAttestationResult(ok=not failures, verified_pairs=verified_pairs, failures=failures)
+
+        for responder in peers:
+            evidence_for_peer = peer_external_evidence.get(responder, {})
+            for verifier in self._external_verifiers:
+                evidence = evidence_for_peer.get(verifier.provider_name)
+                verified, reason = verifier.verify(responder, evidence)
+                verdict = {
+                    "responder": responder,
+                    "provider": verifier.provider_name,
+                    "verified": verified,
+                    "reason": reason,
+                }
+                external_verification.append(verdict)
+                if not verified:
+                    failures.append(
+                        {
+                            "challenger": "external_verifier",
+                            "responder": responder,
+                            "reason": f"{verifier.provider_name}:{reason}",
+                        }
+                    )
+        return PeerAttestationResult(
+            ok=not failures,
+            verified_pairs=verified_pairs,
+            failures=failures,
+            external_verification=external_verification,
+        )
 
 
 class FriendlyPeerRegistry:

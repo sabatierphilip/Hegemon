@@ -22,10 +22,12 @@ from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
 from sentinel_containment.security import (
+    CloudAttestationVerifier,
     FriendlyPeerRegistry,
     HardwareKeyVerifier,
     HumanConfirmationVerifier,
     PeerVerificationMesh,
+    TPMQuoteVerifier,
 )
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import IngestionService, discover_live_file_sources
@@ -203,9 +205,29 @@ class SentinelRuntime:
             for pid, key in configured_legacy_keys.items():
                 process_keys.setdefault(pid, key)
 
+        external_verifiers = []
+        tpm_cfg = p2p_cfg.get("external_tpm_attestation", {})
+        if bool(tpm_cfg.get("enabled", False)):
+            external_verifiers.append(
+                TPMQuoteVerifier(
+                    trusted_measurements={str(k): str(v) for k, v in tpm_cfg.get("trusted_measurements", {}).items()}
+                )
+            )
+
+        cloud_cfg = p2p_cfg.get("external_cloud_attestation", {})
+        if bool(cloud_cfg.get("enabled", False)):
+            issuers = [str(i) for i in cloud_cfg.get("trusted_issuers", [])]
+            external_verifiers.append(
+                CloudAttestationVerifier(
+                    trusted_issuers=issuers,
+                    required_nonce_prefix=str(cloud_cfg.get("required_nonce_prefix", "hegemon")),
+                )
+            )
+
         self.peer_mesh = PeerVerificationMesh(
             process_keys=process_keys,
             max_clock_skew_seconds=int(p2p_cfg.get("max_clock_skew_seconds", 30)),
+            external_verifiers=external_verifiers,
         )
         self._peer_verification_interval = float(p2p_cfg.get("interval_seconds", 5.0))
         self._next_peer_verification_due = 0.0
@@ -288,6 +310,7 @@ class SentinelRuntime:
             "verified_pairs": result.verified_pairs,
             "failures": result.failures,
             "mesh_size": len(self.peer_mesh.process_ids),
+            "external_verification": result.external_verification,
         }
         self.ingestor.ingest(
             "host_runtime",

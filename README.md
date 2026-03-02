@@ -17,7 +17,7 @@ What starts automatically:
 - Probabilistic MITRE-aware attack chain extraction
 - Learned graph edge novelty with temporal and structural drift scoring
 - Credential blast-radius estimation and containment simulation before hard quarantine
-- Multi-signal honeypot tripwires with proto-AGI indicator scoring and immediate kill/containment chain
+- Multi-signal honeypot tripwires with proto-AGI indicator scoring, adversarial tradecraft profiling, and immediate kill/containment chain
 - Immutable audit logging with immediate out-of-band mirroring support
 - Flask dashboard (`http://localhost:5000`) and `/graph`
 
@@ -51,6 +51,8 @@ Main settings are in `config/config.yaml`:
 - `trusted_hardware_public_keys` and `containment_signature` to require YubiKey/TPM-backed signatures before any containment execution
 - `honeypot_resources` for decoy assets that should never be accessed
 - `proto_agi_indicators` to tune high-risk autonomous behavior markers that trigger immediate containment
+- `peer_verification.external_tpm_attestation.*` to enforce hardware TPM quote validation for every mesh peer
+- `peer_verification.external_cloud_attestation.*` to enforce cloud-native workload attestation checks
 - `audit_out_of_band_path` for append-only out-of-band audit sink
 - `approval_identity_store` for canonical approval identity normalization
 - `dashboard_host`/`dashboard_port` for web UI
@@ -83,7 +85,7 @@ Notes:
 - Defensive-first containment with hard-response acceleration for high-risk incidents
 - Configurable approval quorum (default single-user for faster autonomous response)
 - Identity-bound execution: containment requires valid signatures from trusted hardware-bound keys (YubiKey/TPM)
-- Dynamic peer-to-peer process attestation mesh to continuously verify Hegemon process integrity and detect tampering/subversion attempts
+- Dynamic peer-to-peer process attestation mesh plus external TPM/cloud attestation verification to prevent self-attesting compromised nodes
 - User-only friendly software enrollment with cryptographic authorization; enrolled friendlies are added to the mesh and protected via patrol telemetry
 - Reversible actions where possible with stronger automatic isolation for severe events
 - Tamper-evident immutable hash-chain logs plus telemetry event signature-chain verification

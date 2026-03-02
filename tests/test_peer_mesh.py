@@ -4,7 +4,12 @@ import time
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from sentinel_containment.security.peer_mesh import FriendlyPeerRegistry, PeerVerificationMesh
+from sentinel_containment.security.peer_mesh import (
+    CloudAttestationVerifier,
+    FriendlyPeerRegistry,
+    PeerVerificationMesh,
+    TPMQuoteVerifier,
+)
 
 
 def test_peer_mesh_detects_tampered_peer_key():
@@ -55,3 +60,45 @@ def test_friendly_registry_requires_single_user_and_signature():
     assert allowed.record is not None
     assert allowed.record["guard_patrol"] == "enabled"
     assert registry.patrol_targets()[0]["software_id"] == "friendly-sim"
+
+
+def test_peer_mesh_requires_external_attestation_verifiers():
+    mesh = PeerVerificationMesh(
+        {"a": "ka", "b": "kb"},
+        max_clock_skew_seconds=999999,
+        external_verifiers=[
+            TPMQuoteVerifier({"a": "pcr-a", "b": "pcr-b"}),
+            CloudAttestationVerifier(["aws-nitro"], required_nonce_prefix="hegemon"),
+        ],
+    )
+
+    healthy = mesh.run_attestation_cycle(
+        external_attestations={
+            "a": {
+                "tpm_quote": {"measurement": "pcr-a"},
+                "cloud_attestation": {"issuer": "aws-nitro", "nonce": "hegemon-1", "workload": "a"},
+            },
+            "b": {
+                "tpm_quote": {"measurement": "pcr-b"},
+                "cloud_attestation": {"issuer": "aws-nitro", "nonce": "hegemon-2", "workload": "b"},
+            },
+        }
+    )
+    assert healthy.ok is True
+    assert healthy.external_verification
+
+    tampered = mesh.run_attestation_cycle(
+        external_attestations={
+            "a": {
+                "tpm_quote": {"measurement": "pcr-a"},
+                "cloud_attestation": {"issuer": "aws-nitro", "nonce": "hegemon-1", "workload": "a"},
+            },
+            "b": {
+                "tpm_quote": {"measurement": "forged"},
+                "cloud_attestation": {"issuer": "rogue", "nonce": "xxx", "workload": "b"},
+            },
+        }
+    )
+    assert tampered.ok is False
+    assert any("tpm_quote:tpm_measurement_mismatch" in f["reason"] for f in tampered.failures)
+    assert any("cloud_attestation:untrusted_cloud_issuer" in f["reason"] for f in tampered.failures)
