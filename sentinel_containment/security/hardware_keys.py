@@ -37,6 +37,13 @@ class HardwareKeyVerifier:
     def enabled(self) -> bool:
         return self._fail_closed or self.configured
 
+    def upsert_trusted_public_key(self, key_id: str, public_key_pem: str) -> None:
+        normalized_key_id = str(key_id).strip()
+        normalized_pem = str(public_key_pem).strip()
+        if not normalized_key_id or not normalized_pem:
+            return
+        self._trusted_public_keys[normalized_key_id] = normalized_pem
+
     @staticmethod
     def canonical_payload(
         host: str,

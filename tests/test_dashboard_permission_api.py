@@ -153,3 +153,47 @@ def test_security_headers_present(auth_headers):
     assert resp.headers["X-Frame-Options"] == "DENY"
     assert "default-src 'self'" in resp.headers["Content-Security-Policy"]
     assert resp.headers["X-CSRF-Protection"] == "token-required-for-state-change"
+
+
+def test_hardware_key_auto_configure_api(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "hardware_key_fail_closed": False,
+        "trusted_hardware_public_keys": {},
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+
+    client = app.test_client()
+
+    status_before = client.get("/api/hardware-keys/status", headers=auth_headers)
+    assert status_before.status_code == 200
+    assert status_before.get_json()["completed"] is False
+
+    configured = client.post("/api/hardware-keys/auto-configure", json={"configure": True}, headers=auth_headers)
+    assert configured.status_code == 200
+    configured_payload = configured.get_json()
+    assert configured_payload["completed"] is True
+    assert configured_payload["configured"] is True
+
+    declined = client.post("/api/hardware-keys/auto-configure", json={"configure": False}, headers=auth_headers)
+    assert declined.status_code == 200
+    assert declined.get_json()["completed"] is False
+
+    runtime.ingestion_service.syslog_server.server_close()
+    runtime.ingestion_service.kernel_webhook_server.server_close()

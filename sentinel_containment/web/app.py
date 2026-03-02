@@ -155,6 +155,7 @@ HTML = """
   <div class=\"panel\">
     <h3>Deployment Control</h3>
     <div class=\"small\" id=\"telemetry-status\">Telemetry permission pending.</div>
+    <div class=\"small\" id=\"hardware-key-status\" style=\"margin-top:6px;\">Hardware key bootstrap check pending.</div>
     <button id=\"run-btn\" style=\"margin-top:8px;padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;\">Run</button>
   </div>
 
@@ -260,9 +261,32 @@ async function decideContainment(execute){
   updateDecisionUI(body);
 }
 
+async function promptHardwareKeyBootstrap(){
+  const status=document.getElementById("hardware-key-status");
+  try{
+    const statusResp=await fetch("/api/hardware-keys/status");
+    const statusPayload=await statusResp.json();
+    if(statusPayload.completed){
+      if(status){status.textContent=`Hardware key profile already configured (${statusPayload.key_id || "existing"}).`;}
+      return;
+    }
+    const shouldConfigure=window.confirm("Auto-configure local hardware key profile now for high-severity containment operations?");
+    const applyResp=await fetch("/api/hardware-keys/auto-configure",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({configure:shouldConfigure})});
+    const applyPayload=await applyResp.json();
+    if(status){
+      status.textContent = applyPayload.completed
+        ? `Hardware keys auto-configured with local trust anchor ${applyPayload.key_id || "auto"}.`
+        : "Hardware key auto-configuration deferred by operator.";
+    }
+  }catch(_err){
+    if(status){status.textContent="Hardware key bootstrap check unavailable.";}
+  }
+}
+
 document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
 document.getElementById("containment-yes")?.addEventListener("click",()=>decideContainment(true));
 document.getElementById("containment-no")?.addEventListener("click",()=>decideContainment(false));
+window.addEventListener("load",promptHardwareKeyBootstrap);
 </script>
 </body>
 </html>
@@ -429,6 +453,32 @@ def telemetry_permission_apply():
         return jsonify({"required": True, "granted": granted, "completed": False, "details": ["runtime_not_initialized"]}), 503
     return jsonify(_runtime.apply_telemetry_permission(granted))
 
+
+
+@app.get("/api/hardware-keys/status")
+def hardware_key_status():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if _runtime is None:
+        return jsonify({"required": True, "configured": False, "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.get_hardware_key_setup_notice())
+
+
+@app.post("/api/hardware-keys/auto-configure")
+def hardware_key_auto_configure():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    configure_value = payload.get("configure", False)
+    if not isinstance(configure_value, bool):
+        return jsonify({"error": "invalid_payload", "message": "configure must be a boolean"}), 400
+    if _runtime is None:
+        return jsonify({"required": True, "configured": False, "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.auto_configure_hardware_keys(configure_value))
 
 
 @app.get("/api/containment/decision")
