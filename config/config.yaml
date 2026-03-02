@@ -50,6 +50,9 @@ human_confirmation_fail_closed: true
 human_confirmation_prompt_count: 2
 human_confirmation_question_salt: human-presence-gate
 containment_confirmation: null
+human_required_default: false
+auto_grant_telemetry_permission: true
+auto_configure_hardware_keys_on_startup: true
 ingestion:
   index_path: data/telemetry_index.jsonl
   syslog_host: 0.0.0.0

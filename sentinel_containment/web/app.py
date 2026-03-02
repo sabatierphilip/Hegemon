@@ -154,6 +154,11 @@ HTML = """
 
   <div class=\"panel\">
     <h3>Deployment Control</h3>
+    <div class=\"small\" id=\"human-gate-status\">Human-in-the-loop toggle status loading.</div>
+    <label class=\"small\" style=\"display:flex;align-items:center;gap:8px;margin-top:6px;\">
+      <input id=\"human-gate-toggle\" type=\"checkbox\" />
+      Require human confirmation for containment decisions
+    </label>
     <div class=\"small\" id=\"telemetry-status\">Telemetry permission pending.</div>
     <div class=\"small\" id=\"hardware-key-status\" style=\"margin-top:6px;\">Hardware key bootstrap check pending.</div>
     <button id=\"run-btn\" style=\"margin-top:8px;padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;\">Run</button>
@@ -283,10 +288,42 @@ async function promptHardwareKeyBootstrap(){
   }
 }
 
+async function loadHumanGateStatus(){
+  const status=document.getElementById("human-gate-status");
+  const toggle=document.getElementById("human-gate-toggle");
+  try{
+    const resp=await fetch("/api/human-gate/status");
+    const payload=await resp.json();
+    if(toggle){toggle.checked=Boolean(payload.human_required);}
+    if(status){
+      status.textContent = payload.human_required
+        ? "Human approval is required before containment execution."
+        : "Autonomous mode active: actions auto-approve by default.";
+    }
+  }catch(_err){
+    if(status){status.textContent="Human-gate status unavailable.";}
+  }
+}
+
+async function updateHumanGate(required){
+  const status=document.getElementById("human-gate-status");
+  const resp=await fetch("/api/human-gate/toggle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({human_required:required})});
+  const payload=await resp.json();
+  if(status){
+    status.textContent = payload.human_required
+      ? "Human approval is required before containment execution."
+      : "Autonomous mode active: actions auto-approve by default.";
+  }
+}
+
 document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
 document.getElementById("containment-yes")?.addEventListener("click",()=>decideContainment(true));
 document.getElementById("containment-no")?.addEventListener("click",()=>decideContainment(false));
-window.addEventListener("load",promptHardwareKeyBootstrap);
+document.getElementById("human-gate-toggle")?.addEventListener("change",(event)=>{
+  const target=event.target;
+  updateHumanGate(Boolean(target && target.checked));
+});
+window.addEventListener("load",()=>{loadHumanGateStatus(); promptHardwareKeyBootstrap();});
 </script>
 </body>
 </html>
@@ -453,6 +490,31 @@ def telemetry_permission_apply():
         return jsonify({"required": True, "granted": granted, "completed": False, "details": ["runtime_not_initialized"]}), 503
     return jsonify(_runtime.apply_telemetry_permission(granted))
 
+
+@app.get("/api/human-gate/status")
+def human_gate_status():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if _runtime is None:
+        return jsonify({"human_required": False, "completed": True, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.get_human_gate_status())
+
+
+@app.post("/api/human-gate/toggle")
+def human_gate_toggle():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    human_required_value = payload.get("human_required", False)
+    if not isinstance(human_required_value, bool):
+        return jsonify({"error": "invalid_payload", "message": "human_required must be a boolean"}), 400
+    if _runtime is None:
+        return jsonify({"human_required": bool(human_required_value), "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.set_human_gate(bool(human_required_value)))
 
 
 @app.get("/api/hardware-keys/status")
