@@ -17,6 +17,7 @@ What starts automatically:
 - Probabilistic MITRE-aware attack chain extraction
 - Learned graph edge novelty with temporal and structural drift scoring
 - Credential blast-radius estimation and containment simulation before hard quarantine
+- Hybrid containment execution engine with safe-by-default simulation plus optional live controls (iptables/nft outbound isolation, AWS IAM deny policy push, DNS sinkhole host mapping)
 - Multi-signal honeypot tripwires with proto-AGI indicator scoring, adversarial tradecraft profiling, and immediate kill/containment chain
 - Immutable audit logging with immediate out-of-band mirroring support
 - Flask dashboard (`http://localhost:5000`) and `/graph`
@@ -43,6 +44,7 @@ Main settings are in `config/config.yaml`:
 - `burst_cycle_severity_threshold`/`burst_cycle_seconds` for sub-minute burst detection cadence during active incidents
 - `containment_severity_threshold` for auto containment
 - `containment_simulation_mode` to stage soft-containment before hard host quarantine (defaults to hard containment-first)
+- `containment_live_mode` to permit live containment execution hooks (default false for safety)
 - `force_hard_containment_threshold` and `force_hard_containment_blast_radius` to bypass simulation on high confidence/high blast-radius incidents
 - `hard_quarantine_threshold` to force quarantine at elevated severity
 - `fast_track_containment_threshold`/`fast_track_risk_confidence` for immediate containment based on multi-signal confidence
@@ -96,3 +98,11 @@ Notes:
 ```bash
 pytest -q
 ```
+
+
+### Rule language upgrades
+
+Rules now support structured matching that goes beyond simple equality/threshold checks:
+- Sigma-like selectors under `detection.sigma` (`all_of`, `any_of`, `not`, `contains`, `regex`, `startswith`, `endswith`, `in`)
+- YARA-like token sets under `detection.yara_like` with configurable `min_hits` across multiple fields
+- Native `regex` and `contains_any` field maps for expressive matching in compact rules

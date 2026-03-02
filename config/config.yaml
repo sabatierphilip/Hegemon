@@ -25,6 +25,7 @@ graph_warmup_min_relations: 1
 graph_horizons_minutes: [5, 30, 180]
 attack_chain_window_minutes: 30
 containment_simulation_mode: false
+containment_live_mode: false
 hard_quarantine_threshold: 85
 force_hard_containment_threshold: 80
 force_hard_containment_blast_radius: 70

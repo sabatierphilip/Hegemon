@@ -1,0 +1,13 @@
+title: Suspicious Lateral Tooling (Sigma-like)
+description: Correlates suspicious remote-exec tooling with privilege context.
+severity: 88
+detection:
+  sigma:
+    all_of:
+      - action: { in: ["process_start", "command_execute"] }
+      - command_line: { regex: "(?i)(wmic|psexec|winrm|ssh\\s+-o)" }
+    any_of:
+      - user: { contains: "admin" }
+      - user: { contains: "root" }
+    not:
+      - command_line: { contains: "known-good-maintenance" }
