@@ -1,11 +1,19 @@
 from pathlib import Path
 
+import pytest
+
 from sentinel_containment.config import Settings
 from sentinel_containment.runtime import SentinelRuntime
 from sentinel_containment.web.app import app, set_runtime
 
 
-def test_permission_api_applies_notice(tmp_path: Path):
+@pytest.fixture
+def auth_headers(monkeypatch):
+    monkeypatch.setenv("SENTINEL_DASHBOARD_TOKEN", "test-token")
+    return {"Authorization": "Bearer test-token"}
+
+
+def test_permission_api_applies_notice(tmp_path: Path, auth_headers):
     cfg = {
         "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
         "latest_state_path": str(tmp_path / "latest_state.json"),
@@ -28,7 +36,7 @@ def test_permission_api_applies_notice(tmp_path: Path):
     set_runtime(runtime)
 
     client = app.test_client()
-    response = client.post("/api/telemetry/permission", json={"granted": True})
+    response = client.post("/api/telemetry/permission", json={"granted": True}, headers=auth_headers)
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["granted"] is True
@@ -38,7 +46,7 @@ def test_permission_api_applies_notice(tmp_path: Path):
     runtime.ingestion_service.kernel_webhook_server.server_close()
 
 
-def test_containment_decision_api_executes_and_releases(tmp_path: Path):
+def test_containment_decision_api_executes_and_releases(tmp_path: Path, auth_headers):
     cfg = {
         "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
         "latest_state_path": str(tmp_path / "latest_state.json"),
@@ -77,7 +85,7 @@ def test_containment_decision_api_executes_and_releases(tmp_path: Path):
 
     client = app.test_client()
 
-    execute_response = client.post("/api/containment/decision", json={"execute": True})
+    execute_response = client.post("/api/containment/decision", json={"execute": True}, headers=auth_headers)
     assert execute_response.status_code == 200
     execute_payload = execute_response.get_json()
     assert execute_payload["executed"] is True
@@ -95,7 +103,7 @@ def test_containment_decision_api_executes_and_releases(tmp_path: Path):
     }
     runtime._holding_hosts.add("host-b")
 
-    release_response = client.post("/api/containment/decision", json={"execute": False})
+    release_response = client.post("/api/containment/decision", json={"execute": False}, headers=auth_headers)
     assert release_response.status_code == 200
     release_payload = release_response.get_json()
     assert release_payload["released"] is True
@@ -103,3 +111,45 @@ def test_containment_decision_api_executes_and_releases(tmp_path: Path):
 
     runtime.ingestion_service.syslog_server.server_close()
     runtime.ingestion_service.kernel_webhook_server.server_close()
+
+
+def test_web_auth_and_redaction_controls(auth_headers, monkeypatch):
+    monkeypatch.setattr(
+        "sentinel_containment.web.app._load_latest_state",
+        lambda: {
+            "topology": {
+                "nodes": [{"id": "n1", "ip": "10.0.0.8"}],
+                "edges": [{"source": "n1", "target": "n2", "service": "ssh"}],
+            }
+        },
+    )
+
+    client = app.test_client()
+
+    unauthorized = client.get("/api/state")
+    assert unauthorized.status_code == 401
+
+    graph_resp = client.get("/graph", headers=auth_headers)
+    assert graph_resp.status_code == 200
+    graph_payload = graph_resp.get_json()
+    assert graph_payload["redacted"] is True
+    assert graph_payload["nodes"] == 1
+    assert graph_payload["edges"] == 1
+
+
+def test_input_validation_rejects_malformed_payload(auth_headers):
+    client = app.test_client()
+
+    malformed = client.post("/api/containment/decision", data="{bad", headers={**auth_headers, "Content-Type": "application/json"})
+    assert malformed.status_code == 400
+
+    wrong_type = client.post("/api/telemetry/permission", json={"granted": "yes"}, headers=auth_headers)
+    assert wrong_type.status_code == 400
+
+
+def test_security_headers_present(auth_headers):
+    client = app.test_client()
+    resp = client.get("/api/state", headers=auth_headers)
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert "default-src 'self'" in resp.headers["Content-Security-Policy"]
+    assert resp.headers["X-CSRF-Protection"] == "token-required-for-state-change"

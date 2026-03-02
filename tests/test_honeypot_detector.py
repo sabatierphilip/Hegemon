@@ -28,3 +28,35 @@ def test_honeypot_detector_keeps_simple_tripwire_behavior():
     assert alerts
     assert alerts[0].classification == "honeypot_tripwire"
     assert alerts[0].kill_chain_recommended is False
+
+
+def test_honeypot_detector_catches_obfuscated_proto_agi_indicator():
+    detector = HoneypotDetector(["decoy://llm-admin"], ["recursive self-improvement"])
+
+    alerts = detector.evaluate(
+        {
+            "resource": "decoy://llm-admin",
+            "action": "touch",
+            "message": "r3curs1ve_s3lf-1mpr0v3m3nt task queued",
+        }
+    )
+
+    assert alerts
+    assert alerts[0].classification == "proto_agi_honeypot_tripwire"
+    assert "recursive self-improvement" in alerts[0].matched_indicators
+
+
+def test_honeypot_detector_catches_base64_encoded_indicator():
+    detector = HoneypotDetector(["decoy://llm-admin"], ["policy evasion"])
+
+    alerts = detector.evaluate(
+        {
+            "resource": "decoy://llm-admin",
+            "action": "touch",
+            "message": "cG9saWN5IGV2YXNpb24=",
+        }
+    )
+
+    assert alerts
+    assert alerts[0].classification == "proto_agi_honeypot_tripwire"
+    assert "policy evasion" in alerts[0].matched_indicators
