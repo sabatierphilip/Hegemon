@@ -20,7 +20,8 @@ What starts automatically:
 - Hybrid containment execution engine with safe-by-default simulation plus optional live controls (iptables/nft outbound isolation, AWS IAM deny policy push, DNS sinkhole host mapping)
 - Multi-signal honeypot tripwires with proto-AGI indicator scoring, adversarial tradecraft profiling, and immediate kill/containment chain
 - Immutable audit logging with immediate out-of-band mirroring support
-- Flask dashboard (`http://localhost:5000`) and `/graph`
+- Local-only Flask dashboard (`http://127.0.0.1:5000`) and `/graph`
+- First-run dashboard popup to optionally auto-configure hardware-key trust anchors for high-severity containment
 
 ## Docker single-command deployment
 
@@ -57,7 +58,7 @@ Main settings are in `config/config.yaml`:
 - `peer_verification.external_cloud_attestation.*` to enforce cloud-native workload attestation checks
 - `audit_out_of_band_path` for append-only out-of-band audit sink
 - `approval_identity_store` for canonical approval identity normalization
-- `dashboard_host`/`dashboard_port` for web UI
+- `dashboard_host`/`dashboard_port` for local UI binding (defaults to `127.0.0.1`)
 - `graph_horizons_minutes` for multi-horizon rolling graph anomaly summaries that catch patient low-and-slow campaigns
 - `web_rate_*` settings for adaptive event-triggered burst throttling that defends dashboard/API endpoints from request-flood DoS
 

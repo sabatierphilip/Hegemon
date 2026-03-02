@@ -9,7 +9,7 @@ incident_channel: SOC-Slack
 telemetry_index_path: data/telemetry_index.jsonl
 telemetry_batch_limit: 200
 latest_state_path: data/latest_state.json
-dashboard_host: 0.0.0.0
+dashboard_host: 127.0.0.1
 dashboard_port: 5000
 web_rate_base_window_seconds: 1.0
 web_rate_base_limit: 60

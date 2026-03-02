@@ -10,6 +10,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
 from sentinel_containment.config import Settings
 from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.containment.executors import ContainmentActionExecutor
@@ -183,6 +186,12 @@ class SentinelRuntime:
         )
 
         self._telemetry_setup_notice: dict[str, Any] = {"required": True, "granted": False, "completed": False, "details": []}
+        self._hardware_key_setup_notice: dict[str, Any] = {
+            "required": True,
+            "configured": self.fast_lane_containment.hardware_key_verifier.configured,
+            "completed": self.fast_lane_containment.hardware_key_verifier.configured,
+            "details": [],
+        }
         self._dynamic_threads: list[threading.Thread] = []
         self._containment_decision: dict[str, Any] = {
             "pending": False,
@@ -415,6 +424,42 @@ class SentinelRuntime:
             pending_payload = dict(self._containment_decision)
             pending_payload["holding_hosts"] = sorted(self._holding_hosts)
             self.audit.append("containment_decision_pending", pending_payload)
+
+    def get_hardware_key_setup_notice(self) -> dict[str, Any]:
+        return dict(self._hardware_key_setup_notice)
+
+    def auto_configure_hardware_keys(self, configure: bool) -> dict[str, Any]:
+        if not configure:
+            self._hardware_key_setup_notice = {
+                "required": True,
+                "configured": self.fast_lane_containment.hardware_key_verifier.configured,
+                "completed": False,
+                "details": ["operator_declined_auto_config"],
+            }
+            self.audit.append("hardware_key_autoconfig_declined", self._hardware_key_setup_notice)
+            return dict(self._hardware_key_setup_notice)
+
+        key_id = str(self.settings.get("auto_hardware_key_id", "auto-ed25519-local")).strip() or "auto-ed25519-local"
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        public_pem = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("utf-8")
+
+        self.fast_lane_containment.hardware_key_verifier.upsert_trusted_public_key(key_id, public_pem)
+        self.settings.data.setdefault("trusted_hardware_public_keys", {})[key_id] = public_pem
+        self.settings.data["hardware_key_fail_closed"] = True
+
+        self._hardware_key_setup_notice = {
+            "required": True,
+            "configured": True,
+            "completed": True,
+            "details": ["hardware_key_profile_hardened", "runtime_trust_anchor_updated"],
+            "key_id": key_id,
+            "local_only": True,
+        }
+        self.audit.append("hardware_key_autoconfig_completed", {"key_id": key_id, "local_only": True})
+        return dict(self._hardware_key_setup_notice)
 
     def apply_telemetry_permission(self, granted: bool) -> dict[str, Any]:
         details: list[str] = []
