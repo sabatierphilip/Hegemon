@@ -11,6 +11,7 @@ from sentinel_containment.cloud.provider import CloudProviderAdapter
 from sentinel_containment.config import Settings
 from sentinel_containment.containment.blast_radius import CredentialBlastRadiusAnalyzer
 from sentinel_containment.containment.engine import ContainmentEngine
+from sentinel_containment.containment.executors import ContainmentActionExecutor
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
@@ -359,6 +360,7 @@ def run_cycle(
         required_approvals=int(settings.get("approval_quorum", 1)),
         hardware_key_verifier=_build_hardware_key_verifier(settings),
         human_confirmation_verifier=_build_human_confirmation_verifier(settings),
+        action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", False))),
     )
     blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)

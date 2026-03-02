@@ -12,6 +12,7 @@ from typing import Any
 
 from sentinel_containment.config import Settings
 from sentinel_containment.containment.engine import ContainmentEngine
+from sentinel_containment.containment.executors import ContainmentActionExecutor
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
@@ -151,6 +152,7 @@ class SentinelRuntime:
                 question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
                 fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
             ),
+            action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", False))),
         )
 
         extra_sources = {

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from sentinel_containment.containment.executors import ContainmentActionExecutor
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.security import HardwareKeyVerifier, HumanConfirmationVerifier
 
@@ -22,6 +23,7 @@ class ContainmentEngine:
         required_approvals: int = 1,
         hardware_key_verifier: HardwareKeyVerifier | None = None,
         human_confirmation_verifier: HumanConfirmationVerifier | None = None,
+        action_executor: ContainmentActionExecutor | None = None,
     ):
         self.audit_log = audit_log
         self.contained_hosts: set[str] = set()
@@ -30,6 +32,7 @@ class ContainmentEngine:
         self._alias_lookup = self._build_alias_lookup(self.identity_store)
         self.hardware_key_verifier = hardware_key_verifier or HardwareKeyVerifier()
         self.human_confirmation_verifier = human_confirmation_verifier or HumanConfirmationVerifier()
+        self.action_executor = action_executor or ContainmentActionExecutor(active_mode=False)
 
     def execute(
         self,
@@ -43,6 +46,7 @@ class ContainmentEngine:
         simulation_context: dict[str, Any] | None = None,
         signature_bundle: dict[str, Any] | None = None,
         confirmation_bundle: dict[str, Any] | None = None,
+        action_context: dict[str, Any] | None = None,
     ) -> ContainmentResult:
         signature_verification = self.hardware_key_verifier.verify(
             host=host,
@@ -124,6 +128,15 @@ class ContainmentEngine:
         if "quarantine_host" in executed:
             self.contained_hosts.add(host)
 
+        action_results = []
+        for action in executed:
+            result = self.action_executor.execute(host, action, action_context)
+            action_results.append({
+                "action": result.action,
+                "status": result.status,
+                "details": result.details,
+            })
+
         self.audit_log.append("containment_executed", {
             "host": host,
             "severity": severity,
@@ -133,6 +146,7 @@ class ContainmentEngine:
             "reversible": True,
             "offensive_actions": False,
             "simulation_mode": simulation_mode,
+            "action_results": action_results,
         })
         return ContainmentResult(True, executed, "Containment actions executed")
 
