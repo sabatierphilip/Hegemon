@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import time
+
+import hmac
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -267,6 +269,67 @@ document.getElementById("containment-no")?.addEventListener("click",()=>decideCo
 """
 
 
+def _api_token() -> str:
+    settings = Settings.load()
+    configured = str(settings.get("dashboard_api_token", "")).strip()
+    if configured:
+        return configured
+    return str(settings.env("SENTINEL_DASHBOARD_TOKEN", "")).strip()
+
+
+def _is_authenticated() -> bool:
+    token = _api_token()
+    if not token:
+        return False
+    provided = request.headers.get("Authorization", "")
+    if provided.lower().startswith("bearer "):
+        provided = provided[7:].strip()
+    return bool(provided) and hmac.compare_digest(provided, token)
+
+
+def _require_auth():
+    if _is_authenticated():
+        return None
+    return jsonify({"error": "unauthorized", "message": "valid bearer token required"}), 401
+
+
+def _safe_json_payload(max_bytes: int = 65536) -> tuple[dict, tuple | None]:
+    if request.content_length is not None and request.content_length > max_bytes:
+        return {}, (jsonify({"error": "payload_too_large", "message": f"max payload size is {max_bytes} bytes"}), 413)
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return {}, (jsonify({"error": "invalid_json", "message": "request body must be valid JSON"}), 400)
+    if not isinstance(payload, dict):
+        return {}, (jsonify({"error": "invalid_payload", "message": "request body must be a JSON object"}), 400)
+    return payload, None
+
+
+@app.after_request
+def apply_security_headers(response):
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'; "
+        "form-action 'self'"
+    )
+    response.headers["X-CSRF-Protection"] = "token-required-for-state-change"
+    return response
+
+
+
+
 def _load_latest_state() -> dict:
     settings = Settings.load()
     state_path = Path(settings.get("latest_state_path", "data/latest_state.json"))
@@ -294,6 +357,9 @@ def _severity_class(value: int) -> str:
 
 @app.get("/")
 def dashboard():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
     state = _load_latest_state()
     return render_template_string(
         HTML,
@@ -316,12 +382,20 @@ def dashboard():
 
 @app.get("/graph")
 def graph():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
     state = _load_latest_state()
-    return jsonify(state.get("topology", {}))
+    topology = state.get("topology", {})
+    redacted = {"nodes": len(topology.get("nodes", [])), "edges": len(topology.get("edges", [])), "redacted": True}
+    return jsonify(redacted)
 
 
 @app.get("/api/state")
 def api_state():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
     return jsonify(_load_latest_state())
 
 def set_runtime(runtime: SentinelRuntime) -> None:
@@ -331,6 +405,9 @@ def set_runtime(runtime: SentinelRuntime) -> None:
 
 @app.get("/api/telemetry/permission")
 def telemetry_permission_status():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
     if _runtime is None:
         return jsonify({"required": True, "granted": False, "completed": False, "details": ["runtime_not_initialized"]}), 503
     return jsonify(_runtime.get_telemetry_setup_notice())
@@ -338,8 +415,16 @@ def telemetry_permission_status():
 
 @app.post("/api/telemetry/permission")
 def telemetry_permission_apply():
-    payload = request.get_json(silent=True) or {}
-    granted = bool(payload.get("granted", False))
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    granted_value = payload.get("granted", False)
+    if not isinstance(granted_value, bool):
+        return jsonify({"error": "invalid_payload", "message": "granted must be a boolean"}), 400
+    granted = granted_value
     if _runtime is None:
         return jsonify({"required": True, "granted": granted, "completed": False, "details": ["runtime_not_initialized"]}), 503
     return jsonify(_runtime.apply_telemetry_permission(granted))
@@ -348,6 +433,9 @@ def telemetry_permission_apply():
 
 @app.get("/api/containment/decision")
 def containment_decision_status():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
     if _runtime is None:
         return jsonify({"pending": False, "message": "runtime_not_initialized"}), 503
     return jsonify(_runtime.get_containment_decision_status())
@@ -355,8 +443,16 @@ def containment_decision_status():
 
 @app.post("/api/containment/decision")
 def containment_decision_apply():
-    payload = request.get_json(silent=True) or {}
-    execute = bool(payload.get("execute", False))
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    execute_value = payload.get("execute", False)
+    if not isinstance(execute_value, bool):
+        return jsonify({"error": "invalid_payload", "message": "execute must be a boolean"}), 400
+    execute = execute_value
     if _runtime is None:
         return jsonify({"pending": False, "executed": False, "message": "runtime_not_initialized"}), 503
     return jsonify(_runtime.apply_containment_decision(execute))
