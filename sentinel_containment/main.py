@@ -14,7 +14,12 @@ from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
-from sentinel_containment.detection.mirror_clone import MirrorCloneDetector, ReconDirective, StageTwoDirective
+from sentinel_containment.detection.mirror_clone import (
+    LevelThreeDirective,
+    MirrorCloneDetector,
+    ReconDirective,
+    StageTwoDirective,
+)
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.graph_anomaly import parse_event_time
 from sentinel_containment.detection.honeypot import HoneypotDetector
@@ -383,6 +388,7 @@ def run_cycle(
     counter_clone_execution = []
     autonomous_recon_directives = []
     stage_two_counteroffensive_directives = []
+    level_three_hunting_directives = []
 
     for event in detector_events:
         rule_alerts.extend(rules.evaluate(event))
@@ -526,6 +532,31 @@ def run_cycle(
             )
         )
 
+    level_three_hunting_directives = [
+        asdict(d)
+        for d in mirror_clone_detector.generate_level_three_hunting_directives(
+            max_directives=int(settings.get("level_three_max_directives", 2)),
+            min_severity_score=float(settings.get("level_three_min_severity_score", 0.55)),
+        )
+    ]
+    for directive in level_three_hunting_directives:
+        planned_actions = mirror_clone_detector.execute_level_three_directive(LevelThreeDirective(**directive))
+        counter_clone_actions.extend(planned_actions)
+        counter_clone_execution.extend(
+            execute_counter_clone_actions(
+                actions=[asdict(a) for a in planned_actions],
+                deployment={
+                    "deployment_id": f"stage3::{directive['shard']}",
+                    "shard": directive["shard"],
+                    "synthetic_probe_sequence": [],
+                },
+                containment=containment,
+                ingestor=ingestor,
+                audit=audit,
+                signature_bundle=_containment_signature(settings),
+            )
+        )
+
     immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
     risk_confidence = compute_risk_confidence(
         candidate_severity,
@@ -626,6 +657,7 @@ def run_cycle(
         "counter_clone_execution": counter_clone_execution,
         "autonomous_recon_directives": autonomous_recon_directives,
         "stage_two_counteroffensive_directives": stage_two_counteroffensive_directives,
+        "level_three_hunting_directives": level_three_hunting_directives,
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
         "risk_confidence": risk_confidence,

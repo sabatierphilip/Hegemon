@@ -33,6 +33,8 @@ fast_track_risk_confidence: 0.65
 clone_rapid_deploy_minutes: 3
 autonomous_recon_max_directives: 4
 autonomous_recon_min_markov_score: 0.35
+level_three_max_directives: 2
+level_three_min_severity_score: 0.55
 hard_response_action_threshold: 85
 burst_cycle_severity_threshold: 80
 burst_cycle_seconds: 0.1

@@ -80,6 +80,23 @@ class StageTwoDirective:
     rationale: str
 
 
+@dataclass
+class LevelThreeDirective:
+    shard: str
+    threat_label: str
+    confidence: float
+    severity_score: float
+    blindspot_score: float
+    liespot_score: float
+    hunter_swarm_size: int
+    target_resource: str
+    kill_chain_path: list[str]
+    blindspot_vector: list[str]
+    liespot_vector: list[str]
+    patch_strategy: list[str]
+    rationale: str
+
+
 class MirrorCloneDetector:
     """Builds per-identity scan/trace clones and can rapidly deploy executable counter-clones."""
 
@@ -285,6 +302,107 @@ class MirrorCloneDetector:
                 target=directive.target_resource,
                 rationale="Preemptively isolate suspicious proto-AGI communication and replication pathways",
                 priority=min(97, 74 + int(directive.escalation_score * 20)),
+            ),
+        ]
+
+    def generate_level_three_hunting_directives(
+        self,
+        max_directives: int = 2,
+        min_severity_score: float = 0.55,
+    ) -> list[LevelThreeDirective]:
+        directives: list[LevelThreeDirective] = []
+        for shard, action_counts in self._action_counts.items():
+            if sum(action_counts.values()) < self.warmup_events:
+                continue
+
+            kill_chain_path, confidence = self._predict_markov_path(shard, horizon=6)
+            if not kill_chain_path:
+                continue
+
+            markov_score = self._markov_kill_chain_score(kill_chain_path)
+            resource_risk = self._resource_risk_score(shard, kill_chain_path[0])
+            drift = self._model_disagreement(shard)
+            sustained_abuse = self._sustained_compute_abuse_score(shard)
+
+            blindspot_score, blindspot_vector = self._blindspot_score_and_vector(shard)
+            liespot_score, liespot_vector = self._liespot_score_and_vector(shard)
+            severity_score = min(
+                1.0,
+                (0.25 * markov_score)
+                + (0.15 * confidence)
+                + (0.15 * resource_risk)
+                + (0.10 * drift)
+                + (0.10 * sustained_abuse)
+                + (0.15 * blindspot_score)
+                + (0.10 * liespot_score),
+            )
+            if severity_score < min_severity_score:
+                continue
+
+            candidate_resources = self._resource_counts[shard].get(kill_chain_path[0], {})
+            target_resource = (
+                max(candidate_resources.items(), key=lambda item: item[1])[0]
+                if candidate_resources
+                else "synthetic://unknown"
+            )
+            threat_label = self._classify_level_three_threat(kill_chain_path, blindspot_score, liespot_score)
+            hunter_swarm_size = 2 + min(6, int(severity_score * 7))
+            patch_strategy = self._build_blindspot_patch_strategy(blindspot_vector, liespot_vector, kill_chain_path)
+
+            directives.append(
+                LevelThreeDirective(
+                    shard=shard,
+                    threat_label=threat_label,
+                    confidence=round(confidence, 3),
+                    severity_score=round(severity_score, 3),
+                    blindspot_score=round(blindspot_score, 3),
+                    liespot_score=round(liespot_score, 3),
+                    hunter_swarm_size=hunter_swarm_size,
+                    target_resource=target_resource,
+                    kill_chain_path=kill_chain_path,
+                    blindspot_vector=blindspot_vector,
+                    liespot_vector=liespot_vector,
+                    patch_strategy=patch_strategy,
+                    rationale=(
+                        "Level-3 autonomous hunting directive generated with blindspot/liespot patching: "
+                        f"threat_label={threat_label}, severity_score={severity_score:.2f}, "
+                        f"blindspot_score={blindspot_score:.2f}, liespot_score={liespot_score:.2f}"
+                    ),
+                )
+            )
+
+        directives.sort(key=lambda item: (item.severity_score, item.confidence), reverse=True)
+        return directives[: max(0, max_directives)]
+
+    def execute_level_three_directive(self, directive: LevelThreeDirective) -> list[CounterCloneAction]:
+        return [
+            CounterCloneAction(
+                shard=directive.shard,
+                action="deploy_level3_hunter_swarm",
+                target=f"{directive.hunter_swarm_size}@{directive.target_resource}",
+                rationale=directive.rationale,
+                priority=min(100, 82 + int(directive.severity_score * 18)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="patch_autonomous_blindspots",
+                target=" | ".join(directive.blindspot_vector) if directive.blindspot_vector else "none",
+                rationale="Auto-patch telemetry blindspots by enforcing synthetic corroboration and shard coverage balancing",
+                priority=min(99, 80 + int(directive.blindspot_score * 18)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="neutralize_liespots",
+                target=" | ".join(directive.liespot_vector) if directive.liespot_vector else "none",
+                rationale="Autonomously suppress liespots by cross-model consensus and contradiction-sensitive replay",
+                priority=min(98, 78 + int(directive.liespot_score * 20)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="execute_patch_strategy",
+                target=" -> ".join(directive.patch_strategy),
+                rationale="Execute generic blindspot/liespot patch sequence for resilient level-3 hunting",
+                priority=min(97, 77 + int(directive.severity_score * 16)),
             ),
         ]
 
@@ -721,6 +839,62 @@ class MirrorCloneDetector:
         if "iam_privilege_change" in path or resource_risk >= 0.7:
             return "rogue_agent_privilege_capture"
         return "rogue_agent_recon_chain"
+
+    @staticmethod
+    def _classify_level_three_threat(path: list[str], blindspot_score: float, liespot_score: float) -> str:
+        if blindspot_score >= 0.7 and liespot_score >= 0.6:
+            return "deception_stealth_hybrid"
+        if "autonomous_replication" in path or "sandbox_escape" in path:
+            return "proto_agi_stealth_escalation"
+        if blindspot_score >= 0.65:
+            return "sensor_blindspot_abuse"
+        if liespot_score >= 0.6:
+            return "telemetry_contradiction_attack"
+        return "advanced_rogue_hunting_chain"
+
+    def _blindspot_score_and_vector(self, shard: str) -> tuple[float, list[str]]:
+        actions = self._action_counts[shard]
+        if not actions:
+            return 0.0, []
+        vector: list[str] = []
+        unique_actions = len(actions)
+        resources = len(self._unique_resources[shard])
+        if unique_actions <= 2:
+            vector.append("low_action_diversity")
+        if resources <= 2:
+            vector.append("resource_visibility_gap")
+        if not any("network" in action or "scan" in action for action in actions):
+            vector.append("egress_sensor_gap")
+        score = min(1.0, (0.35 * (1.0 if unique_actions <= 2 else 0.2)) + (0.35 * (1.0 if resources <= 2 else 0.2)) + (0.30 * (1.0 if "egress_sensor_gap" in vector else 0.1)))
+        return score, vector
+
+    def _liespot_score_and_vector(self, shard: str) -> tuple[float, list[str]]:
+        vector: list[str] = []
+        transition = self.predict_actions_for_shard(shard, top_k=1)
+        ensemble = self._ensemble_predictions(shard, top_k=1)
+        disagreement = self._model_disagreement(shard)
+        if disagreement >= 0.35:
+            vector.append("predictive_model_conflict")
+        if transition and ensemble and transition[0][0] != ensemble[0][0]:
+            vector.append("next_action_contradiction")
+        repeated_single_action = max(self._action_counts[shard].values(), default=0)
+        total = max(1, sum(self._action_counts[shard].values()))
+        if (repeated_single_action / total) >= 0.75:
+            vector.append("narrative_lock_in")
+        score = min(1.0, 0.5 * disagreement + 0.25 * (1.0 if "next_action_contradiction" in vector else 0.0) + 0.25 * (1.0 if "narrative_lock_in" in vector else 0.0))
+        return score, vector
+
+    @staticmethod
+    def _build_blindspot_patch_strategy(blindspots: list[str], liespots: list[str], path: list[str]) -> list[str]:
+        strategy = ["cross_shard_consensus"]
+        if blindspots:
+            strategy.append("sensor_rebalancing")
+        if liespots:
+            strategy.append("contradiction_replay")
+        if any(step in {"sandbox_escape", "autonomous_replication"} for step in path):
+            strategy.append("high_fidelity_honeynet_overlay")
+        strategy.append("continuous_truth_scoring")
+        return strategy
 
     @staticmethod
     def _markov_kill_chain_score(path: list[str]) -> float:
