@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
 from sentinel_containment.detection.mirror_clone import MirrorCloneDetector, ReconDirective, StageTwoDirective
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
+from sentinel_containment.detection.graph_anomaly import parse_event_time
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
@@ -345,6 +347,10 @@ def run_cycle(
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
 
     recent_events = ingestor.read_recent(limit=int(settings.get("telemetry_batch_limit", 200)))
+    horizon_minutes_cfg = settings.get("graph_horizons_minutes", [5, 30, 180])
+    if not isinstance(horizon_minutes_cfg, list):
+        horizon_minutes_cfg = [5, 30, 180]
+    horizon_minutes = sorted({max(1, int(v)) for v in horizon_minutes_cfg})
 
     def _trusted_synthetic_event(event: dict[str, Any]) -> bool:
         return (
@@ -392,6 +398,26 @@ def run_cycle(
                 )
             )
 
+    now_utc = datetime.now(timezone.utc)
+    graph_horizon_summary: list[dict[str, Any]] = []
+    active_horizons = 0
+    for minutes in horizon_minutes:
+        cutoff = now_utc - timedelta(minutes=minutes)
+        horizon_events = [e for e in detector_events if parse_event_time(e) >= cutoff]
+        horizon_anomalies = [a for a in graph_anomalies if parse_event_time(a.event) >= cutoff]
+        anomaly_count = len(horizon_anomalies)
+        peak_severity = max((a.severity for a in horizon_anomalies), default=0)
+        if anomaly_count:
+            active_horizons += 1
+        graph_horizon_summary.append(
+            {
+                "minutes": minutes,
+                "events": len(horizon_events),
+                "graph_anomalies": anomaly_count,
+                "peak_severity": peak_severity,
+            }
+        )
+
     correlated = correlator.correlate(rule_alerts, baseline_alerts)
     attack_chains = sequence_model.evaluate(detector_events)
     containment_result = None
@@ -428,6 +454,9 @@ def run_cycle(
                         signature_bundle=_containment_signature(settings),
                     )
                 )
+
+    if active_horizons >= 2:
+        candidate_severity = min(99, candidate_severity + 5)
 
     autonomous_recon_directives = [
         asdict(d)
@@ -575,6 +604,8 @@ def run_cycle(
         "alerts": [asdict(a) for a in rule_alerts],
         "baseline_anomalies": [asdict(a) for a in baseline_alerts],
         "graph_anomalies": [asdict(a) for a in graph_anomalies],
+        "graph_horizon_summary": graph_horizon_summary,
+        "persistent_horizon_activity": active_horizons >= 2,
         "attack_chains": [asdict(c) for c in attack_chains],
         "honeypot_alerts": [asdict(a) for a in honeypot_alerts],
         "mirror_alerts": [asdict(a) for a in mirror_alerts],

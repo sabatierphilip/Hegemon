@@ -54,6 +54,7 @@ Main settings are in `config/config.yaml`:
 - `audit_out_of_band_path` for append-only out-of-band audit sink
 - `approval_identity_store` for canonical approval identity normalization
 - `dashboard_host`/`dashboard_port` for web UI
+- `graph_horizons_minutes` for multi-horizon rolling graph anomaly summaries that catch patient low-and-slow campaigns
 - `web_rate_*` settings for adaptive event-triggered burst throttling that defends dashboard/API endpoints from request-flood DoS
 
 
@@ -82,6 +83,8 @@ Notes:
 - Defensive-first containment with hard-response acceleration for high-risk incidents
 - Configurable approval quorum (default single-user for faster autonomous response)
 - Identity-bound execution: containment requires valid signatures from trusted hardware-bound keys (YubiKey/TPM)
+- Dynamic peer-to-peer process attestation mesh to continuously verify Hegemon process integrity and detect tampering/subversion attempts
+- User-only friendly software enrollment with cryptographic authorization; enrolled friendlies are added to the mesh and protected via patrol telemetry
 - Reversible actions where possible with stronger automatic isolation for severe events
 - Tamper-evident immutable hash-chain logs plus telemetry event signature-chain verification
 - No offensive actions against external infrastructure
