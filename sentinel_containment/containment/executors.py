@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -109,7 +110,7 @@ class ContainmentActionExecutor:
                     }
                 ],
             }
-            iam.put_role_policy(RoleName=role_name, PolicyName=policy_name, PolicyDocument=str(policy_doc).replace("'", '"'))
+            iam.put_role_policy(RoleName=role_name, PolicyName=policy_name, PolicyDocument=json.dumps(policy_doc, separators=(",", ":")))
             return ActionExecutionResult(
                 action="disable_iam_sessions",
                 status="executed",

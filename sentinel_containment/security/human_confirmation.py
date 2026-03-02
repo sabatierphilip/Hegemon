@@ -118,8 +118,9 @@ class HumanConfirmationVerifier:
         answer: str = "yes",
         prompt_count: int = 2,
     ) -> dict[str, Any]:
-        verifier = cls(shared_secret=shared_secret, prompt_count=prompt_count)
-        answers = [str(answer).strip().lower() for _ in range(verifier.prompt_count)]
+        effective_prompt_count = max(1, int(prompt_count))
+        verifier = cls(shared_secret=shared_secret, prompt_count=effective_prompt_count)
+        answers = [str(answer).strip().lower() for _ in range(effective_prompt_count)]
         canonical = verifier._canonical_confirmation_payload(
             host=host,
             severity=severity,

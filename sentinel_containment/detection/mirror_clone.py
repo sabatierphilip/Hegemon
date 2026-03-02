@@ -105,10 +105,14 @@ class MirrorCloneDetector:
         warmup_events: int = 6,
         min_prediction_confidence: float = 0.65,
         rapid_clone_minutes: int = 3,
+        max_tracked_shards: int = 2048,
+        max_actions_per_shard: int = 20000,
     ):
         self.warmup_events = warmup_events
         self.min_prediction_confidence = min_prediction_confidence
         self.rapid_clone_minutes = max(1, rapid_clone_minutes)
+        self.max_tracked_shards = max(1, int(max_tracked_shards))
+        self.max_actions_per_shard = max(100, int(max_actions_per_shard))
         self._seen_events = 0
         self._scan_fingerprint: dict[str, float] = {}
         self._scan_samples: dict[str, int] = defaultdict(int)
@@ -417,6 +421,7 @@ class MirrorCloneDetector:
 
         self._update_models(shard, action, resource)
         self._seen_events += 1
+        self._prune_models()
         return alerts
 
     def deploy_counter_clone(self, alert: MirrorAlert) -> CloneDeployment:
@@ -682,9 +687,37 @@ class MirrorCloneDetector:
         if previous is not None:
             self._transitions[shard][previous][action] += 1
         self._action_counts[shard][action] += 1
+        total_actions = sum(self._action_counts[shard].values())
+        if total_actions > self.max_actions_per_shard:
+            scale = max(0.5, self.max_actions_per_shard / float(total_actions))
+            for act, count in list(self._action_counts[shard].items()):
+                new_count = max(1, int(count * scale))
+                self._action_counts[shard][act] = new_count
+            for prev_action, nxt in list(self._transitions[shard].items()):
+                for nxt_action, count in list(nxt.items()):
+                    nxt[nxt_action] = max(1, int(count * scale))
+            for act, resources in list(self._resource_counts[shard].items()):
+                for res, count in list(resources.items()):
+                    resources[res] = max(1, int(count * scale))
         self._resource_counts[shard][action][resource] += 1
         self._unique_resources[shard].add(resource)
         self._last_action[shard] = action
+
+    def _prune_models(self) -> None:
+        while len(self._action_counts) > self.max_tracked_shards:
+            shard = min(self._action_counts, key=lambda key: sum(self._action_counts[key].values()))
+            self._drop_shard(shard)
+
+    def _drop_shard(self, shard: str) -> None:
+        self._scan_fingerprint.pop(shard, None)
+        self._scan_samples.pop(shard, None)
+        self._null_probe_counts.pop(shard, None)
+        self._last_action.pop(shard, None)
+        self._action_counts.pop(shard, None)
+        self._transitions.pop(shard, None)
+        self._resource_counts.pop(shard, None)
+        self._unique_resources.pop(shard, None)
+        self._deployments.pop(shard, None)
 
     def _predict_next_action(self, shard: str, previous_action: str) -> tuple[str | None, float]:
         next_map = self._transitions[shard][previous_action]
