@@ -1384,6 +1384,60 @@ def test_run_cycle_emits_autonomous_recon_directives(tmp_path):
     assert any(r["action"] == "backmodel_markov_kill_chain" for r in state["counter_clone_execution"])
 
 
+def test_mirror_clone_generates_level_three_hunting_directives():
+    detector = MirrorCloneDetector(warmup_events=1)
+    events = [
+        {"host": "hunt-l3", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "prod-cluster"},
+        {"host": "hunt-l3", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-l3", "user": "svc", "process": "agent", "action": "sandbox_escape", "resource": "runtime"},
+        {"host": "hunt-l3", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+        {"host": "hunt-l3", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+    ]
+    for event in events:
+        detector.evaluate(event)
+
+    directives = detector.generate_level_three_hunting_directives(max_directives=2, min_severity_score=0.2)
+
+    assert directives
+    assert directives[0].severity_score >= 0.2
+    assert isinstance(directives[0].patch_strategy, list)
+
+    actions = detector.execute_level_three_directive(directives[0])
+    assert any(a.action == "deploy_level3_hunter_swarm" for a in actions)
+    assert any(a.action == "patch_autonomous_blindspots" for a in actions)
+    assert any(a.action == "neutralize_liespots" for a in actions)
+
+
+def test_run_cycle_emits_level_three_hunting_directives(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    for event in [
+        {"host": "hunt-l3-run", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "prod-cluster"},
+        {"host": "hunt-l3-run", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-l3-run", "user": "svc", "process": "agent", "action": "sandbox_escape", "resource": "runtime"},
+        {"host": "hunt-l3-run", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+    ]:
+        ingestor.ingest("model_api", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+                "level_three_min_severity_score": 0.2,
+            }
+        )
+    )
+
+    assert state["level_three_hunting_directives"]
+    assert any(a["action"] == "deploy_level3_hunter_swarm" for a in state["counter_clone_actions"])
+    assert any(r["action"] == "neutralize_liespots" for r in state["counter_clone_execution"])
+
+
 def test_baseline_ignores_non_numeric_metrics_without_crashing():
     baseline = BehavioralBaseline(threshold=2.0, window=10, min_history=2)
 
