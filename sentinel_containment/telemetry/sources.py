@@ -4,8 +4,10 @@ import http.server
 import json
 import logging
 import os
+import platform
 import stat
 import socketserver
+import subprocess
 import threading
 import time
 import hmac
@@ -274,6 +276,21 @@ class IngestionService:
                 )
             )
         self._threads: list[threading.Thread] = []
+        self._started = False
+
+    def _start_file_source_thread(self, source: JSONLinesFileSource) -> None:
+        t = threading.Thread(target=source.run_forever, daemon=True)
+        t.start()
+        self._threads.append(t)
+
+    def add_file_source(self, source_type: str, path: Path, counterclone_integrity_key: str | None = None) -> bool:
+        if any(fs.source_type == source_type and fs.path == path for fs in self.file_sources):
+            return False
+        source = JSONLinesFileSource(path, source_type, self.ingestor, integrity_key=counterclone_integrity_key)
+        self.file_sources.append(source)
+        if self._started:
+            self._start_file_source_thread(source)
+        return True
 
     def start(self) -> None:
         udp_thread = threading.Thread(target=self.syslog_server.serve_forever, daemon=True)
@@ -285,12 +302,70 @@ class IngestionService:
         self._threads.append(kernel_thread)
 
         for source in self.file_sources:
-            t = threading.Thread(target=source.run_forever, daemon=True)
-            t.start()
-            self._threads.append(t)
+            self._start_file_source_thread(source)
+        self._started = True
 
     def stop(self) -> None:
         self.syslog_server.shutdown()
         self.syslog_server.server_close()
         self.kernel_webhook_server.shutdown()
         self.kernel_webhook_server.server_close()
+
+
+class DynamicSystemTelemetrySource:
+    """Collects lightweight, real host telemetry snapshots from procfs and platform commands."""
+
+    def __init__(self, ingestor: TelemetryIngestor, poll_interval_seconds: float = 10.0):
+        self.ingestor = ingestor
+        self.poll_interval_seconds = poll_interval_seconds
+
+    def _safe_run(self, command: list[str]) -> str:
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=3)
+            return result.stdout.strip()[:4000]
+        except Exception:
+            return ""
+
+    def poll_once(self) -> None:
+        host = platform.node() or "localhost"
+        loadavg = ""
+        if Path("/proc/loadavg").exists():
+            loadavg = Path("/proc/loadavg").read_text(encoding="utf-8").strip()
+        meminfo = ""
+        if Path("/proc/meminfo").exists():
+            meminfo = "\n".join(Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()[:4])
+
+        self.ingestor.ingest(
+            "host_runtime",
+            {
+                "host": host,
+                "process": "dynamic-runtime-collector",
+                "action": "system_snapshot",
+                "resource": "procfs",
+                "loadavg": loadavg,
+                "meminfo_head": meminfo,
+                "collector_level": "runtime",
+                "telemetry_scope": "dynamic_system",
+            },
+        )
+
+        socket_summary = self._safe_run(["ss", "-tunap"]) or self._safe_run(["netstat", "-tunap"])
+        self.ingestor.ingest(
+            "network_flow",
+            {
+                "host": host,
+                "process": "dynamic-network-collector",
+                "action": "socket_inventory",
+                "resource": "system_network",
+                "socket_table": socket_summary,
+                "collector_level": "os",
+                "telemetry_scope": "dynamic_network",
+            },
+        )
+
+    def run_forever(self, stop_check: Callable[[], bool] | None = None) -> None:
+        while True:
+            if stop_check and stop_check():
+                return
+            self.poll_once()
+            time.sleep(self.poll_interval_seconds)

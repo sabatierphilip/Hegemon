@@ -31,7 +31,11 @@ from sentinel_containment.security import (
     TPMQuoteVerifier,
 )
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
-from sentinel_containment.telemetry.sources import IngestionService, discover_live_file_sources
+from sentinel_containment.telemetry.sources import (
+    DynamicSystemTelemetrySource,
+    IngestionService,
+    discover_live_file_sources,
+)
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -178,6 +182,9 @@ class SentinelRuntime:
             counterclone_integrity_key=ingest_cfg.get("counterclone_integrity_key"),
         )
 
+        self._telemetry_setup_notice: dict[str, Any] = {"required": True, "granted": False, "completed": False, "details": []}
+        self._dynamic_threads: list[threading.Thread] = []
+
         self.fast_lane_server: FastLaneServer | None = None
         p2p_cfg = settings.get("peer_verification", {})
         configured_peer_ids = p2p_cfg.get("peer_ids", [
@@ -242,15 +249,67 @@ class SentinelRuntime:
 
         fast_lane_cfg = settings.get("fast_lane", {})
         if fast_lane_cfg.get("enabled", False):
-            self.fast_lane_server = FastLaneServer(
-                host=str(fast_lane_cfg.get("host", "0.0.0.0")),
-                port=int(fast_lane_cfg.get("port", 9443)),
-                path=str(fast_lane_cfg.get("path", "/fast-lane/event")),
-                runtime=self,
-                server_cert=str(fast_lane_cfg.get("server_cert_path", "certs/fastlane-server.crt")),
-                server_key=str(fast_lane_cfg.get("server_key_path", "certs/fastlane-server.key")),
-                client_ca_cert=str(fast_lane_cfg.get("client_ca_cert_path", "certs/fastlane-client-ca.crt")),
-            )
+            server_cert = Path(str(fast_lane_cfg.get("server_cert_path", "certs/fastlane-server.crt")))
+            server_key = Path(str(fast_lane_cfg.get("server_key_path", "certs/fastlane-server.key")))
+            client_ca = Path(str(fast_lane_cfg.get("client_ca_cert_path", "certs/fastlane-client-ca.crt")))
+            missing = [str(path) for path in (server_cert, server_key, client_ca) if not path.exists()]
+            if missing:
+                self.audit.append(
+                    "fast_lane_disabled",
+                    {
+                        "reason": "missing_tls_material",
+                        "missing_files": missing,
+                    },
+                )
+            else:
+                self.fast_lane_server = FastLaneServer(
+                    host=str(fast_lane_cfg.get("host", "0.0.0.0")),
+                    port=int(fast_lane_cfg.get("port", 9443)),
+                    path=str(fast_lane_cfg.get("path", "/fast-lane/event")),
+                    runtime=self,
+                    server_cert=str(server_cert),
+                    server_key=str(server_key),
+                    client_ca_cert=str(client_ca),
+                )
+
+    def apply_telemetry_permission(self, granted: bool) -> dict[str, Any]:
+        details: list[str] = []
+        if granted:
+            details = self._setup_dynamic_telemetry_sources()
+        self._telemetry_setup_notice = {
+            "required": True,
+            "granted": bool(granted),
+            "completed": bool(granted),
+            "details": details,
+        }
+        self.audit.append("telemetry_permission", self._telemetry_setup_notice)
+        return dict(self._telemetry_setup_notice)
+
+    def get_telemetry_setup_notice(self) -> dict[str, Any]:
+        return dict(self._telemetry_setup_notice)
+
+    def _setup_dynamic_telemetry_sources(self) -> list[str]:
+        ingest_cfg = self.settings.get("ingestion", {})
+        details: list[str] = []
+
+        autodiscovery = discover_live_file_sources({fs.source_type: fs.path for fs in self.ingestion_service.file_sources})
+        for source_type, path in autodiscovery.items():
+            if self.ingestion_service.add_file_source(
+                source_type,
+                path,
+                counterclone_integrity_key=ingest_cfg.get("counterclone_integrity_key"),
+            ):
+                details.append(f"attached_file_source:{source_type}:{path}")
+
+        dynamic_source = DynamicSystemTelemetrySource(
+            self.ingestor,
+            poll_interval_seconds=float(ingest_cfg.get("dynamic_system_poll_seconds", 10.0)),
+        )
+        t = threading.Thread(target=dynamic_source.run_forever, args=(lambda: self._stop.is_set(),), daemon=True)
+        t.start()
+        self._dynamic_threads.append(t)
+        details.append("enabled_dynamic_system_runtime")
+        return details
 
     def process_priority_event(self, event: dict[str, Any]) -> dict[str, Any]:
         source_type = str(event.get("source_type", "fast_lane"))
