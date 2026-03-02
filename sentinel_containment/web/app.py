@@ -9,8 +9,10 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template_string, request
 
 from sentinel_containment.config import Settings
+from sentinel_containment.runtime import SentinelRuntime
 
 app = Flask(__name__)
+_runtime: SentinelRuntime | None = None
 
 
 @dataclass
@@ -148,6 +150,12 @@ HTML = """
     <div class=\"badge\">Candidate Severity: {{ candidate_severity }}</div>
   </div>
 
+  <div class=\"panel\">
+    <h3>Deployment Control</h3>
+    <div class=\"small\" id=\"telemetry-status\">Telemetry permission pending.</div>
+    <button id=\"run-btn\" style=\"margin-top:8px;padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;\">Run</button>
+  </div>
+
   <div class=\"grid\">
     <div class=\"card\"><div class=\"muted\">Events Processed</div><div class=\"kpi\">{{ events_processed }}</div></div>
     <div class=\"card\"><div class=\"muted\">Rule Alerts</div><div class=\"kpi\">{{ alerts_count }}</div></div>
@@ -205,6 +213,15 @@ HTML = """
     </div>
   </div>
 </div>
+<script>
+async function startWithPermission(){
+  const status=document.getElementById("telemetry-status");
+  const resp=await fetch("/api/telemetry/permission",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({granted:true})});
+  const body=await resp.json();
+  status.textContent = body.completed ? "Dynamic telemetry deployment completed." : "Telemetry permission not granted.";
+}
+document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
+</script>
 </body>
 </html>
 """
@@ -264,3 +281,24 @@ def graph():
 @app.get("/api/state")
 def api_state():
     return jsonify(_load_latest_state())
+
+def set_runtime(runtime: SentinelRuntime) -> None:
+    global _runtime
+    _runtime = runtime
+
+
+@app.get("/api/telemetry/permission")
+def telemetry_permission_status():
+    if _runtime is None:
+        return jsonify({"required": True, "granted": False, "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.get_telemetry_setup_notice())
+
+
+@app.post("/api/telemetry/permission")
+def telemetry_permission_apply():
+    payload = request.get_json(silent=True) or {}
+    granted = bool(payload.get("granted", False))
+    if _runtime is None:
+        return jsonify({"required": True, "granted": granted, "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.apply_telemetry_permission(granted))
+
