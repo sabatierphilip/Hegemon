@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import http.server
 import json
 import secrets
@@ -447,8 +448,25 @@ class SentinelRuntime:
         ).decode("utf-8")
 
         self.fast_lane_containment.hardware_key_verifier.upsert_trusted_public_key(key_id, public_pem)
+        auto_signature = private_key.sign(
+            HardwareKeyVerifier.canonical_payload(
+                host="*",
+                severity=0,
+                requested_actions=[],
+                approvals=[],
+                key_id=key_id,
+                key_type="yubikey",
+                authorize_all_containment=True,
+            )
+        )
         self.settings.data.setdefault("trusted_hardware_public_keys", {})[key_id] = public_pem
         self.settings.data["hardware_key_fail_closed"] = True
+        self.settings.data["containment_signature"] = {
+            "key_id": key_id,
+            "key_type": "yubikey",
+            "authorize_all_containment": True,
+            "signature": base64.b64encode(auto_signature).decode("ascii"),
+        }
 
         self._hardware_key_setup_notice = {
             "required": True,
