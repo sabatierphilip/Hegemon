@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
 
 from sentinel_containment.config import Settings
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
-from sentinel_containment.telemetry.sources import IngestionService
+from sentinel_containment.telemetry.sources import IngestionService, discover_live_file_sources
 
 
 if __name__ == "__main__":
@@ -19,6 +19,14 @@ if __name__ == "__main__":
     ingest_cfg = cfg.get("ingestion", {})
 
     ingestor = TelemetryIngestor(Path(ingest_cfg.get("index_path", "data/telemetry_index.jsonl")))
+    extra_sources = {
+        "host_kernel": Path(ingest_cfg.get("kernel_events_file", "data/kernel_events.jsonl")),
+        "host_runtime": Path(ingest_cfg.get("runtime_events_file", "data/runtime_events.jsonl")),
+        "host_osquery": Path(ingest_cfg.get("osquery_file", "data/osquery_events.jsonl")),
+        "hypervisor": Path(ingest_cfg.get("hypervisor_events_file", "data/hypervisor_events.jsonl")),
+        "counterclone": Path(ingest_cfg.get("counterclone_events_file", "data/counterclone_events.jsonl")),
+    }
+    extra_sources.update(discover_live_file_sources(extra_sources))
     service = IngestionService(
         ingestor=ingestor,
         syslog_host=ingest_cfg.get("syslog_host", "0.0.0.0"),
@@ -26,6 +34,11 @@ if __name__ == "__main__":
         cloudtrail_path=Path(ingest_cfg.get("cloudtrail_file", "data/cloudtrail.jsonl")),
         network_flow_path=Path(ingest_cfg.get("network_flow_file", "data/network_flows.jsonl")),
         model_api_path=Path(ingest_cfg.get("model_api_file", "data/model_api.jsonl")),
+        extra_sources=extra_sources,
+        kernel_webhook_host=ingest_cfg.get("kernel_webhook_host", "0.0.0.0"),
+        kernel_webhook_port=int(ingest_cfg.get("kernel_webhook_port", 5515)),
+        kernel_webhook_path=ingest_cfg.get("kernel_webhook_path", "/kernel-event"),
+        counterclone_integrity_key=ingest_cfg.get("counterclone_integrity_key"),
     )
 
     state = {"stop": False}

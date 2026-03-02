@@ -31,6 +31,4 @@ def test_runtime_applies_single_permission_for_dynamic_telemetry(tmp_path: Path)
     assert notice["granted"] is True
     assert notice["completed"] is True
     assert any(item == "enabled_dynamic_system_runtime" for item in notice["details"])
-
-    runtime.ingestion_service.syslog_server.server_close()
-    runtime.ingestion_service.kernel_webhook_server.server_close()
+    runtime.ingestion_service.stop()

@@ -306,10 +306,12 @@ class IngestionService:
         self._started = True
 
     def stop(self) -> None:
-        self.syslog_server.shutdown()
+        if self._started:
+            self.syslog_server.shutdown()
+            self.kernel_webhook_server.shutdown()
         self.syslog_server.server_close()
-        self.kernel_webhook_server.shutdown()
         self.kernel_webhook_server.server_close()
+        self._started = False
 
 
 class DynamicSystemTelemetrySource:

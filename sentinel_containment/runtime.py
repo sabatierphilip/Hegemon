@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import http.server
 import json
+import logging
 import secrets
 import socketserver
 import ssl
@@ -14,6 +15,8 @@ from typing import Any
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
+from sentinel_containment.asset_mapper.discovery import AssetMapper
+from sentinel_containment.cloud.provider import CloudProviderAdapter
 from sentinel_containment.config import Settings
 from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.containment.executors import ContainmentActionExecutor
@@ -40,6 +43,9 @@ from sentinel_containment.telemetry.sources import (
     IngestionService,
     discover_live_file_sources,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -132,7 +138,9 @@ class SentinelRuntime:
             warmup_min_relations=int(settings.get("graph_warmup_min_relations", 1)),
         )
         self.sequence_model = AttackSequenceModel(
-            chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
+            chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30)),
+            max_events_per_host=int(settings.get("attack_chain_max_events_per_host", 2048)),
+            max_tracked_hosts=int(settings.get("attack_chain_max_tracked_hosts", 2048)),
         )
         self.honeypot_detector = HoneypotDetector(
             settings.get("honeypot_resources", []),
@@ -142,9 +150,28 @@ class SentinelRuntime:
             warmup_events=int(settings.get("clone_warmup_events", 6)),
             min_prediction_confidence=float(settings.get("clone_min_prediction_confidence", 0.65)),
             rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
+            max_tracked_shards=int(settings.get("clone_max_tracked_shards", 2048)),
+            max_actions_per_shard=int(settings.get("clone_max_actions_per_shard", 20000)),
         )
         self.audit = ImmutableAuditLog(
             out_of_band_path=Path(settings.get("audit_out_of_band_path")) if settings.get("audit_out_of_band_path") else None
+        )
+        self.asset_mapper = AssetMapper(CloudProviderAdapter(simulated=bool(settings.get("simulated_mode", False))))
+        self.containment = ContainmentEngine(
+            self.audit,
+            identity_store=settings.get("approval_identity_store", {}),
+            required_approvals=int(settings.get("approval_quorum", 1)),
+            hardware_key_verifier=HardwareKeyVerifier(
+                settings.get("trusted_hardware_public_keys", {}),
+                fail_closed=bool(settings.get("hardware_key_fail_closed", True)),
+            ),
+            human_confirmation_verifier=HumanConfirmationVerifier(
+                shared_secret=str(settings.get("human_confirmation_shared_secret", "")),
+                prompt_count=int(settings.get("human_confirmation_prompt_count", 2)),
+                question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
+                fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
+            ),
+            action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", False))),
         )
         self.fast_lane_containment = ContainmentEngine(
             self.audit,
@@ -208,6 +235,7 @@ class SentinelRuntime:
         self._holding_hosts: set[str] = set()
 
         self.fast_lane_server: FastLaneServer | None = None
+        self.fast_lane_status: dict[str, Any] = {"enabled": bool(settings.get("fast_lane", {}).get("enabled", False)), "active": False, "missing_tls_files": []}
         p2p_cfg = settings.get("peer_verification", {})
         configured_peer_ids = p2p_cfg.get("peer_ids", [
             "ingestion_service",
@@ -276,6 +304,7 @@ class SentinelRuntime:
             client_ca = Path(str(fast_lane_cfg.get("client_ca_cert_path", "certs/fastlane-client-ca.crt")))
             missing = [str(path) for path in (server_cert, server_key, client_ca) if not path.exists()]
             if missing:
+                self.fast_lane_status = {"enabled": True, "active": False, "missing_tls_files": missing}
                 self.audit.append(
                     "fast_lane_disabled",
                     {
@@ -283,6 +312,7 @@ class SentinelRuntime:
                         "missing_files": missing,
                     },
                 )
+                logger.warning("Fast-lane TLS listener disabled; missing cert material: %s", ", ".join(missing))
             else:
                 self.fast_lane_server = FastLaneServer(
                     host=str(fast_lane_cfg.get("host", "0.0.0.0")),
@@ -293,6 +323,7 @@ class SentinelRuntime:
                     server_key=str(server_key),
                     client_ca_cert=str(client_ca),
                 )
+                self.fast_lane_status = {"enabled": True, "active": True, "missing_tls_files": []}
 
         if bool(self.settings.get("auto_grant_telemetry_permission", True)) and not self._human_required:
             self.apply_telemetry_permission(True)
@@ -447,7 +478,7 @@ class SentinelRuntime:
                     },
                 )
                 return
-            self.fast_lane_containment.execute(
+            hold_result = self.fast_lane_containment.execute(
                 host=host,
                 severity=max(70, min(89, severity)),
                 requested_actions=["disable_outbound_traffic", "forensic_snapshot_metadata"],
@@ -470,6 +501,7 @@ class SentinelRuntime:
             pending_payload = dict(self._containment_decision)
             pending_payload["holding_hosts"] = sorted(self._holding_hosts)
             self.audit.append("containment_decision_pending", pending_payload)
+            self.audit.append("containment_hold_applied", {"host": host, "severity": severity, "approved": hold_result.approved, "actions_executed": hold_result.actions_executed, "message": hold_result.message})
 
     def get_hardware_key_setup_notice(self) -> dict[str, Any]:
         return dict(self._hardware_key_setup_notice)
@@ -499,7 +531,21 @@ class SentinelRuntime:
             return dict(self._hardware_key_setup_notice)
 
         key_id = str(self.settings.get("auto_hardware_key_id", "auto-ed25519-local")).strip() or "auto-ed25519-local"
-        private_key = ed25519.Ed25519PrivateKey.generate()
+        private_key_path = Path(str(self.settings.get("auto_hardware_private_key_path", "data/auto_hardware_ed25519.pem")))
+        private_key_path.parent.mkdir(parents=True, exist_ok=True)
+        if private_key_path.exists():
+            private_bytes = private_key_path.read_bytes()
+            private_key = serialization.load_pem_private_key(private_bytes, password=None)
+        else:
+            private_key = ed25519.Ed25519PrivateKey.generate()
+            private_key_path.write_bytes(
+                private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            )
+            private_key_path.chmod(0o600)
         public_pem = private_key.public_key().public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -530,11 +576,11 @@ class SentinelRuntime:
             "required": True,
             "configured": True,
             "completed": True,
-            "details": ["hardware_key_profile_hardened", "runtime_trust_anchor_updated"],
+            "details": ["hardware_key_profile_hardened", "runtime_trust_anchor_updated", f"private_key_persisted:{private_key_path}"],
             "key_id": key_id,
             "local_only": True,
         }
-        self.audit.append("hardware_key_autoconfig_completed", {"key_id": key_id, "local_only": True})
+        self.audit.append("hardware_key_autoconfig_completed", {"key_id": key_id, "local_only": True, "private_key_path": str(private_key_path)})
         return dict(self._hardware_key_setup_notice)
 
     def apply_telemetry_permission(self, granted: bool) -> dict[str, Any]:
@@ -704,9 +750,14 @@ class SentinelRuntime:
             sequence_model=self.sequence_model,
             honeypot_detector=self.honeypot_detector,
             mirror_clone_detector=self.mirror_clone_detector,
+            audit=self.audit,
+            mapper=self.asset_mapper,
+            ingestor=self.ingestor,
+            containment=self.containment,
         )
         self._update_containment_decision_from_state(state)
         state["containment_decision"] = self.get_containment_decision_status()
+        state["fast_lane_status"] = dict(self.fast_lane_status)
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return state

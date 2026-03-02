@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import secrets
 import time
 
 import hmac
@@ -8,13 +10,15 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, g, jsonify, render_template_string, request
 
 from sentinel_containment.config import Settings
 from sentinel_containment.runtime import SentinelRuntime
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 _runtime: SentinelRuntime | None = None
+_auth_warning_emitted = False
 
 
 @dataclass
@@ -95,6 +99,7 @@ _request_guard = _build_request_guard()
 
 @app.before_request
 def enforce_request_throttle():
+    g.csp_nonce = secrets.token_urlsafe(16)
     client_id = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
     client_id = client_id.split(",")[0].strip()
     if not _request_guard.allow(client_id):
@@ -107,7 +112,7 @@ HTML = """
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
   <title>Sentinel-Containment Command Center</title>
-  <style>
+  <style nonce="{{ csp_nonce }}">
     :root {
       --bg: #0b1020;
       --panel: #131a2e;
@@ -237,7 +242,7 @@ HTML = """
     </div>
   </div>
 </div>
-<script>
+<script nonce="{{ csp_nonce }}">
 async function startWithPermission(){
   const status=document.getElementById("telemetry-status");
   const resp=await fetch("/api/telemetry/permission",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({granted:true})});
@@ -331,11 +336,18 @@ window.addEventListener("load",()=>{loadHumanGateStatus(); promptHardwareKeyBoot
 
 
 def _api_token() -> str:
+    global _auth_warning_emitted
     settings = Settings.load()
     configured = str(settings.get("dashboard_api_token", "")).strip()
     if configured:
         return configured
-    return str(settings.env("SENTINEL_DASHBOARD_TOKEN", "")).strip()
+    env_token = str(settings.env("SENTINEL_DASHBOARD_TOKEN", "")).strip()
+    if env_token:
+        return env_token
+    if not _auth_warning_emitted:
+        logger.error("Dashboard API token is not configured. Set dashboard_api_token or SENTINEL_DASHBOARD_TOKEN.")
+        _auth_warning_emitted = True
+    return ""
 
 
 def _is_authenticated() -> bool:
@@ -375,10 +387,11 @@ def apply_security_headers(response):
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
     response.headers["Cache-Control"] = "no-store"
+    nonce = getattr(g, "csp_nonce", "")
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        f"style-src 'self' 'nonce-{nonce}'; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
         "frame-ancestors 'none'; "
@@ -438,6 +451,7 @@ def dashboard():
         containment_decision=state.get("containment_decision", {}),
         containment_decision_json=json.dumps(state.get("containment_decision", {}), indent=2),
         severity_class=_severity_class,
+        csp_nonce=getattr(g, "csp_nonce", ""),
     )
 
 
@@ -458,6 +472,16 @@ def api_state():
     if unauthorized:
         return unauthorized
     return jsonify(_load_latest_state())
+
+
+@app.get("/api/health")
+def api_health():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    state = _load_latest_state()
+    fast_lane_status = state.get("fast_lane_status", {"enabled": False, "active": False, "missing_tls_files": []})
+    return jsonify({"ok": True, "fast_lane": fast_lane_status})
 
 def set_runtime(runtime: SentinelRuntime) -> None:
     global _runtime

@@ -69,8 +69,10 @@ class AttackSequenceModel:
         "exfiltration": "T1041",
     }
 
-    def __init__(self, chain_window_minutes: int = 30):
+    def __init__(self, chain_window_minutes: int = 30, max_events_per_host: int = 2048, max_tracked_hosts: int = 2048):
         self.chain_window = timedelta(minutes=chain_window_minutes)
+        self.max_events_per_host = max(100, int(max_events_per_host))
+        self.max_tracked_hosts = max(1, int(max_tracked_hosts))
         self._history: dict[str, list[tuple[str, float, Any, dict[str, Any]]]] = defaultdict(list)
         self._transitions = self._build_transition_matrix()
 
@@ -83,6 +85,7 @@ class AttackSequenceModel:
             timestamp = parse_event_time(event)
             self._history[host].append((stage, stage_confidence, timestamp, event))
             self._trim(host, timestamp)
+            self._prune_hosts()
 
         alerts: list[AttackChainAlert] = []
         for host, host_events in self._history.items():
@@ -109,6 +112,16 @@ class AttackSequenceModel:
         self._history[host] = [
             entry for entry in self._history[host] if (now - entry[2]) <= self.chain_window
         ]
+        if len(self._history[host]) > self.max_events_per_host:
+            self._history[host] = self._history[host][-self.max_events_per_host :]
+
+    def _prune_hosts(self) -> None:
+        while len(self._history) > self.max_tracked_hosts:
+            oldest_host = min(
+                self._history,
+                key=lambda h: self._history[h][-1][2] if self._history[h] else 0,
+            )
+            self._history.pop(oldest_host, None)
 
     def _infer_stage(self, event: dict[str, Any]) -> tuple[str, float]:
         action = str(event.get("action", "unknown")).lower()

@@ -33,9 +33,7 @@ def test_runtime_disables_fast_lane_when_tls_files_missing(tmp_path: Path):
     runtime = SentinelRuntime(Settings(cfg))
 
     assert runtime.fast_lane_server is None
-
-    runtime.ingestion_service.syslog_server.server_close()
-    runtime.ingestion_service.kernel_webhook_server.server_close()
+    runtime.ingestion_service.stop()
 
 
 def test_runtime_defaults_to_autonomous_mode_and_bootstraps_keys(tmp_path: Path):
@@ -72,6 +70,4 @@ def test_runtime_defaults_to_autonomous_mode_and_bootstraps_keys(tmp_path: Path)
     hardware = runtime.get_hardware_key_setup_notice()
     assert hardware["completed"] is True
     assert runtime.settings.get("containment_signature") is not None
-
-    runtime.ingestion_service.syslog_server.server_close()
-    runtime.ingestion_service.kernel_webhook_server.server_close()
+    runtime.ingestion_service.stop()

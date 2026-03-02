@@ -319,13 +319,17 @@ def run_cycle(
     sequence_model: AttackSequenceModel | None = None,
     honeypot_detector: HoneypotDetector | None = None,
     mirror_clone_detector: MirrorCloneDetector | None = None,
+    audit: ImmutableAuditLog | None = None,
+    mapper: AssetMapper | None = None,
+    ingestor: TelemetryIngestor | None = None,
+    containment: ContainmentEngine | None = None,
 ) -> dict:
     out_of_band = settings.get("audit_out_of_band_path")
-    audit = ImmutableAuditLog(out_of_band_path=Path(out_of_band) if out_of_band else None)
-    mapper = AssetMapper(CloudProviderAdapter(simulated=bool(settings.get("simulated_mode", False))))
+    audit = audit or ImmutableAuditLog(out_of_band_path=Path(out_of_band) if out_of_band else None)
+    mapper = mapper or AssetMapper(CloudProviderAdapter(simulated=bool(settings.get("simulated_mode", False))))
     topology = mapper.snapshot()
 
-    ingestor = TelemetryIngestor(Path(settings.get("telemetry_index_path", "data/telemetry_index.jsonl")))
+    ingestor = ingestor or TelemetryIngestor(Path(settings.get("telemetry_index_path", "data/telemetry_index.jsonl")))
     baseline = baseline or BehavioralBaseline(
         threshold=float(settings.get("anomaly_threshold", 2.0)),
         window=int(settings.get("baseline_window", 30)),
@@ -343,7 +347,9 @@ def run_cycle(
         warmup_min_relations=int(settings.get("graph_warmup_min_relations", 1)),
     )
     sequence_model = sequence_model or AttackSequenceModel(
-        chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30))
+        chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30)),
+        max_events_per_host=int(settings.get("attack_chain_max_events_per_host", 2048)),
+        max_tracked_hosts=int(settings.get("attack_chain_max_tracked_hosts", 2048)),
     )
     honeypot_detector = honeypot_detector or HoneypotDetector(
         settings.get("honeypot_resources", []),
@@ -353,8 +359,10 @@ def run_cycle(
         warmup_events=int(settings.get("clone_warmup_events", 6)),
         min_prediction_confidence=float(settings.get("clone_min_prediction_confidence", 0.65)),
         rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
+        max_tracked_shards=int(settings.get("clone_max_tracked_shards", 2048)),
+        max_actions_per_shard=int(settings.get("clone_max_actions_per_shard", 20000)),
     )
-    containment = ContainmentEngine(
+    containment = containment or ContainmentEngine(
         audit,
         identity_store=settings.get("approval_identity_store", {}),
         required_approvals=int(settings.get("approval_quorum", 1)),
@@ -694,7 +702,11 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
         warmup_min_distinct_sources=int(settings.get("graph_warmup_min_distinct_sources", 2)),
         warmup_min_relations=int(settings.get("graph_warmup_min_relations", 1)),
     )
-    sequence_model = AttackSequenceModel(chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30)))
+    sequence_model = AttackSequenceModel(
+        chain_window_minutes=int(settings.get("attack_chain_window_minutes", 30)),
+        max_events_per_host=int(settings.get("attack_chain_max_events_per_host", 2048)),
+        max_tracked_hosts=int(settings.get("attack_chain_max_tracked_hosts", 2048)),
+    )
     honeypot_detector = HoneypotDetector(
         settings.get("honeypot_resources", []),
         settings.get("proto_agi_indicators", []),
@@ -703,6 +715,20 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
         warmup_events=int(settings.get("clone_warmup_events", 6)),
         min_prediction_confidence=float(settings.get("clone_min_prediction_confidence", 0.65)),
         rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
+        max_tracked_shards=int(settings.get("clone_max_tracked_shards", 2048)),
+        max_actions_per_shard=int(settings.get("clone_max_actions_per_shard", 20000)),
+    )
+    out_of_band = settings.get("audit_out_of_band_path")
+    audit = ImmutableAuditLog(out_of_band_path=Path(out_of_band) if out_of_band else None)
+    mapper = AssetMapper(CloudProviderAdapter(simulated=bool(settings.get("simulated_mode", False))))
+    ingestor = TelemetryIngestor(Path(settings.get("telemetry_index_path", "data/telemetry_index.jsonl")))
+    containment = ContainmentEngine(
+        audit,
+        identity_store=settings.get("approval_identity_store", {}),
+        required_approvals=int(settings.get("approval_quorum", 1)),
+        hardware_key_verifier=_build_hardware_key_verifier(settings),
+        human_confirmation_verifier=_build_human_confirmation_verifier(settings),
+        action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", False))),
     )
     while True:
         state = run_cycle(
@@ -714,6 +740,10 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
             sequence_model=sequence_model,
             honeypot_detector=honeypot_detector,
             mirror_clone_detector=mirror_clone_detector,
+            audit=audit,
+            mapper=mapper,
+            ingestor=ingestor,
+            containment=containment,
         )
         burst_threshold = int(settings.get("burst_cycle_severity_threshold", 80))
         burst_interval_seconds = float(settings.get("burst_cycle_seconds", 0.1))

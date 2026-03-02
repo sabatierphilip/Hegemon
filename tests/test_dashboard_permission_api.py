@@ -41,9 +41,7 @@ def test_permission_api_applies_notice(tmp_path: Path, auth_headers):
     payload = response.get_json()
     assert payload["granted"] is True
     assert payload["completed"] is True
-
-    runtime.ingestion_service.syslog_server.server_close()
-    runtime.ingestion_service.kernel_webhook_server.server_close()
+    runtime.ingestion_service.stop()
 
 
 def test_containment_decision_api_executes_and_releases(tmp_path: Path, auth_headers):
@@ -108,9 +106,7 @@ def test_containment_decision_api_executes_and_releases(tmp_path: Path, auth_hea
     release_payload = release_response.get_json()
     assert release_payload["released"] is True
     assert release_payload["executed"] is False
-
-    runtime.ingestion_service.syslog_server.server_close()
-    runtime.ingestion_service.kernel_webhook_server.server_close()
+    runtime.ingestion_service.stop()
 
 
 def test_web_auth_and_redaction_controls(auth_headers, monkeypatch):
@@ -195,9 +191,7 @@ def test_hardware_key_auto_configure_api(tmp_path: Path, auth_headers):
     declined = client.post("/api/hardware-keys/auto-configure", json={"configure": False}, headers=auth_headers)
     assert declined.status_code == 200
     assert declined.get_json()["completed"] is False
-
-    runtime.ingestion_service.syslog_server.server_close()
-    runtime.ingestion_service.kernel_webhook_server.server_close()
+    runtime.ingestion_service.stop()
 
 
 def test_hardware_key_auto_configure_enables_containment_execution(tmp_path: Path, auth_headers):
@@ -264,9 +258,7 @@ def test_hardware_key_auto_configure_enables_containment_execution(tmp_path: Pat
     payload = after.get_json()
     assert payload["executed"] is True
     assert "quarantine_host" in payload["actions_executed"]
-
-    runtime.ingestion_service.syslog_server.server_close()
-    runtime.ingestion_service.kernel_webhook_server.server_close()
+    runtime.ingestion_service.stop()
 
 
 def test_human_gate_toggle_api_defaults_off_and_can_enable(tmp_path: Path, auth_headers):
@@ -306,6 +298,4 @@ def test_human_gate_toggle_api_defaults_off_and_can_enable(tmp_path: Path, auth_
     disabled_payload = disabled.get_json()
     assert disabled_payload["human_required"] is False
     assert runtime.get_hardware_key_setup_notice()["completed"] is True
-
-    runtime.ingestion_service.syslog_server.server_close()
-    runtime.ingestion_service.kernel_webhook_server.server_close()
+    runtime.ingestion_service.stop()
