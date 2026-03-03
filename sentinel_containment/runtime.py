@@ -239,6 +239,7 @@ class SentinelRuntime:
         self._holding_hosts: set[str] = set()
         self._auto_hardware_private_key: ed25519.Ed25519PrivateKey | None = None
         self._auto_hardware_key_id: str | None = None
+        self._startup_warning_banner = ""
 
         self.fast_lane_server: FastLaneServer | None = None
         self.fast_lane_status: dict[str, Any] = {"enabled": bool(settings.get("fast_lane", {}).get("enabled", False)), "active": False, "missing_tls_files": []}
@@ -345,6 +346,7 @@ class SentinelRuntime:
             self.apply_telemetry_permission(True)
         if bool(self.settings.get("auto_configure_hardware_keys_on_startup", True)):
             self.auto_configure_hardware_keys(True)
+        self._emit_preflight_trust_anchor_warning_if_needed()
 
     def get_human_gate_status(self) -> dict[str, Any]:
         return {
@@ -429,6 +431,12 @@ class SentinelRuntime:
                         approvals=approvals,
                     )
 
+                effective_signature = signature_bundle or self._autonomous_containment_signature_bundle(
+                    host=host,
+                    severity=severity,
+                    requested_actions=recommended_actions,
+                    approvals=approvals,
+                )
                 result = self.fast_lane_containment.execute(
                     host=host,
                     severity=severity,
@@ -436,7 +444,7 @@ class SentinelRuntime:
                     approvals=approvals,
                     simulation_mode=False,
                     hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
-                    signature_bundle=signature_bundle,
+                    signature_bundle=effective_signature,
                     confirmation_bundle=self.settings.get("containment_confirmation"),
                 )
                 response.update(
@@ -512,14 +520,22 @@ class SentinelRuntime:
             if self._containment_decision.get("pending", False):
                 return
             if not self._human_required:
+                approvals = list(self.settings.get("automated_approvers", ["user"]))
+                configured_signature = self.settings.get("containment_signature")
+                effective_signature = configured_signature if isinstance(configured_signature, dict) else self._autonomous_containment_signature_bundle(
+                    host=host,
+                    severity=severity,
+                    requested_actions=recommended_actions,
+                    approvals=approvals,
+                )
                 auto_result = self.fast_lane_containment.execute(
                     host=host,
                     severity=severity,
                     requested_actions=recommended_actions,
-                    approvals=list(self.settings.get("automated_approvers", ["user"])),
+                    approvals=approvals,
                     simulation_mode=False,
                     hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
-                    signature_bundle=self.settings.get("containment_signature"),
+                    signature_bundle=effective_signature,
                     confirmation_bundle=self.settings.get("containment_confirmation"),
                 )
                 self.audit.append(
@@ -533,14 +549,22 @@ class SentinelRuntime:
                     },
                 )
                 return
+            hold_approvals = list(self.settings.get("automated_approvers", ["user"]))
+            configured_hold_signature = self.settings.get("containment_signature")
+            effective_hold_signature = configured_hold_signature if isinstance(configured_hold_signature, dict) else self._autonomous_containment_signature_bundle(
+                host=host,
+                severity=max(70, min(89, severity)),
+                requested_actions=["disable_outbound_traffic", "forensic_snapshot_metadata"],
+                approvals=hold_approvals,
+            )
             hold_result = self.fast_lane_containment.execute(
                 host=host,
                 severity=max(70, min(89, severity)),
                 requested_actions=["disable_outbound_traffic", "forensic_snapshot_metadata"],
-                approvals=list(self.settings.get("automated_approvers", ["user"])),
+                approvals=hold_approvals,
                 simulation_mode=False,
                 hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
-                signature_bundle=self.settings.get("containment_signature"),
+                signature_bundle=effective_hold_signature,
                 confirmation_bundle=self.settings.get("containment_confirmation"),
             )
             self._holding_hosts.add(host)
@@ -560,6 +584,107 @@ class SentinelRuntime:
 
     def get_hardware_key_setup_notice(self) -> dict[str, Any]:
         return dict(self._hardware_key_setup_notice)
+
+    def _containment_policy_status(self) -> dict[str, Any]:
+        engines = {
+            "primary": self.containment,
+            "fast_lane": self.fast_lane_containment,
+        }
+        blocked_reasons: list[str] = []
+        approvals = list(self.settings.get("automated_approvers", ["user"]))
+        host = "preflight-trust-anchor-check"
+        severity = 95
+        requested_actions = ["disable_outbound_traffic", "quarantine_host"]
+
+        for name, engine in engines.items():
+            signature_bundle = self.settings.get("containment_signature")
+            if not isinstance(signature_bundle, dict):
+                signature_bundle = self._autonomous_containment_signature_bundle(
+                    host=host,
+                    severity=severity,
+                    requested_actions=requested_actions,
+                    approvals=approvals,
+                )
+            confirmation_bundle = self.settings.get("containment_confirmation")
+            if not isinstance(confirmation_bundle, dict):
+                confirmation_bundle = None
+
+            signature_verification = (
+                engine.hardware_key_verifier.verify(
+                    host=host,
+                    severity=severity,
+                    requested_actions=requested_actions,
+                    approvals=approvals,
+                    signature_bundle=signature_bundle,
+                )
+                if engine.hardware_key_verifier.enabled
+                else None
+            )
+            confirmation_verification = (
+                engine.human_confirmation_verifier.verify(
+                    host=host,
+                    severity=severity,
+                    requested_actions=requested_actions,
+                    approvals=approvals,
+                    confirmation_bundle=confirmation_bundle,
+                )
+                if engine.human_confirmation_verifier.enabled
+                else None
+            )
+
+            signature_ok = signature_verification is None or signature_verification.allowed
+            confirmation_ok = confirmation_verification is None or confirmation_verification.allowed
+            bypass_by_human = bool(
+                confirmation_verification
+                and confirmation_verification.allowed
+                and engine.human_confirmation_verifier.configured
+            )
+            bypass_by_signature = bool(
+                signature_verification
+                and signature_verification.allowed
+                and engine.hardware_key_verifier.configured
+            )
+
+            if not signature_ok and not bypass_by_human and signature_verification is not None:
+                blocked_reasons.append(f"{name}: {signature_verification.message}")
+            if not confirmation_ok and not bypass_by_signature and confirmation_verification is not None:
+                blocked_reasons.append(f"{name}: {confirmation_verification.message}")
+
+        return {
+            "ready": not blocked_reasons,
+            "blocked_reasons": blocked_reasons,
+            "token_configured": True,
+            "key_policy_ready": not blocked_reasons,
+        }
+
+    def _emit_preflight_trust_anchor_warning_if_needed(self) -> None:
+        status = self._containment_policy_status()
+        if status["ready"]:
+            self._startup_warning_banner = ""
+            return
+        reason_blob = " | ".join(status["blocked_reasons"])
+        self._startup_warning_banner = (
+            "⚠️ HARD WARNING: containment authorization pre-flight failed. "
+            f"Current key policy blocks kill-chain/containment execution: {reason_blob}"
+        )
+        self.audit.append("containment_preflight_blocked", status)
+        logger.error(self._startup_warning_banner)
+
+    def get_readiness_status(self) -> dict[str, Any]:
+        policy = self._containment_policy_status()
+        return {
+            "token_ready": True,
+            "key_policy_ready": bool(policy["key_policy_ready"]),
+            "containment_ready": bool(policy["ready"]),
+            "startup_warning": self._startup_warning_banner,
+            "blocked_reasons": list(policy["blocked_reasons"]),
+        }
+
+    def _apply_hardware_key_to_all_engines(self, key_id: str, public_pem: str) -> None:
+        self.containment.hardware_key_verifier.upsert_trusted_public_key(key_id, public_pem)
+        self.fast_lane_containment.hardware_key_verifier.upsert_trusted_public_key(key_id, public_pem)
+        self.settings.data.setdefault("trusted_hardware_public_keys", {})[key_id] = public_pem
+        self.settings.data["hardware_key_fail_closed"] = True
 
     @staticmethod
     def _sha256_hex(payload: bytes) -> str:
@@ -650,6 +775,10 @@ class SentinelRuntime:
         existing_signature = self.settings.get("containment_signature")
         if self.fast_lane_containment.hardware_key_verifier.configured and isinstance(existing_signature, dict):
             key_id = str(existing_signature.get("key_id", "auto-ed25519-local")).strip() or "auto-ed25519-local"
+            trusted_keys = self.settings.get("trusted_hardware_public_keys", {})
+            key_material = str(trusted_keys.get(key_id, "")).strip() if isinstance(trusted_keys, dict) else ""
+            if key_material:
+                self._apply_hardware_key_to_all_engines(key_id, key_material)
             self._hardware_key_setup_notice = {
                 "required": True,
                 "configured": True,
@@ -678,9 +807,7 @@ class SentinelRuntime:
             detail = "ephemeral_private_key_not_persisted"
             audit_payload = {"key_id": key_id, "local_only": True, "persist_private_key": False}
 
-        self.fast_lane_containment.hardware_key_verifier.upsert_trusted_public_key(key_id, public_pem)
-        self.settings.data.setdefault("trusted_hardware_public_keys", {})[key_id] = public_pem
-        self.settings.data["hardware_key_fail_closed"] = True
+        self._apply_hardware_key_to_all_engines(key_id, public_pem)
         self.settings.data.pop("containment_signature", None)
         self._auto_hardware_private_key = private_key
         self._auto_hardware_key_id = key_id
@@ -700,7 +827,42 @@ class SentinelRuntime:
             "local_only": True,
         }
         self.audit.append("hardware_key_autoconfig_completed", audit_payload)
+        self._emit_preflight_trust_anchor_warning_if_needed()
         return dict(self._hardware_key_setup_notice)
+
+    def run_incident_drill(self) -> dict[str, Any]:
+        if not self._containment_policy_status()["ready"] and bool(self.settings.get("drill_auto_configure_hardware_keys", True)):
+            self.auto_configure_hardware_keys(True)
+
+        drill_event = {
+            "source_type": "incident_drill",
+            "host": "drill-host-001",
+            "severity": int(self.settings.get("incident_drill_severity", 98)),
+            "kill_chain": True,
+            "honeypot_trigger": True,
+            "requested_actions": [
+                "kill_active_model_sessions",
+                "disable_iam_sessions",
+                "disable_outbound_traffic",
+                "revoke_rotate_api_keys",
+                "pause_model_serving_container",
+                "sinkhole_suspicious_destinations",
+                "block_lateral_movement_paths",
+                "quarantine_host",
+                "forensic_snapshot_metadata",
+            ],
+        }
+        result = self.process_priority_event(drill_event)
+        payload = {
+            "mode": "deterministic_incident_drill",
+            "approved": bool(result.get("approved", False)),
+            "host": drill_event["host"],
+            "severity": drill_event["severity"],
+            "actions_executed": result.get("actions_executed", []),
+            "message": result.get("message", ""),
+        }
+        self.audit.append("incident_drill_completed", payload)
+        return payload
 
     def apply_telemetry_permission(self, granted: bool) -> dict[str, Any]:
         details: list[str] = []
@@ -769,16 +931,25 @@ class SentinelRuntime:
                     "forensic_snapshot_metadata",
                 ]
 
+        normalized_actions = [str(a) for a in requested_actions]
+        approvals = list(self.settings.get("automated_approvers", ["user"]))
+        event_signature = event.get("containment_signature") if isinstance(event.get("containment_signature"), dict) else None
+        configured_signature = self.settings.get("containment_signature") if isinstance(self.settings.get("containment_signature"), dict) else None
+        effective_signature = event_signature or configured_signature or self._autonomous_containment_signature_bundle(
+            host=host,
+            severity=severity,
+            requested_actions=normalized_actions,
+            approvals=approvals,
+        )
+
         result = self.fast_lane_containment.execute(
             host=host,
             severity=severity,
-            requested_actions=[str(a) for a in requested_actions],
-            approvals=list(self.settings.get("automated_approvers", ["user"])),
+            requested_actions=normalized_actions,
+            approvals=approvals,
             simulation_mode=False,
             hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
-            signature_bundle=event.get("containment_signature")
-            if isinstance(event.get("containment_signature"), dict)
-            else self.settings.get("containment_signature"),
+            signature_bundle=effective_signature,
             confirmation_bundle=event.get("containment_confirmation")
             if isinstance(event.get("containment_confirmation"), dict)
             else self.settings.get("containment_confirmation"),
@@ -955,6 +1126,7 @@ class SentinelRuntime:
         self._update_containment_decision_from_state(state)
         state["containment_decision"] = self.get_containment_decision_status()
         state["fast_lane_status"] = dict(self.fast_lane_status)
+        state["readiness"] = self.get_readiness_status()
         state["p2p_checkpoint"] = self._checkpoint_critical_state(state)
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")

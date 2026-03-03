@@ -21,7 +21,8 @@ What starts automatically:
 - Multi-signal honeypot tripwires with proto-AGI indicator scoring, adversarial tradecraft profiling, and immediate kill/containment chain
 - Immutable audit logging with immediate out-of-band mirroring support
 - Local-only Flask dashboard (`http://127.0.0.1:5000`) and `/graph` (non-loopback clients are rejected at request level)
-- First-run dashboard popup to optionally auto-configure hardware-key trust anchors for high-severity containment
+- Startup pre-flight trust-anchor validation with hard warning banner when key policy would block containment
+- Default autonomous hardware-key bootstrap on startup (dashboard can still toggle/override)
 
 ## Docker single-command deployment
 
@@ -62,6 +63,8 @@ Main settings are in `config/config.yaml`:
 - `dashboard_host`/`dashboard_port` for local UI binding (defaults to `127.0.0.1`)
 - `graph_horizons_minutes` for multi-horizon rolling graph anomaly summaries that catch patient low-and-slow campaigns
 - `web_rate_*` settings for adaptive event-triggered burst throttling that defends dashboard/API endpoints from request-flood DoS
+- `auto_configure_hardware_keys_on_startup` defaults to `true` so the runtime can self-bootstrap trust anchors for autonomous containment by default
+- `incident_drill_severity` and `drill_auto_configure_hardware_keys` to run deterministic severe-alert drill simulations through the same approval path
 
 
 ## GitHub zip download + cryptographic sealing
@@ -95,6 +98,23 @@ Notes:
 - Reversible actions where possible with stronger automatic isolation for severe events
 - Tamper-evident immutable hash-chain logs plus telemetry event signature-chain verification
 - No offensive actions against external infrastructure
+
+
+## Production WSGI load test profile
+
+Run the dashboard with a production WSGI server (example using Gunicorn):
+
+```bash
+gunicorn -w 4 --threads 8 -b 127.0.0.1:5000 sentinel_containment.web.app:app
+```
+
+Then execute a burst profile against authenticated API endpoints:
+
+```bash
+python scripts/run_wsgi_load_profile.py --url http://127.0.0.1:5000/api/health --token <dashboard-token> --concurrency 128 --requests 5000
+```
+
+This validates request-throttle and burst-guard behavior under realistic concurrent WSGI traffic, beyond Flask dev-server assumptions.
 
 ## Tests
 

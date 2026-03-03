@@ -162,6 +162,10 @@ HTML = """
     .title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
     .title h1 { margin: 0; font-size: 28px; }
     .badge { background: #20305f; border: 1px solid #2f4383; padding: 6px 10px; border-radius: 20px; color: #cfe0ff; }
+    .header-cues { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .cue { font-size:11px; border-radius:999px; padding:4px 10px; border:1px solid #2f4383; background:#1a2340; }
+    .cue.ok { border-color:#2f855a; color:#9cf6d2; }
+    .cue.warn { border-color:#8b2f45; color:#ffdce5; }
     .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }
     .card { background: var(--panel); border: 1px solid #253155; border-radius: 12px; padding: 14px; box-shadow: 0 8px 16px rgba(0, 0, 0, .25); }
     .kpi { font-size: 26px; font-weight: 700; margin: 6px 0 2px; }
@@ -183,22 +187,34 @@ HTML = """
   </style>
 </head>
 <body>
-<div class=\"wrap\">
-  <div class=\"title\">
+<div class="wrap">
+  <div class="title">
     <h1>🛡️ Sentinel-Containment Command Center</h1>
-    <div class=\"badge\">Candidate Severity: {{ candidate_severity }}</div>
+    <div class="header-cues">
+      <div class="cue {{ 'ok' if readiness.token_ready else 'warn' }}">Auth Token: {{ 'Ready' if readiness.token_ready else 'Missing' }}</div>
+      <div class="cue {{ 'ok' if readiness.key_policy_ready else 'warn' }}">Key Policy: {{ 'Ready' if readiness.key_policy_ready else 'Blocked' }}</div>
+      <div class="badge">Candidate Severity: {{ candidate_severity }}</div>
+    </div>
   </div>
 
-  <div class=\"panel\">
+  {% if readiness.startup_warning %}
+  <div class="panel" style="border-color:#8b2f45;background:#2b1520;">
+    <h3 style="color:#ffdce5;">Containment Pre-flight Warning</h3>
+    <div class="small">{{ readiness.startup_warning }}</div>
+  </div>
+  {% endif %}
+
+  <div class="panel">
     <h3>Deployment Control</h3>
-    <div class=\"small\" id=\"human-gate-status\">Human-in-the-loop toggle status loading.</div>
-    <label class=\"small\" style=\"display:flex;align-items:center;gap:8px;margin-top:6px;\">
-      <input id=\"human-gate-toggle\" type=\"checkbox\" />
+    <div class="small" id="human-gate-status">Human-in-the-loop toggle status loading.</div>
+    <label class="small" style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+      <input id="human-gate-toggle" type="checkbox" />
       Require human confirmation for containment decisions
     </label>
-    <div class=\"small\" id=\"telemetry-status\">Telemetry permission pending.</div>
-    <div class=\"small\" id=\"hardware-key-status\" style=\"margin-top:6px;\">Hardware key bootstrap check pending.</div>
-    <button id=\"run-btn\" style=\"margin-top:8px;padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;\">Run</button>
+    <div class="small" id="telemetry-status">Telemetry permission pending.</div>
+    <button id="drill-btn" style="margin-top:8px;padding:8px 12px;background:#4a2b6a;color:#e7d7ff;border:1px solid #6b3f96;border-radius:8px;cursor:pointer;">Run Incident Drill</button>
+    <div class="small" id="hardware-key-status" style="margin-top:6px;">Hardware key bootstrap check pending.</div>
+    <button id="run-btn" style="margin-top:8px;padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;">Run</button>
   </div>
 
   <div class="panel">
@@ -342,6 +358,19 @@ async function loadHumanGateStatus(){
   }
 }
 
+
+async function runIncidentDrill(){
+  const status=document.getElementById("containment-status");
+  const resp=await fetch("/api/drill/incident",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:true})});
+  const payload=await resp.json();
+  if(status){
+    status.textContent = payload.approved
+      ? `Incident drill passed on ${payload.host}: approved containment path verified.`
+      : `Incident drill failed: ${payload.message || "containment not approved"}`;
+  }
+  updateDecisionUI(payload);
+}
+
 async function updateHumanGate(required){
   const status=document.getElementById("human-gate-status");
   const resp=await fetch("/api/human-gate/toggle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({human_required:required})});
@@ -354,6 +383,7 @@ async function updateHumanGate(required){
 }
 
 document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
+document.getElementById("drill-btn")?.addEventListener("click",runIncidentDrill);
 document.getElementById("containment-yes")?.addEventListener("click",()=>decideContainment(true));
 document.getElementById("containment-no")?.addEventListener("click",()=>decideContainment(false));
 document.getElementById("human-gate-toggle")?.addEventListener("change",(event)=>{
@@ -461,6 +491,21 @@ def _severity_class(value: int) -> str:
     return "low"
 
 
+def _readiness_payload() -> dict[str, object]:
+    runtime_payload = _runtime.get_readiness_status() if _runtime is not None else {}
+    token_ready = bool(_api_token())
+    readiness = {
+        "token_ready": token_ready,
+        "key_policy_ready": bool(runtime_payload.get("key_policy_ready", False)),
+        "containment_ready": bool(runtime_payload.get("containment_ready", False)),
+        "startup_warning": str(runtime_payload.get("startup_warning", "")),
+        "blocked_reasons": list(runtime_payload.get("blocked_reasons", [])),
+    }
+    if not token_ready and not readiness["startup_warning"]:
+        readiness["startup_warning"] = "⚠️ HARD WARNING: dashboard API token missing; operator auth is not ready."
+    return readiness
+
+
 @app.get("/")
 def dashboard():
     unauthorized = _require_auth()
@@ -483,6 +528,7 @@ def dashboard():
         containment_decision=state.get("containment_decision", {}),
         containment_decision_json=json.dumps(state.get("containment_decision", {}), indent=2),
         severity_class=_severity_class,
+        readiness=_readiness_payload(),
         csp_nonce=getattr(g, "csp_nonce", ""),
     )
 
@@ -597,6 +643,32 @@ def hardware_key_auto_configure():
     if _runtime is None:
         return jsonify({"required": True, "configured": False, "completed": False, "details": ["runtime_not_initialized"]}), 503
     return jsonify(_runtime.auto_configure_hardware_keys(configure_value))
+
+
+@app.get("/api/readiness")
+def api_readiness():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify(_readiness_payload())
+
+
+@app.post("/api/drill/incident")
+def incident_drill():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    run_value = payload.get("run", False)
+    if not isinstance(run_value, bool):
+        return jsonify({"error": "invalid_payload", "message": "run must be a boolean"}), 400
+    if not run_value:
+        return jsonify({"mode": "deterministic_incident_drill", "approved": False, "message": "drill_not_requested"})
+    if _runtime is None:
+        return jsonify({"mode": "deterministic_incident_drill", "approved": False, "message": "runtime_not_initialized"}), 503
+    return jsonify(_runtime.run_incident_drill())
 
 
 @app.get("/api/containment/decision")
