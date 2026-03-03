@@ -111,6 +111,22 @@ class LevelFourDirective:
     rationale: str
 
 
+@dataclass
+class LevelFiveDirective:
+    shard: str
+    threat_label: str
+    confidence: float
+    hunter_score: float
+    p2p_verification_score: float
+    reactive_signal_score: float
+    local_tamper_score: float
+    hunter_swarm_size: int
+    target_resource: str
+    kill_chain_path: list[str]
+    friendly_shields: list[str]
+    rationale: str
+
+
 class MirrorCloneDetector:
     """Builds per-identity scan/trace clones and can rapidly deploy executable counter-clones."""
 
@@ -521,6 +537,117 @@ class MirrorCloneDetector:
                 target=objective_target,
                 rationale="Maintain always-on adaptive deception and telemetry self-healing objectives",
                 priority=min(100, 85 + int(directive.confidence * 10)),
+            ),
+        ]
+
+    def generate_level_five_hunter_directives(
+        self,
+        max_directives: int = 2,
+        min_hunter_score: float = 0.4,
+    ) -> list[LevelFiveDirective]:
+        directives: list[LevelFiveDirective] = []
+        for shard, action_counts in self._action_counts.items():
+            total = sum(action_counts.values())
+            if total < self.warmup_events:
+                continue
+
+            kill_chain_path, confidence = self._predict_markov_path(shard, horizon=8)
+            if not kill_chain_path:
+                continue
+
+            markov_score = self._markov_kill_chain_score(kill_chain_path)
+            drift = self._model_disagreement(shard)
+            sustained_abuse = self._sustained_compute_abuse_score(shard)
+            p2p_verification_score = min(1.0, 0.45 + (0.25 * confidence) + (0.15 * drift) + (0.15 * sustained_abuse))
+            reactive_signal_score = min(1.0, (0.45 * markov_score) + (0.35 * drift) + (0.20 * sustained_abuse))
+            local_tamper_score = self._local_tamper_pressure(kill_chain_path)
+            hunter_score = min(
+                1.0,
+                (0.20 * confidence)
+                + (0.20 * markov_score)
+                + (0.20 * p2p_verification_score)
+                + (0.20 * reactive_signal_score)
+                + (0.20 * local_tamper_score),
+            )
+            if hunter_score < min_hunter_score:
+                continue
+
+            candidate_resources = self._resource_counts[shard].get(kill_chain_path[0], {})
+            target_resource = (
+                max(candidate_resources.items(), key=lambda item: item[1])[0]
+                if candidate_resources
+                else "synthetic://unknown"
+            )
+            hunter_swarm_size = 6 + min(12, int(hunter_score * 12))
+            directives.append(
+                LevelFiveDirective(
+                    shard=shard,
+                    threat_label="l5_friendly_integrity_hunter",
+                    confidence=round(confidence, 3),
+                    hunter_score=round(hunter_score, 3),
+                    p2p_verification_score=round(p2p_verification_score, 3),
+                    reactive_signal_score=round(reactive_signal_score, 3),
+                    local_tamper_score=round(local_tamper_score, 3),
+                    hunter_swarm_size=hunter_swarm_size,
+                    target_resource=target_resource,
+                    kill_chain_path=kill_chain_path,
+                    friendly_shields=[
+                        "p2p_directive_verification_quorum",
+                        "reactive_local_tamper_lockdown",
+                        "friendlies_clone_shielding",
+                        "global_action_signal_broadcast",
+                    ],
+                    rationale=(
+                        "Level-5 hunter directive generated for friendly-system anti-compromise posture: "
+                        f"hunter_score={hunter_score:.2f}, p2p_verification_score={p2p_verification_score:.2f}, "
+                        f"reactive_signal_score={reactive_signal_score:.2f}, local_tamper_score={local_tamper_score:.2f}"
+                    ),
+                )
+            )
+
+        directives.sort(
+            key=lambda item: (item.hunter_score, item.p2p_verification_score, item.confidence),
+            reverse=True,
+        )
+        return directives[: max(0, max_directives)]
+
+    def execute_level_five_directive(self, directive: LevelFiveDirective) -> list[CounterCloneAction]:
+        shields = " | ".join(directive.friendly_shields)
+        return [
+            CounterCloneAction(
+                shard=directive.shard,
+                action="deploy_level5_hunter_directive_mesh",
+                target=f"{directive.hunter_swarm_size}@{directive.target_resource}",
+                rationale=directive.rationale,
+                priority=min(100, 90 + int(directive.hunter_score * 10)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="spawn_level5_counter_clones",
+                target=" -> ".join(directive.kill_chain_path),
+                rationale="Deploy clone hunters with reactive interception against projected compromise routes",
+                priority=min(100, 89 + int(directive.reactive_signal_score * 10)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="p2p_verify_hunter_directives",
+                target=shields,
+                rationale="Require mesh quorum verification before every level-5 directive execution",
+                priority=min(100, 88 + int(directive.p2p_verification_score * 10)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="block_local_unauthorized_tamper",
+                target="hegemon-local-user-surface",
+                rationale="Reactive lockout when local unauthorized tampering or policy edits are detected",
+                priority=min(100, 87 + int(directive.local_tamper_score * 10)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="broadcast_global_hunter_actions",
+                target="system://all-out-actions",
+                rationale="Inform the system of every level-5 hunter action for immutable visibility",
+                priority=95,
             ),
         ]
 
@@ -1120,6 +1247,26 @@ class MirrorCloneDetector:
             + 0.11 * (1.0 if "improbable_transition_pressure" in vector else 0.0),
         )
         return score, vector
+
+    @staticmethod
+    def _local_tamper_pressure(kill_chain_path: list[str]) -> float:
+        tamper_actions = {
+            "policy_change",
+            "iam_privilege_change",
+            "credential_dump",
+            "tamper_detection",
+            "disable_telemetry",
+            "modify_runtime",
+            "local_privilege_escalation",
+            "root_shell",
+            "config_write",
+            "unauthorized_local_access",
+        }
+        if not kill_chain_path:
+            return 0.0
+        hit_count = sum(1 for action in kill_chain_path if action in tamper_actions)
+        path_pressure = hit_count / float(len(kill_chain_path))
+        return min(1.0, (0.6 * path_pressure) + (0.4 if hit_count > 0 else 0.0))
 
     @staticmethod
     def _build_blindspot_patch_strategy(blindspots: list[str], liespots: list[str], path: list[str]) -> list[str]:

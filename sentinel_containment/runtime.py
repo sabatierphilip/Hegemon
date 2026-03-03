@@ -1019,6 +1019,8 @@ class SentinelRuntime:
             "autonomous_recon_directives": state.get("autonomous_recon_directives", []),
             "stage_two_counteroffensive_directives": state.get("stage_two_counteroffensive_directives", []),
             "level_three_hunting_directives": state.get("level_three_hunting_directives", []),
+            "level_four_continuous_directives": state.get("level_four_continuous_directives", []),
+            "level_five_hunter_directives": state.get("level_five_hunter_directives", []),
             "counter_clone_actions": state.get("counter_clone_actions", []),
             "candidate_severity": state.get("candidate_severity", 0),
             "risk_confidence": state.get("risk_confidence", 0.0),
@@ -1061,12 +1063,16 @@ class SentinelRuntime:
             state.get("autonomous_recon_directives")
             or state.get("stage_two_counteroffensive_directives")
             or state.get("level_three_hunting_directives")
+            or state.get("level_four_continuous_directives")
+            or state.get("level_five_hunter_directives")
         )
         if critical_directives and not validation.accepted:
             payload["directive_quarantine"] = True
             state["autonomous_recon_directives"] = []
             state["stage_two_counteroffensive_directives"] = []
             state["level_three_hunting_directives"] = []
+            state["level_four_continuous_directives"] = []
+            state["level_five_hunter_directives"] = []
         return payload
 
     def enroll_friendly_software(

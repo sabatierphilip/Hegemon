@@ -16,6 +16,7 @@ from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
 from sentinel_containment.detection.mirror_clone import (
+    LevelFiveDirective,
     LevelFourDirective,
     LevelThreeDirective,
     MirrorCloneDetector,
@@ -428,6 +429,7 @@ def run_cycle(
     stage_two_counteroffensive_directives = []
     level_three_hunting_directives = []
     level_four_continuous_directives = []
+    level_five_hunter_directives = []
 
     for event in detector_events:
         rule_alerts.extend(rules.evaluate(event))
@@ -621,6 +623,31 @@ def run_cycle(
             )
         )
 
+    level_five_hunter_directives = [
+        asdict(d)
+        for d in mirror_clone_detector.generate_level_five_hunter_directives(
+            max_directives=int(settings.get("level_five_max_directives", 2)),
+            min_hunter_score=float(settings.get("level_five_min_hunter_score", 0.4)),
+        )
+    ]
+    for directive in level_five_hunter_directives:
+        planned_actions = mirror_clone_detector.execute_level_five_directive(LevelFiveDirective(**directive))
+        counter_clone_actions.extend(planned_actions)
+        counter_clone_execution.extend(
+            execute_counter_clone_actions(
+                actions=[asdict(a) for a in planned_actions],
+                deployment={
+                    "deployment_id": f"stage5::{directive['shard']}",
+                    "shard": directive["shard"],
+                    "synthetic_probe_sequence": [],
+                },
+                containment=containment,
+                ingestor=ingestor,
+                audit=audit,
+                signature_bundle=_containment_signature(settings),
+            )
+        )
+
     immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
     risk_confidence = compute_risk_confidence(
         candidate_severity,
@@ -723,6 +750,7 @@ def run_cycle(
         "stage_two_counteroffensive_directives": stage_two_counteroffensive_directives,
         "level_three_hunting_directives": level_three_hunting_directives,
         "level_four_continuous_directives": level_four_continuous_directives,
+        "level_five_hunter_directives": level_five_hunter_directives,
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
         "risk_confidence": risk_confidence,

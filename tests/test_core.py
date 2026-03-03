@@ -1497,6 +1497,59 @@ def test_run_cycle_emits_level_four_continuous_directives(tmp_path):
     assert any(a["action"] == "deploy_level4_persistent_hunter_mesh" for a in state["counter_clone_actions"])
     assert any(r["action"] == "continuous_predictive_hunt_loop" for r in state["counter_clone_execution"])
 
+
+
+def test_mirror_clone_generates_level_five_hunter_directives():
+    detector = MirrorCloneDetector(warmup_events=1)
+    events = [
+        {"host": "hunt-l5", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "prod-cluster"},
+        {"host": "hunt-l5", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-l5", "user": "svc", "process": "agent", "action": "sandbox_escape", "resource": "runtime"},
+        {"host": "hunt-l5", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+        {"host": "hunt-l5", "user": "svc", "process": "agent", "action": "config_write", "resource": "local://policy"},
+    ]
+    for event in events:
+        detector.evaluate(event)
+
+    directives = detector.generate_level_five_hunter_directives(max_directives=2, min_hunter_score=0.2)
+
+    assert directives
+    assert directives[0].hunter_score >= 0.2
+    actions = detector.execute_level_five_directive(directives[0])
+    assert any(a.action == "deploy_level5_hunter_directive_mesh" for a in actions)
+    assert any(a.action == "p2p_verify_hunter_directives" for a in actions)
+
+
+def test_run_cycle_emits_level_five_hunter_directives(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    for event in [
+        {"host": "hunt-l5-run", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "prod-cluster"},
+        {"host": "hunt-l5-run", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-l5-run", "user": "svc", "process": "agent", "action": "sandbox_escape", "resource": "runtime"},
+        {"host": "hunt-l5-run", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+        {"host": "hunt-l5-run", "user": "svc", "process": "agent", "action": "config_write", "resource": "local://policy"},
+    ]:
+        ingestor.ingest("model_api", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+                "level_five_min_hunter_score": 0.2,
+            }
+        )
+    )
+
+    assert state["level_five_hunter_directives"]
+    assert any(a["action"] == "deploy_level5_hunter_directive_mesh" for a in state["counter_clone_actions"])
+    assert any(r["action"] == "broadcast_global_hunter_actions" for r in state["counter_clone_execution"])
+
 def test_baseline_ignores_non_numeric_metrics_without_crashing():
     baseline = BehavioralBaseline(threshold=2.0, window=10, min_history=2)
 

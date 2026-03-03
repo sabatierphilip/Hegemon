@@ -38,6 +38,8 @@ level_three_max_directives: 2
 level_three_min_severity_score: 0.55
 level_four_max_directives: 2
 level_four_min_dominance_score: 0.35
+level_five_max_directives: 2
+level_five_min_hunter_score: 0.4
 hard_response_action_threshold: 85
 burst_cycle_severity_threshold: 80
 burst_cycle_seconds: 0.1
