@@ -9,6 +9,7 @@ import hmac
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, render_template_string, request
 
@@ -97,11 +98,42 @@ def _build_request_guard() -> EventTriggeredBurstGuard:
 _request_guard = _build_request_guard()
 
 
+def _is_loopback(addr: str | None) -> bool:
+    if not addr:
+        return False
+    return addr in {"127.0.0.1", "::1", "localhost"}
+
+
+def _is_local_request() -> bool:
+    remote = request.remote_addr or ""
+    if not _is_loopback(remote):
+        return False
+    origin = request.headers.get("Origin", "").strip()
+    if origin:
+        host = (urlparse(origin).hostname or "").strip().lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            return False
+    return True
+
+
+def _valid_csrf_origin_for_state_change() -> bool:
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return True
+    origin = request.headers.get("Origin", "").strip()
+    if not origin:
+        return False
+    host = (urlparse(origin).hostname or "").strip().lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 @app.before_request
 def enforce_request_throttle():
     g.csp_nonce = secrets.token_urlsafe(16)
-    client_id = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
-    client_id = client_id.split(",")[0].strip()
+    if not _is_local_request():
+        return jsonify({"error": "forbidden", "message": "dashboard is restricted to local loopback clients"}), 403
+    if not _valid_csrf_origin_for_state_change():
+        return jsonify({"error": "forbidden", "message": "state-changing requests require localhost Origin header"}), 403
+    client_id = (request.remote_addr or "unknown").strip()
     if not _request_guard.allow(client_id):
         return jsonify({"error": "rate_limited", "message": "Event-triggered burst protection active"}), 429
 

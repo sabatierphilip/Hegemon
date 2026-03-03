@@ -20,7 +20,7 @@ What starts automatically:
 - Hybrid containment execution engine with safe-by-default simulation plus optional live controls (iptables/nft outbound isolation, AWS IAM deny policy push, DNS sinkhole host mapping)
 - Multi-signal honeypot tripwires with proto-AGI indicator scoring, adversarial tradecraft profiling, and immediate kill/containment chain
 - Immutable audit logging with immediate out-of-band mirroring support
-- Local-only Flask dashboard (`http://127.0.0.1:5000`) and `/graph`
+- Local-only Flask dashboard (`http://127.0.0.1:5000`) and `/graph` (non-loopback clients are rejected at request level)
 - First-run dashboard popup to optionally auto-configure hardware-key trust anchors for high-severity containment
 
 ## Docker single-command deployment
@@ -56,6 +56,7 @@ Main settings are in `config/config.yaml`:
 - `proto_agi_indicators` to tune high-risk autonomous behavior markers that trigger immediate containment
 - `peer_verification.external_tpm_attestation.*` to enforce hardware TPM quote validation for every mesh peer
 - `peer_verification.external_cloud_attestation.*` to enforce cloud-native workload attestation checks
+- `peer_verification.checkpoint_*` controls for quorum checkpointing (`checkpoint_quorum`, `checkpoint_signers`, `replication_targets`, nonce age, sequential enforcement)
 - `audit_out_of_band_path` for append-only out-of-band audit sink
 - `approval_identity_store` for canonical approval identity normalization
 - `dashboard_host`/`dashboard_port` for local UI binding (defaults to `127.0.0.1`)
@@ -89,6 +90,7 @@ Notes:
 - Configurable approval quorum (default single-user for faster autonomous response)
 - Identity-bound execution: containment requires valid signatures from trusted hardware-bound keys (YubiKey/TPM)
 - Dynamic peer-to-peer process attestation mesh plus external TPM/cloud attestation verification to prevent self-attesting compromised nodes
+- Quorum-signed P2P checkpoints with monotonic sequence/nonce anti-replay, Merkle-root commitments, gossip cross-notarization, and signer revocation/rotation support
 - User-only friendly software enrollment with cryptographic authorization; enrolled friendlies are added to the mesh and protected via patrol telemetry
 - Reversible actions where possible with stronger automatic isolation for severe events
 - Tamper-evident immutable hash-chain logs plus telemetry event signature-chain verification
@@ -107,3 +109,6 @@ Rules now support structured matching that goes beyond simple equality/threshold
 - Sigma-like selectors under `detection.sigma` (`all_of`, `any_of`, `not`, `contains`, `regex`, `startswith`, `endswith`, `in`)
 - YARA-like token sets under `detection.yara_like` with configurable `min_hits` across multiple fields
 - Native `regex` and `contains_any` field maps for expressive matching in compact rules
+- `long_window_accumulation` for low-and-slow exfil detection over extended windows
+- `field_entropy` for covert-channel spotting (encoded/high-entropy payloads in DNS or API fields)
+- `windowed_count` + `additional_checks` for low-and-slow DNS tunnel detection across long windows

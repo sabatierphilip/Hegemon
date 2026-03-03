@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
+from collections import Counter
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -28,6 +30,7 @@ class RuleEngine:
         self._suppressed_count: dict[tuple[str, str], int] = {}
         self._metric_history: dict[tuple[str, str, str], deque[tuple[datetime, float]]] = defaultdict(deque)
         self._recent_events: dict[str, deque[tuple[datetime, str, float]]] = defaultdict(deque)
+        self._field_windows: dict[tuple[str, str], deque[tuple[datetime, str]]] = defaultdict(deque)
 
     def _load_rules(self) -> list[dict[str, Any]]:
         loaded = []
@@ -50,6 +53,14 @@ class RuleEngine:
                 threshold_matches.append(self._check_dynamic_velocity(rule, cond["dynamic_velocity"], event, event_time))
             if "distributed_burst" in cond:
                 threshold_matches.append(self._check_distributed_burst(rule, cond["distributed_burst"], event, event_time))
+            if "long_window_accumulation" in cond:
+                threshold_matches.append(
+                    self._check_long_window_accumulation(rule, cond["long_window_accumulation"], event, event_time)
+                )
+            if "field_entropy" in cond:
+                threshold_matches.append(self._check_field_entropy(cond["field_entropy"], event))
+            if "windowed_count" in cond:
+                threshold_matches.append(self._check_windowed_count(rule, cond["windowed_count"], event, event_time))
 
             structured_match = self._evaluate_structured_conditions(cond, event)
             thresholds_ok = any(threshold_matches) if threshold_matches else True
@@ -78,20 +89,20 @@ class RuleEngine:
 
     def _evaluate_structured_conditions(self, cond: dict[str, Any], event: dict[str, Any]) -> bool:
         equals = cond.get("equals", {})
-        if equals and not all(event.get(k) == v for k, v in equals.items()):
+        if equals and not all(self._get_event_field(event, k) == v for k, v in equals.items()):
             return False
 
         regex = cond.get("regex", {})
         if regex:
             for field, pattern in regex.items():
-                value = str(event.get(field, ""))
+                value = str(self._get_event_field(event, field, ""))
                 if re.search(str(pattern), value) is None:
                     return False
 
         contains_any = cond.get("contains_any", {})
         if contains_any:
             for field, expected in contains_any.items():
-                haystack = str(event.get(field, "")).lower()
+                haystack = str(self._get_event_field(event, field, "")).lower()
                 words = [str(item).lower() for item in expected] if isinstance(expected, list) else [str(expected).lower()]
                 if not any(word in haystack for word in words):
                     return False
@@ -104,6 +115,10 @@ class RuleEngine:
         if sigma and not self._evaluate_sigma_like(sigma, event):
             return False
 
+        additional_checks = cond.get("additional_checks", [])
+        if additional_checks and not self._check_additional_checks(additional_checks, event):
+            return False
+
         return True
 
     def _evaluate_yara_like(self, yara_like: dict[str, Any], event: dict[str, Any]) -> bool:
@@ -111,7 +126,7 @@ class RuleEngine:
         strings = yara_like.get("strings", [])
         min_hits = int(yara_like.get("min_hits", 1))
 
-        haystack = " ".join(str(event.get(field, "")) for field in fields).lower()
+        haystack = " ".join(str(self._get_event_field(event, field, "")) for field in fields).lower()
         hits = 0
         for token in strings:
             if str(token).lower() in haystack:
@@ -133,7 +148,7 @@ class RuleEngine:
 
     def _match_selector(self, selector: dict[str, Any], event: dict[str, Any]) -> bool:
         for field, expected in selector.items():
-            value = event.get(field)
+            value = self._get_event_field(event, field)
             if isinstance(expected, dict):
                 for op, cond in expected.items():
                     if not self._match_operator(op, value, cond):
@@ -222,6 +237,119 @@ class RuleEngine:
         unique_identities = {ident for ident, _ in under_threshold}
         aggregate_velocity = sum(api for _, api in under_threshold)
         return len(unique_identities) >= min_identities and aggregate_velocity >= min_total
+
+    def _check_long_window_accumulation(
+        self,
+        rule: dict[str, Any],
+        condition: dict[str, Any],
+        event: dict[str, Any],
+        event_time: datetime,
+    ) -> bool:
+        metric = str(condition.get("metric", "egress_mb"))
+        value = self._safe_float(event.get(metric), default=0.0)
+        identity_fields = condition.get("identity_fields", ["host", "user", "process"])
+        identity = "|".join(str(event.get(field, "unknown")).strip().lower() for field in identity_fields)
+        history_key = (rule.get("title", "unnamed_rule"), identity, metric)
+        history = self._metric_history[history_key]
+
+        window = timedelta(seconds=int(condition.get("window_seconds", 21600)))
+        while history and (event_time - history[0][0]) > window:
+            history.popleft()
+
+        max_per_event = float(condition.get("max_per_event", float("inf")))
+        recent_values = [sample for _, sample in history if sample <= max_per_event]
+        cumulative = sum(recent_values)
+        min_total = float(condition.get("min_total", 256.0))
+        min_events = int(condition.get("min_events", 12))
+        triggered = len(recent_values) >= min_events and cumulative >= min_total
+
+        history.append((event_time, value))
+        return triggered
+
+    def _check_field_entropy(self, condition: dict[str, Any], event: dict[str, Any]) -> bool:
+        fields = condition.get("fields", ["resource", "metadata", "output"])
+        min_length = int(condition.get("min_length", 48))
+        threshold = float(condition.get("min_entropy", 4.2))
+        min_fields = int(condition.get("min_fields", 1))
+
+        matches = 0
+        for field in fields:
+            value = str(self._get_event_field(event, field, ""))
+            if len(value) < min_length:
+                continue
+            if self._shannon_entropy(value) >= threshold:
+                matches += 1
+
+        return matches >= min_fields
+
+    @staticmethod
+    def _shannon_entropy(value: str) -> float:
+        if not value:
+            return 0.0
+        counts = Counter(value)
+        total = len(value)
+        entropy = 0.0
+        for count in counts.values():
+            prob = count / total
+            entropy -= prob * math.log2(prob)
+        return entropy
+
+
+    def _check_windowed_count(
+        self,
+        rule: dict[str, Any],
+        condition: dict[str, Any],
+        event: dict[str, Any],
+        event_time: datetime,
+    ) -> bool:
+        field = str(condition.get("field", "resource"))
+        identity_field = str(condition.get("identity_field", "host"))
+        value = str(self._get_event_field(event, field, "")).strip().lower()
+        identity = str(self._get_event_field(event, identity_field, "unknown")).strip().lower()
+        if not value:
+            return False
+
+        key = (rule.get("title", "unnamed_rule"), f"{identity}:{field}")
+        history = self._field_windows[key]
+        window = timedelta(seconds=int(condition.get("window_seconds", 3600)))
+        while history and (event_time - history[0][0]) > window:
+            history.popleft()
+
+        history.append((event_time, value))
+        count_threshold = int(condition.get("count_threshold", 200))
+        min_distinct = int(condition.get("min_distinct_values", 1))
+        distinct_values = len({entry for _, entry in history})
+        return len(history) >= count_threshold and distinct_values >= min_distinct
+
+    def _check_additional_checks(self, checks: list[dict[str, Any]], event: dict[str, Any]) -> bool:
+        if not isinstance(checks, list) or not checks:
+            return True
+        for check in checks:
+            if not isinstance(check, dict):
+                return False
+            field = str(check.get("field", ""))
+            if not field:
+                return False
+            value = self._get_event_field(event, field)
+            if "equals" in check and value != check["equals"]:
+                return False
+            if "greater_than" in check and self._safe_float(value, 0.0) <= self._safe_float(check["greater_than"], 0.0):
+                return False
+            if "contains" in check and str(check["contains"]).lower() not in str(value or "").lower():
+                return False
+        return True
+
+    @staticmethod
+    def _get_event_field(event: dict[str, Any], field: str, default: Any = None) -> Any:
+        if field in event:
+            return event.get(field, default)
+        cursor: Any = event
+        for part in field.split("."):
+            if isinstance(cursor, dict) and part in cursor:
+                cursor = cursor[part]
+            else:
+                return default
+        return cursor
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:

@@ -7,6 +7,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from sentinel_containment.security.peer_mesh import (
     CloudAttestationVerifier,
     FriendlyPeerRegistry,
+    MeshCheckpointLedger,
     PeerVerificationMesh,
     TPMQuoteVerifier,
 )
@@ -102,3 +103,69 @@ def test_peer_mesh_requires_external_attestation_verifiers():
     assert tampered.ok is False
     assert any("tpm_quote:tpm_measurement_mismatch" in f["reason"] for f in tampered.failures)
     assert any("cloud_attestation:untrusted_cloud_issuer" in f["reason"] for f in tampered.failures)
+
+
+def test_checkpoint_ledger_requires_quorum_and_monotonic_seq_with_replay_protection():
+    mesh = PeerVerificationMesh({"a": "ka", "b": "kb", "c": "kc"})
+    ledger = MeshCheckpointLedger(mesh, quorum_size=2, replication_targets=["ra", "rb"])
+
+    chk1 = ledger.create_checkpoint(entries=[{"k": 1}], signer_ids=["a", "b"])
+    ok1 = ledger.validate_checkpoint(chk1)
+    assert ok1.accepted is True
+    assert ok1.quorum_met is True
+
+    # Replay same checkpoint must fail for seq regression/nonce replay
+    replay = ledger.validate_checkpoint(chk1)
+    assert replay.accepted is False
+    assert any(reason in replay.reasons for reason in ["seq_replay_or_regression", "nonce_replay_detected"])
+
+    # Gap in seq must be rejected when sequential mode is on
+    chk_gap = ledger.create_checkpoint(entries=[{"k": 2}], signer_ids=["a", "b"])
+    chk_gap = chk_gap.__class__(
+        seq_no=chk_gap.seq_no + 1,
+        epoch=chk_gap.epoch,
+        nonce=chk_gap.nonce,
+        created_at=chk_gap.created_at,
+        prev_checkpoint_hash=chk_gap.prev_checkpoint_hash,
+        merkle_root=chk_gap.merkle_root,
+        entry_count=chk_gap.entry_count,
+        signer_ids=chk_gap.signer_ids,
+        signatures=chk_gap.signatures,
+        replication_targets=chk_gap.replication_targets,
+    )
+    res_gap = ledger.validate_checkpoint(chk_gap)
+    assert res_gap.accepted is False
+    assert "seq_gap_detected" in res_gap.reasons
+
+
+def test_checkpoint_ledger_rejects_revoked_signer_and_detects_split_brain():
+    mesh = PeerVerificationMesh({"a": "ka", "b": "kb", "c": "kc"})
+    ledger = MeshCheckpointLedger(mesh, quorum_size=2)
+
+    chk1 = ledger.create_checkpoint(entries=[{"x": 1}], signer_ids=["a", "b"])
+    assert ledger.validate_checkpoint(chk1).accepted is True
+
+    ledger.revoke_peer("b", "compromised")
+    chk2 = ledger.create_checkpoint(entries=[{"x": 2}], signer_ids=["a", "b"])
+    res2 = ledger.validate_checkpoint(chk2)
+    assert res2.accepted is False
+    assert any(reason.startswith("revoked_signer:b") for reason in res2.reasons)
+
+    # Simulate split-brain gossip for same seq_no with different checkpoint hash
+    chk3 = ledger.create_checkpoint(entries=[{"x": 3}], signer_ids=["a", "c"])
+    assert ledger.validate_checkpoint(chk3).accepted is True
+    alt = ledger.create_checkpoint(entries=[{"x": 999}], signer_ids=["a", "c"])
+    alt = alt.__class__(
+        seq_no=chk3.seq_no,
+        epoch=chk3.epoch,
+        nonce=alt.nonce,
+        created_at=alt.created_at,
+        prev_checkpoint_hash=chk3.prev_checkpoint_hash,
+        merkle_root=alt.merkle_root,
+        entry_count=alt.entry_count,
+        signer_ids=alt.signer_ids,
+        signatures=alt.signatures,
+        replication_targets=alt.replication_targets,
+    )
+    gossip = ledger.gossip_observe(alt, source_peer="peer-z")
+    assert "split_brain_checkpoint_detected" in gossip.reasons

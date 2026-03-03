@@ -4,6 +4,7 @@ from sentinel_containment.security.peer_mesh import (
     CloudAttestationVerifier,
     ExternalAttestationVerifier,
     FriendlyPeerRegistry,
+    MeshCheckpointLedger,
     PeerVerificationMesh,
     TPMQuoteVerifier,
 )
@@ -12,6 +13,7 @@ __all__ = [
     "HardwareKeyVerifier",
     "HumanConfirmationVerifier",
     "PeerVerificationMesh",
+    "MeshCheckpointLedger",
     "FriendlyPeerRegistry",
     "ExternalAttestationVerifier",
     "TPMQuoteVerifier",
