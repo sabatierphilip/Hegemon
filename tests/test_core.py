@@ -1445,6 +1445,58 @@ def test_run_cycle_emits_level_three_hunting_directives(tmp_path):
     assert any(r["action"] == "neutralize_liespots" for r in state["counter_clone_execution"])
 
 
+
+
+def test_mirror_clone_generates_level_four_continuous_directives():
+    detector = MirrorCloneDetector(warmup_events=1)
+    events = [
+        {"host": "hunt-l4", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "prod-cluster"},
+        {"host": "hunt-l4", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-l4", "user": "svc", "process": "agent", "action": "sandbox_escape", "resource": "runtime"},
+        {"host": "hunt-l4", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+        {"host": "hunt-l4", "user": "svc", "process": "agent", "action": "network_send", "resource": "203.0.113.5"},
+    ]
+    for event in events:
+        detector.evaluate(event)
+
+    directives = detector.generate_level_four_continuous_directives(max_directives=2, min_dominance_score=0.2)
+
+    assert directives
+    assert directives[0].dominance_score >= 0.2
+    actions = detector.execute_level_four_directive(directives[0])
+    assert any(a.action == "deploy_level4_persistent_hunter_mesh" for a in actions)
+    assert any(a.action == "continuous_predictive_hunt_loop" for a in actions)
+
+
+def test_run_cycle_emits_level_four_continuous_directives(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    for event in [
+        {"host": "hunt-l4-run", "user": "svc", "process": "agent", "action": "container_spawn", "resource": "prod-cluster"},
+        {"host": "hunt-l4-run", "user": "svc", "process": "agent", "action": "iam_privilege_change", "resource": "role-admin"},
+        {"host": "hunt-l4-run", "user": "svc", "process": "agent", "action": "sandbox_escape", "resource": "runtime"},
+        {"host": "hunt-l4-run", "user": "svc", "process": "agent", "action": "autonomous_replication", "resource": "https://mesh"},
+    ]:
+        ingestor.ingest("model_api", event)
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "clone_warmup_events": 1,
+                "level_four_min_dominance_score": 0.2,
+            }
+        )
+    )
+
+    assert state["level_four_continuous_directives"]
+    assert any(a["action"] == "deploy_level4_persistent_hunter_mesh" for a in state["counter_clone_actions"])
+    assert any(r["action"] == "continuous_predictive_hunt_loop" for r in state["counter_clone_execution"])
+
 def test_baseline_ignores_non_numeric_metrics_without_crashing():
     baseline = BehavioralBaseline(threshold=2.0, window=10, min_history=2)
 

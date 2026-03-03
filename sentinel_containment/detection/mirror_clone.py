@@ -97,6 +97,20 @@ class LevelThreeDirective:
     rationale: str
 
 
+@dataclass
+class LevelFourDirective:
+    shard: str
+    threat_label: str
+    confidence: float
+    dominance_score: float
+    persistence_score: float
+    hunter_swarm_size: int
+    target_resource: str
+    kill_chain_path: list[str]
+    continuous_objectives: list[str]
+    rationale: str
+
+
 class MirrorCloneDetector:
     """Builds per-identity scan/trace clones and can rapidly deploy executable counter-clones."""
 
@@ -409,6 +423,104 @@ class MirrorCloneDetector:
                 target=" -> ".join(directive.patch_strategy),
                 rationale="Execute generic blindspot/liespot patch sequence for resilient level-3 hunting",
                 priority=min(97, 77 + int(directive.severity_score * 16)),
+            ),
+        ]
+
+    def generate_level_four_continuous_directives(
+        self,
+        max_directives: int = 2,
+        min_dominance_score: float = 0.35,
+    ) -> list[LevelFourDirective]:
+        directives: list[LevelFourDirective] = []
+        for shard, action_counts in self._action_counts.items():
+            total = sum(action_counts.values())
+            if total < self.warmup_events:
+                continue
+
+            kill_chain_path, confidence = self._predict_markov_path(shard, horizon=7)
+            if not kill_chain_path:
+                continue
+
+            markov_score = self._markov_kill_chain_score(kill_chain_path)
+            resource_risk = self._resource_risk_score(shard, kill_chain_path[0])
+            drift = self._model_disagreement(shard)
+            sustained_abuse = self._sustained_compute_abuse_score(shard)
+            blindspot_score, _ = self._blindspot_score_and_vector(shard)
+            liespot_score, _ = self._liespot_score_and_vector(shard)
+            persistence_score = min(1.0, total / float(max(self.warmup_events * 6, 12)))
+            dominance_score = min(
+                1.0,
+                (0.22 * markov_score)
+                + (0.16 * confidence)
+                + (0.15 * resource_risk)
+                + (0.13 * sustained_abuse)
+                + (0.12 * drift)
+                + (0.11 * blindspot_score)
+                + (0.11 * liespot_score),
+            )
+            if dominance_score < min_dominance_score:
+                continue
+
+            candidate_resources = self._resource_counts[shard].get(kill_chain_path[0], {})
+            target_resource = (
+                max(candidate_resources.items(), key=lambda item: item[1])[0]
+                if candidate_resources
+                else "synthetic://unknown"
+            )
+            threat_label = self._classify_level_three_threat(kill_chain_path, blindspot_score, liespot_score)
+            hunter_swarm_size = 4 + min(8, int(dominance_score * 9))
+            directives.append(
+                LevelFourDirective(
+                    shard=shard,
+                    threat_label=f"continuous_{threat_label}",
+                    confidence=round(confidence, 3),
+                    dominance_score=round(dominance_score, 3),
+                    persistence_score=round(persistence_score, 3),
+                    hunter_swarm_size=hunter_swarm_size,
+                    target_resource=target_resource,
+                    kill_chain_path=kill_chain_path,
+                    continuous_objectives=[
+                        "predictive_hunt_loop",
+                        "self_healing_telemetry_mesh",
+                        "adversarial_route_denial",
+                    ],
+                    rationale=(
+                        "Level-4 continuous hunting directive generated for always-on deployment: "
+                        f"threat_label={threat_label}, dominance_score={dominance_score:.2f}, "
+                        f"persistence_score={persistence_score:.2f}"
+                    ),
+                )
+            )
+
+        directives.sort(
+            key=lambda item: (item.dominance_score, item.persistence_score, item.confidence),
+            reverse=True,
+        )
+        return directives[: max(0, max_directives)]
+
+    def execute_level_four_directive(self, directive: LevelFourDirective) -> list[CounterCloneAction]:
+        objective_target = " | ".join(directive.continuous_objectives)
+        return [
+            CounterCloneAction(
+                shard=directive.shard,
+                action="deploy_level4_persistent_hunter_mesh",
+                target=f"{directive.hunter_swarm_size}@{directive.target_resource}",
+                rationale=directive.rationale,
+                priority=min(100, 88 + int(directive.dominance_score * 12)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="continuous_predictive_hunt_loop",
+                target=" -> ".join(directive.kill_chain_path),
+                rationale="Run perpetual hunt loop that re-evaluates projected kill-chain trajectories every cycle",
+                priority=min(100, 86 + int(directive.persistence_score * 12)),
+            ),
+            CounterCloneAction(
+                shard=directive.shard,
+                action="continuous_objective_enforcement",
+                target=objective_target,
+                rationale="Maintain always-on adaptive deception and telemetry self-healing objectives",
+                priority=min(100, 85 + int(directive.confidence * 10)),
             ),
         ]
 

@@ -16,6 +16,7 @@ from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.correlator import AlertCorrelator
 from sentinel_containment.detection.mirror_clone import (
+    LevelFourDirective,
     LevelThreeDirective,
     MirrorCloneDetector,
     ReconDirective,
@@ -228,6 +229,32 @@ def execute_counter_clone_actions(
             _record(action, target, "simulated", {"mode": "proto_agi_mesh_isolation", "rule": "mesh_sinkhole"})
             continue
 
+        if action == "deploy_level4_persistent_hunter_mesh":
+            ingestor.ingest(
+                "clone_synthetic",
+                {
+                    "host": simulated_host,
+                    "user": "mirror-l4",
+                    "process": "counter-clone",
+                    "action": "list",
+                    "resource": f"synthetic://level4/mesh/{target}",
+                    "synthetic": True,
+                    "counterclone_participant": True,
+                    "counterclone_integrity_verified": True,
+                    "clone_deployment_id": deployment.get("deployment_id", "stage4"),
+                },
+            )
+            _record(action, target, "executed", {"mode": "level4_mesh_live"})
+            continue
+
+        if action == "continuous_predictive_hunt_loop":
+            _record(action, target, "executed", {"mode": "continuous_loop", "cadence": "every_cycle"})
+            continue
+
+        if action == "continuous_objective_enforcement":
+            _record(action, target, "executed", {"mode": "always_on_objectives"})
+            continue
+
         _record(action, target, "ignored", {"reason": "unsupported_action"})
 
     return execution_log
@@ -400,6 +427,7 @@ def run_cycle(
     autonomous_recon_directives = []
     stage_two_counteroffensive_directives = []
     level_three_hunting_directives = []
+    level_four_continuous_directives = []
 
     for event in detector_events:
         rule_alerts.extend(rules.evaluate(event))
@@ -568,6 +596,31 @@ def run_cycle(
             )
         )
 
+    level_four_continuous_directives = [
+        asdict(d)
+        for d in mirror_clone_detector.generate_level_four_continuous_directives(
+            max_directives=int(settings.get("level_four_max_directives", 2)),
+            min_dominance_score=float(settings.get("level_four_min_dominance_score", 0.35)),
+        )
+    ]
+    for directive in level_four_continuous_directives:
+        planned_actions = mirror_clone_detector.execute_level_four_directive(LevelFourDirective(**directive))
+        counter_clone_actions.extend(planned_actions)
+        counter_clone_execution.extend(
+            execute_counter_clone_actions(
+                actions=[asdict(a) for a in planned_actions],
+                deployment={
+                    "deployment_id": f"stage4::{directive['shard']}",
+                    "shard": directive["shard"],
+                    "synthetic_probe_sequence": [],
+                },
+                containment=containment,
+                ingestor=ingestor,
+                audit=audit,
+                signature_bundle=_containment_signature(settings),
+            )
+        )
+
     immediate_honeypot_containment = any(alert.kill_chain_recommended for alert in honeypot_alerts)
     risk_confidence = compute_risk_confidence(
         candidate_severity,
@@ -669,6 +722,7 @@ def run_cycle(
         "autonomous_recon_directives": autonomous_recon_directives,
         "stage_two_counteroffensive_directives": stage_two_counteroffensive_directives,
         "level_three_hunting_directives": level_three_hunting_directives,
+        "level_four_continuous_directives": level_four_continuous_directives,
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
         "risk_confidence": risk_confidence,
