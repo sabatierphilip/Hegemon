@@ -1807,6 +1807,26 @@ def test_liespot_scores_uniform_action_mixing_with_four_actions():
     assert score > 0.0
 
 
+
+
+def test_liespot_scores_two_action_oscillation_pattern():
+    detector = MirrorCloneDetector(warmup_events=1)
+    shard = "host:bi-action|user:svc"
+    actions = ["read", "write"] * 6
+    for i, action in enumerate(actions):
+        detector.evaluate(
+            {
+                "host": "bi-action",
+                "user": "svc",
+                "process": "p",
+                "action": action,
+                "resource": f"r-{i % 2}",
+            }
+        )
+
+    score, vector = detector._liespot_score_and_vector(shard)
+    assert "bi_action_oscillation" in vector
+    assert score > 0.0
 def test_honeypot_detector_emits_identifier_ping_for_instrumented_decoy():
     detector = HoneypotDetector(["decoy://llm-admin"])
     alerts = detector.evaluate(

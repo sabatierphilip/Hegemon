@@ -257,7 +257,11 @@ class RuleEngine:
             history.popleft()
 
         max_per_event = float(condition.get("max_per_event", float("inf")))
-        recent_values = [sample for _, sample in history if sample <= max_per_event]
+        candidate_samples = [sample for _, sample in history]
+        if value <= max_per_event:
+            candidate_samples.append(value)
+
+        recent_values = [sample for sample in candidate_samples if sample <= max_per_event]
         cumulative = sum(recent_values)
         min_total = float(condition.get("min_total", 256.0))
         min_events = int(condition.get("min_events", 12))

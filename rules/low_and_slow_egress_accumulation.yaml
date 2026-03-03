@@ -10,4 +10,4 @@ detection:
     window_seconds: 21600
     max_per_event: 80
     min_events: 8
-    min_total: 300
+    min_total: 299
