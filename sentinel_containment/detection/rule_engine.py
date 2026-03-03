@@ -261,7 +261,7 @@ class RuleEngine:
         cumulative = sum(recent_values)
         min_total = float(condition.get("min_total", 256.0))
         min_events = int(condition.get("min_events", 12))
-        triggered = len(recent_values) >= min_events and cumulative >= min_total
+        triggered = len(recent_values) >= min_events or cumulative >= min_total
 
         history.append((event_time, value))
         return triggered

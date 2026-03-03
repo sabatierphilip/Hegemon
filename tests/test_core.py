@@ -1740,3 +1740,15 @@ def test_liespot_scores_uniform_action_mixing():
     score, vector = detector._liespot_score_and_vector(shard)
     assert "uniform_action_mixing" in vector
     assert score > 0.0
+
+
+def test_liespot_scores_uniform_action_mixing_with_four_actions():
+    detector = MirrorCloneDetector(warmup_events=1)
+    shard = "host:uniform4|user:svc"
+    actions = ["read", "write", "exec", "network_send"] * 4
+    for action in actions:
+        detector.evaluate({"host": "uniform4", "user": "svc", "process": "p", "action": action, "resource": "r"})
+
+    score, vector = detector._liespot_score_and_vector(shard)
+    assert "uniform_action_mixing" in vector
+    assert score > 0.0

@@ -953,7 +953,7 @@ class MirrorCloneDetector:
                 entropy -= probability * log2(probability)
         max_entropy = log2(max(1, len(action_distribution))) if action_distribution else 0.0
         normalized_entropy = (entropy / max_entropy) if max_entropy > 0 else 0.0
-        if len(action_distribution) >= 5 and normalized_entropy >= 0.95:
+        if len(action_distribution) >= 3 and normalized_entropy >= 0.95:
             vector.append("uniform_action_mixing")
 
         score = min(
