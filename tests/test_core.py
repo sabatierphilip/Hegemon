@@ -1550,6 +1550,14 @@ def test_run_cycle_emits_level_five_hunter_directives(tmp_path):
     assert any(a["action"] == "deploy_level5_hunter_directive_mesh" for a in state["counter_clone_actions"])
     assert any(r["action"] == "broadcast_global_hunter_actions" for r in state["counter_clone_execution"])
 
+    spawn_execution = next(r for r in state["counter_clone_execution"] if r["action"] == "spawn_level5_counter_clones")
+    assert spawn_execution["status"] == "executed"
+    assert spawn_execution["details"]["path_steps"]
+
+    mesh_execution = next(r for r in state["counter_clone_execution"] if r["action"] == "deploy_level5_hunter_directive_mesh")
+    assert mesh_execution["status"] == "executed"
+    assert mesh_execution["details"]["swarm_size"] >= 1
+
 def test_baseline_ignores_non_numeric_metrics_without_crashing():
     baseline = BehavioralBaseline(threshold=2.0, window=10, min_history=2)
 

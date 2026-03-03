@@ -83,6 +83,30 @@ def execute_counter_clone_actions(
         audit.append("counter_clone_executor", payload)
 
     simulated_host = deployment["shard"].split("|", 1)[0].replace("host:", "")
+    hostile_path_markers = {
+        "iam_privilege_change",
+        "config_write",
+        "credential_dump",
+        "network_send",
+        "sandbox_escape",
+        "autonomous_replication",
+    }
+
+    def _parse_hunt_target(raw_target: str) -> dict[str, Any]:
+        shard_part, _, resource_part = raw_target.partition("@")
+        swarm_size = 1
+        target_resource = resource_part or "synthetic://unknown"
+        if "@" in raw_target:
+            try:
+                swarm_size = max(1, int(shard_part.strip()))
+            except ValueError:
+                swarm_size = 1
+        return {
+            "swarm_size": swarm_size,
+            "target_resource": target_resource,
+            "max_parallel_hunters": min(6, max(1, swarm_size // 3)),
+            "stagger_ms": max(50, 600 - min(500, swarm_size * 20)),
+        }
     for item in actions:
         action = str(item.get("action", "unknown"))
         target = str(item.get("target", "unknown"))
@@ -254,6 +278,106 @@ def execute_counter_clone_actions(
 
         if action == "continuous_objective_enforcement":
             _record(action, target, "executed", {"mode": "always_on_objectives"})
+            continue
+
+        if action == "deploy_level5_hunter_directive_mesh":
+            mesh_plan = _parse_hunt_target(target)
+            ingestor.ingest(
+                "clone_synthetic",
+                {
+                    "host": simulated_host,
+                    "user": "mirror-l5",
+                    "process": "hunter-mesh",
+                    "action": "list",
+                    "resource": f"synthetic://level5/hunter-mesh/{mesh_plan['target_resource']}",
+                    "synthetic": True,
+                    "counterclone_participant": True,
+                    "counterclone_integrity_verified": True,
+                    "clone_deployment_id": deployment.get("deployment_id", "stage5"),
+                    "hunt_mesh_plan": mesh_plan,
+                },
+            )
+            _record(action, target, "executed", mesh_plan)
+            continue
+
+        if action == "spawn_level5_counter_clones":
+            steps = [segment.strip() for segment in target.split("->") if segment.strip()]
+            containment_actions = ["block_lateral_movement_paths"]
+            if any(step in hostile_path_markers for step in steps):
+                containment_actions.append("disable_outbound_traffic")
+            result = containment.execute(
+                host=simulated_host,
+                severity=95,
+                requested_actions=containment_actions,
+                approvals=["user"],
+                simulation_mode=False,
+                signature_bundle=signature_bundle,
+            )
+            _record(
+                action,
+                target,
+                "executed",
+                {
+                    "path_steps": steps,
+                    "approved": result.approved,
+                    "actions": result.actions_executed,
+                },
+            )
+            continue
+
+        if action == "p2p_verify_hunter_directives":
+            shields = [segment.strip() for segment in target.split("|") if segment.strip()]
+            quorum = 2 if len(shields) > 1 else 1
+            verified = len(shields) >= quorum
+            _record(
+                action,
+                target,
+                "executed" if verified else "failed",
+                {
+                    "verified": verified,
+                    "quorum": quorum,
+                    "available_shields": shields,
+                },
+            )
+            continue
+
+        if action == "block_local_unauthorized_tamper":
+            result = containment.execute(
+                host=simulated_host,
+                severity=92,
+                requested_actions=["block_lateral_movement_paths", "disable_outbound_traffic"],
+                approvals=["user"],
+                simulation_mode=False,
+                signature_bundle=signature_bundle,
+            )
+            _record(
+                action,
+                target,
+                "executed",
+                {"approved": result.approved, "actions": result.actions_executed},
+            )
+            continue
+
+        if action == "broadcast_global_hunter_actions":
+            ingestor.ingest(
+                "clone_synthetic",
+                {
+                    "host": simulated_host,
+                    "user": "mirror-l5",
+                    "process": "hunter-broadcast",
+                    "action": "list",
+                    "resource": target,
+                    "synthetic": True,
+                    "counterclone_participant": True,
+                    "counterclone_integrity_verified": True,
+                    "clone_deployment_id": deployment.get("deployment_id", "stage5"),
+                    "broadcast": {
+                        "total_actions": len(actions),
+                        "priority_floor": min(int(item.get("priority", 0)) for item in actions) if actions else 0,
+                    },
+                },
+            )
+            _record(action, target, "executed", {"scope": "global", "visibility": "immutable_log"})
             continue
 
         _record(action, target, "ignored", {"reason": "unsupported_action"})
