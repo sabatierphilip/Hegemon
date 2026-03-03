@@ -175,7 +175,7 @@ class SentinelRuntime:
                 question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
                 fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
             ),
-            action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", False))),
+            action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
         )
         self.fast_lane_containment = ContainmentEngine(
             self.audit,
@@ -191,7 +191,7 @@ class SentinelRuntime:
                 question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
                 fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
             ),
-            action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", False))),
+            action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
         )
 
         extra_sources = {
@@ -363,6 +363,22 @@ class SentinelRuntime:
             self.auto_configure_hardware_keys(True)
         payload = self.get_human_gate_status()
         self.audit.append("human_gate_updated", payload)
+        return payload
+
+    def get_containment_live_mode_status(self) -> dict[str, Any]:
+        return {
+            "containment_live_mode": bool(self.settings.get("containment_live_mode", True)),
+            "completed": True,
+            "details": ["live_containment_enabled"] if bool(self.settings.get("containment_live_mode", True)) else ["live_containment_disabled"],
+        }
+
+    def set_containment_live_mode(self, enabled: bool) -> dict[str, Any]:
+        live_mode = bool(enabled)
+        self.settings.data["containment_live_mode"] = live_mode
+        self.containment.action_executor.active_mode = live_mode
+        self.fast_lane_containment.action_executor.active_mode = live_mode
+        payload = self.get_containment_live_mode_status()
+        self.audit.append("containment_live_mode_updated", payload)
         return payload
 
     def get_containment_decision_status(self) -> dict[str, Any]:
@@ -676,6 +692,7 @@ class SentinelRuntime:
             "token_ready": True,
             "key_policy_ready": bool(policy["key_policy_ready"]),
             "containment_ready": bool(policy["ready"]),
+            "containment_live_mode": bool(self.settings.get("containment_live_mode", True)),
             "startup_warning": self._startup_warning_banner,
             "blocked_reasons": list(policy["blocked_reasons"]),
         }

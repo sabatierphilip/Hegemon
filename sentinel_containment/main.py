@@ -397,7 +397,7 @@ def run_cycle(
         required_approvals=int(settings.get("approval_quorum", 1)),
         hardware_key_verifier=_build_hardware_key_verifier(settings),
         human_confirmation_verifier=_build_human_confirmation_verifier(settings),
-        action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", False))),
+        action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
     )
     blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
@@ -812,7 +812,7 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
         required_approvals=int(settings.get("approval_quorum", 1)),
         hardware_key_verifier=_build_hardware_key_verifier(settings),
         human_confirmation_verifier=_build_human_confirmation_verifier(settings),
-        action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", False))),
+        action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
     )
     while True:
         state = run_cycle(

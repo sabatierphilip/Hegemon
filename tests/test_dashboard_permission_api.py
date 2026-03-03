@@ -425,3 +425,46 @@ def test_incident_drill_api_executes_approved_containment(tmp_path: Path, auth_h
     assert payload["approved"] is True
     assert "quarantine_host" in payload["actions_executed"]
     runtime.ingestion_service.stop()
+
+
+def test_containment_live_mode_toggle_api_defaults_on_and_can_disable(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+
+    client = app.test_client()
+
+    status_response = client.get("/api/containment-live-mode/status", headers=auth_headers)
+    assert status_response.status_code == 200
+    status_payload = status_response.get_json()
+    assert status_payload["containment_live_mode"] is True
+
+    toggle_response = client.post(
+        "/api/containment-live-mode/toggle",
+        json={"containment_live_mode": False},
+        headers=auth_headers,
+    )
+    assert toggle_response.status_code == 200
+    toggle_payload = toggle_response.get_json()
+    assert toggle_payload["containment_live_mode"] is False
+    assert runtime.containment.action_executor.active_mode is False
+    assert runtime.fast_lane_containment.action_executor.active_mode is False
+
+    runtime.ingestion_service.stop()

@@ -48,7 +48,7 @@ Main settings are in `config/config.yaml`:
 - `burst_cycle_severity_threshold`/`burst_cycle_seconds` for sub-minute burst detection cadence during active incidents
 - `containment_severity_threshold` for auto containment
 - `containment_simulation_mode` to stage soft-containment before hard host quarantine (defaults to hard containment-first)
-- `containment_live_mode` to permit live containment execution hooks (default false for safety)
+- `containment_live_mode` to permit live containment execution hooks (default true for immediate high-stakes response; toggleable via dashboard)
 - `force_hard_containment_threshold` and `force_hard_containment_blast_radius` to bypass simulation on high confidence/high blast-radius incidents
 - `hard_quarantine_threshold` to force quarantine at elevated severity
 - `fast_track_containment_threshold`/`fast_track_risk_confidence` for immediate containment based on multi-signal confidence
