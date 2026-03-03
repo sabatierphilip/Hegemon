@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import signal
+import subprocess
 import sys
 import threading
 import webbrowser
+from importlib.util import find_spec
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +17,35 @@ from sentinel_containment.runtime import SentinelRuntime
 from sentinel_containment.web.app import app, set_runtime
 
 
+def _ensure_dependencies_installed() -> None:
+    required_modules = {
+        "flask": "flask",
+        "networkx": "networkx",
+        "PyYAML": "yaml",
+        "cryptography": "cryptography",
+        "boto3": "boto3",
+    }
+    missing = [package for package, module in required_modules.items() if find_spec(module) is None]
+    if not missing:
+        return
+
+    requirements_file = ROOT / "requirements.txt"
+    if not requirements_file.exists():
+        raise RuntimeError(
+            "Missing required dependencies and requirements.txt was not found. "
+            f"Missing packages: {', '.join(missing)}"
+        )
+
+    print(
+        "[start_sentinel] Missing dependencies detected: "
+        f"{', '.join(missing)}. Installing from {requirements_file}..."
+    )
+    install_cmd = [sys.executable, "-m", "pip", "install", "-r", str(requirements_file)]
+    subprocess.run(install_cmd, check=True)
+
+
 if __name__ == "__main__":
+    _ensure_dependencies_installed()
     settings = Settings.load()
     runtime = SentinelRuntime(settings)
     set_runtime(runtime)
