@@ -20,6 +20,7 @@ What starts automatically:
 - Hybrid containment execution engine with safe-by-default simulation plus optional live controls (iptables/nft outbound isolation, AWS IAM deny policy push, DNS sinkhole host mapping)
 - Multi-signal honeypot tripwires with proto-AGI indicator scoring, adversarial tradecraft profiling, and immediate kill/containment chain
 - Level-4 continuously deployed hunting directives that run always-on predictive hunt loops (not trigger-only)
+- Level-5 friendly-integrity hunter directives with P2P directive verification, reactive tamper lockout, and all-action broadcast telemetry
 - Immutable audit logging with immediate out-of-band mirroring support
 - Local-only Flask dashboard (`http://127.0.0.1:5000`) and `/graph` (non-loopback clients are rejected at request level)
 - Startup pre-flight trust-anchor validation with hard warning banner when key policy would block containment
@@ -66,6 +67,7 @@ Main settings are in `config/config.yaml`:
 - `web_rate_*` settings for adaptive event-triggered burst throttling that defends dashboard/API endpoints from request-flood DoS
 - `auto_configure_hardware_keys_on_startup` defaults to `true` so the runtime can self-bootstrap trust anchors for autonomous containment by default
 - `level_four_max_directives`/`level_four_min_dominance_score` to tune continuously deployed level-4 hunting meshes
+- `level_five_max_directives`/`level_five_min_hunter_score` to tune level-5 friendly-integrity hunter meshes
 - `incident_drill_severity` and `drill_auto_configure_hardware_keys` to run deterministic severe-alert drill simulations through the same approval path
 
 
