@@ -125,3 +125,6 @@ peer_verification:
 friendly_enrollment:
   enrollment_user: user
   trusted_user_public_keys: {}
+
+incident_drill_severity: 98
+drill_auto_configure_hardware_keys: true

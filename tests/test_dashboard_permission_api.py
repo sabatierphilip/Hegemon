@@ -358,3 +358,70 @@ def test_dashboard_blocks_state_change_without_local_origin(tmp_path: Path, auth
     response = client.post("/api/telemetry/permission", json={"granted": True}, headers=headers)
     assert response.status_code == 403
     runtime.ingestion_service.stop()
+
+
+def test_readiness_api_reports_token_and_key_policy(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "trusted_hardware_public_keys": {},
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+
+    client = app.test_client()
+    response = client.get("/api/readiness", headers=auth_headers)
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["token_ready"] is True
+    assert payload["key_policy_ready"] is True
+    runtime.ingestion_service.stop()
+
+
+def test_incident_drill_api_executes_approved_containment(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "trusted_hardware_public_keys": {},
+        "human_confirmation_fail_closed": False,
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+
+    client = app.test_client()
+    response = client.post("/api/drill/incident", json={"run": True}, headers=auth_headers)
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["approved"] is True
+    assert "quarantine_host" in payload["actions_executed"]
+    runtime.ingestion_service.stop()
