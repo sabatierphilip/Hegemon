@@ -1,0 +1,13 @@
+title: Low-and-Slow Egress Accumulation
+description: Detects stealthy long-tail data transfer that stays under per-event thresholds but accumulates over time.
+severity: 87
+detection:
+  equals:
+    action: network_send
+  long_window_accumulation:
+    metric: egress_mb
+    identity_fields: [host, user, process]
+    window_seconds: 21600
+    max_per_event: 80
+    min_events: 12
+    min_total: 300

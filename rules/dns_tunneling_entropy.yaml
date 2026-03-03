@@ -1,0 +1,15 @@
+title: Suspicious DNS Tunneling / Encoded Payload
+description: Detects likely covert channels by combining DNS-like actions with high-entropy payload fields.
+severity: 89
+detection:
+  sigma:
+    all_of:
+      - action: { in: ["dns_query", "dns_txt_query", "resolve"] }
+    any_of:
+      - resource: { contains: "." }
+      - process: { contains: "dns" }
+  field_entropy:
+    fields: [resource, metadata]
+    min_length: 52
+    min_entropy: 4.0
+    min_fields: 1

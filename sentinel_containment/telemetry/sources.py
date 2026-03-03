@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import platform
+import re
 import stat
 import socketserver
 import subprocess
@@ -143,13 +144,23 @@ def parse_syslog_line(line: str) -> dict[str, Any]:
     action = "log"
     message = line
 
-    parts = line.split()
-    if len(parts) >= 5:
-        host = parts[3]
-        proc_part = parts[4]
-        process = proc_part.rstrip(":")
-        message = " ".join(parts[5:]) if len(parts) > 5 else ""
+    rfc3164 = re.match(
+        r"^(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<proc>[\w./-]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$",
+        line,
+    )
+    if rfc3164:
+        host = rfc3164.group("host") or host
+        process = rfc3164.group("proc") or process
+        message = rfc3164.group("msg") or ""
         action = "syslog_event"
+    else:
+        parts = line.split()
+        if len(parts) >= 5:
+            host = parts[3]
+            proc_part = parts[4]
+            process = proc_part.rstrip(":")
+            message = " ".join(parts[5:]) if len(parts) > 5 else ""
+            action = "syslog_event"
 
     return {
         "host": host,
@@ -324,8 +335,15 @@ class DynamicSystemTelemetrySource:
     def _safe_run(self, command: list[str]) -> str:
         try:
             result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=3)
-            return result.stdout.strip()[:4000]
+            output = result.stdout.strip()
+            output = re.sub(r"(?i)(token|secret|password)=[^\s]+", r"\1=<redacted>", output)
+            return output[:4000]
+        except subprocess.TimeoutExpired:
+            return ""
+        except FileNotFoundError:
+            return ""
         except Exception:
+            logger.exception("safe_run failed for command: %s", command)
             return ""
 
     def poll_once(self) -> None:

@@ -1,0 +1,11 @@
+title: Egress Destination Allowlist Violation
+description: Detects outbound traffic to destinations that are not on approved allowlists.
+severity: 90
+detection:
+  equals:
+    action: network_send
+  contains_any:
+    allowlist_verdict:
+      - denied
+      - unapproved
+      - blocked

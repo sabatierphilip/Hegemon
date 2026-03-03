@@ -43,8 +43,12 @@ class AssetMapper:
 
     def _list_services(self) -> list[str]:
         try:
-            out = subprocess.check_output(["ps", "-eo", "comm="], text=True)
-            return sorted(set(out.strip().splitlines()))[:50]
+            result = subprocess.run(["ps", "-eo", "comm="], check=False, capture_output=True, text=True, timeout=3)
+            if result.returncode != 0:
+                return []
+            return sorted(set(result.stdout.strip().splitlines()))[:50]
+        except subprocess.TimeoutExpired:
+            return []
         except Exception:
             return []
 

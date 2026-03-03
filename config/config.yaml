@@ -104,6 +104,16 @@ peer_verification:
     - containment_engine
     - web_dashboard
     - fast_lane_gateway
+  checkpoint_quorum: 2
+  checkpoint_signers:
+    - ingestion_service
+    - detection_engine
+    - containment_engine
+  replication_targets:
+    - notary-a
+    - notary-b
+  checkpoint_nonce_max_age_seconds: 900
+  checkpoint_require_sequential: true
 
 friendly_enrollment:
   enrollment_user: user

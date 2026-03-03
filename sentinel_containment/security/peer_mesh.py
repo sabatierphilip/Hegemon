@@ -22,9 +22,45 @@ class PeerAttestationResult:
     external_verification: list[dict[str, Any]]
 
 
-class ExternalAttestationVerifier(ABC):
-    """Provider contract for out-of-band node attestation verification."""
+@dataclass
+class MeshCheckpoint:
+    seq_no: int
+    epoch: int
+    nonce: str
+    created_at: int
+    prev_checkpoint_hash: str
+    merkle_root: str
+    entry_count: int
+    signer_ids: list[str]
+    signatures: dict[str, str]
+    replication_targets: list[str]
 
+    @property
+    def checkpoint_hash(self) -> str:
+        payload = {
+            "seq_no": self.seq_no,
+            "epoch": self.epoch,
+            "nonce": self.nonce,
+            "created_at": self.created_at,
+            "prev_checkpoint_hash": self.prev_checkpoint_hash,
+            "merkle_root": self.merkle_root,
+            "entry_count": self.entry_count,
+            "signer_ids": sorted(self.signer_ids),
+            "replication_targets": sorted(self.replication_targets),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+@dataclass
+class CheckpointValidationResult:
+    accepted: bool
+    reasons: list[str]
+    quorum_met: bool
+    verified_signers: list[str]
+    observed_notaries: int
+
+
+class ExternalAttestationVerifier(ABC):
     provider_name: str
 
     @abstractmethod
@@ -33,8 +69,6 @@ class ExternalAttestationVerifier(ABC):
 
 
 class TPMQuoteVerifier(ExternalAttestationVerifier):
-    """Validates TPM quote-like measurements against expected digests."""
-
     provider_name = "tpm_quote"
 
     def __init__(self, trusted_measurements: dict[str, str]):
@@ -53,8 +87,6 @@ class TPMQuoteVerifier(ExternalAttestationVerifier):
 
 
 class CloudAttestationVerifier(ExternalAttestationVerifier):
-    """Validates cloud-native attestation claims from trusted issuers."""
-
     provider_name = "cloud_attestation"
 
     def __init__(self, trusted_issuers: list[str], required_nonce_prefix: str = "hegemon"):
@@ -103,10 +135,28 @@ class PeerVerificationMesh:
     def add_or_update_peer(self, peer_id: str, peer_key: str) -> None:
         self._process_keys[str(peer_id)] = str(peer_key)
 
-    def _sign(self, peer_id: str, payload: dict[str, Any]) -> str:
+    def remove_peer(self, peer_id: str) -> None:
+        self._process_keys.pop(str(peer_id), None)
+
+    def sign_peer_payload(self, peer_id: str, payload: dict[str, Any]) -> str:
         secret = self._process_keys.get(peer_id, "").encode("utf-8")
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hmac.new(secret, canonical, hashlib.sha256).hexdigest()
+
+    def verify_peer_signature(self, peer_id: str, payload: dict[str, Any], signature: str) -> bool:
+        expected = self.sign_peer_payload(peer_id, payload)
+        return hmac.compare_digest(expected, str(signature).strip())
+
+    def verify_external_peer(self, peer_id: str, evidence_bundle: dict[str, dict[str, Any]] | None) -> tuple[bool, list[dict[str, Any]]]:
+        if not self._external_verifiers:
+            return True, []
+        failures = []
+        for verifier in self._external_verifiers:
+            evidence = (evidence_bundle or {}).get(verifier.provider_name)
+            verified, reason = verifier.verify(peer_id, evidence)
+            if not verified:
+                failures.append({"peer_id": peer_id, "provider": verifier.provider_name, "reason": reason})
+        return not failures, failures
 
     def run_attestation_cycle(
         self,
@@ -132,7 +182,7 @@ class PeerVerificationMesh:
                     "timestamp": int(ts),
                     "scope": "hegemon_p2p_attestation",
                 }
-                expected = self._sign(responder, challenge)
+                expected = self.sign_peer_payload(responder, challenge)
                 observed_key = observed_keys.get(responder, self._process_keys[responder])
                 observed_canonical = json.dumps(challenge, sort_keys=True, separators=(",", ":")).encode("utf-8")
                 observed = hmac.new(str(observed_key).encode("utf-8"), observed_canonical, hashlib.sha256).hexdigest()
@@ -170,6 +220,192 @@ class PeerVerificationMesh:
             failures=failures,
             external_verification=external_verification,
         )
+
+
+class MeshCheckpointLedger:
+    """Quorum-signed, anti-replay P2P checkpoint ledger with gossip cross-notarization."""
+
+    def __init__(
+        self,
+        mesh: PeerVerificationMesh,
+        quorum_size: int,
+        replication_targets: list[str] | None = None,
+        max_nonce_age_seconds: int = 900,
+        require_sequential: bool = True,
+    ):
+        self._mesh = mesh
+        self._quorum_size = max(1, int(quorum_size))
+        self._replication_targets = sorted({str(x).strip() for x in (replication_targets or []) if str(x).strip()})
+        self._max_nonce_age_seconds = max(60, int(max_nonce_age_seconds))
+        self._require_sequential = require_sequential
+        self._last_seq_no = 0
+        self._last_checkpoint_hash = "GENESIS"
+        self._seen_nonces: dict[str, int] = {}
+        self._seq_hash_index: dict[int, str] = {}
+        self._notaries_by_hash: dict[str, set[str]] = {}
+        self._revoked_peers: dict[str, dict[str, Any]] = {}
+        self._epoch = 1
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
+    def revoke_peer(self, peer_id: str, reason: str, revoked_at: int | None = None) -> None:
+        peer = str(peer_id).strip()
+        if not peer:
+            return
+        self._revoked_peers[peer] = {"reason": str(reason), "revoked_at": int(revoked_at or time.time()), "epoch": self._epoch}
+
+    def rotate_peer_key(self, peer_id: str, new_key: str, advance_epoch: bool = True) -> None:
+        self._mesh.add_or_update_peer(str(peer_id).strip(), str(new_key).strip())
+        if advance_epoch:
+            self._epoch += 1
+
+    @staticmethod
+    def _hash_leaf(entry: Any) -> str:
+        raw = json.dumps(entry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    def _merkle_root(self, entries: list[dict[str, Any]]) -> str:
+        if not entries:
+            return hashlib.sha256(b"empty").hexdigest()
+        level = [self._hash_leaf(item) for item in entries]
+        while len(level) > 1:
+            if len(level) % 2 == 1:
+                level.append(level[-1])
+            next_level: list[str] = []
+            for i in range(0, len(level), 2):
+                next_level.append(hashlib.sha256(f"{level[i]}:{level[i+1]}".encode("utf-8")).hexdigest())
+            level = next_level
+        return level[0]
+
+    def _checkpoint_payload(self, checkpoint: MeshCheckpoint) -> dict[str, Any]:
+        return {
+            "scope": "hegemon_p2p_checkpoint",
+            "seq_no": checkpoint.seq_no,
+            "epoch": checkpoint.epoch,
+            "nonce": checkpoint.nonce,
+            "created_at": checkpoint.created_at,
+            "prev_checkpoint_hash": checkpoint.prev_checkpoint_hash,
+            "merkle_root": checkpoint.merkle_root,
+            "entry_count": checkpoint.entry_count,
+            "replication_targets": sorted(checkpoint.replication_targets),
+        }
+
+    def create_checkpoint(
+        self,
+        entries: list[dict[str, Any]],
+        signer_ids: list[str],
+        attestation_bundle: dict[str, dict[str, dict[str, Any]]] | None = None,
+        replication_targets: list[str] | None = None,
+        nonce: str | None = None,
+    ) -> MeshCheckpoint:
+        ts = int(time.time())
+        seq_no = self._last_seq_no + 1
+        checkpoint = MeshCheckpoint(
+            seq_no=seq_no,
+            epoch=self._epoch,
+            nonce=str(nonce or hashlib.sha256(f"{seq_no}:{ts}:{len(entries)}".encode("utf-8")).hexdigest()[:24]),
+            created_at=ts,
+            prev_checkpoint_hash=self._last_checkpoint_hash,
+            merkle_root=self._merkle_root(entries),
+            entry_count=len(entries),
+            signer_ids=sorted({str(s).strip() for s in signer_ids if str(s).strip()}),
+            signatures={},
+            replication_targets=sorted({str(x).strip() for x in (replication_targets or self._replication_targets) if str(x).strip()}),
+        )
+        payload = self._checkpoint_payload(checkpoint)
+        for signer in checkpoint.signer_ids:
+            if signer in self._revoked_peers:
+                continue
+            attested, _ = self._mesh.verify_external_peer(signer, (attestation_bundle or {}).get(signer))
+            if not attested:
+                continue
+            checkpoint.signatures[signer] = self._mesh.sign_peer_payload(signer, payload)
+        return checkpoint
+
+    def validate_checkpoint(
+        self,
+        checkpoint: MeshCheckpoint,
+        attestation_bundle: dict[str, dict[str, dict[str, Any]]] | None = None,
+        observe_state: bool = True,
+        source_peer: str | None = None,
+    ) -> CheckpointValidationResult:
+        reasons: list[str] = []
+        verified_signers: list[str] = []
+
+        if checkpoint.epoch != self._epoch:
+            reasons.append("epoch_mismatch")
+
+        expected_seq = self._last_seq_no + 1
+        if self._require_sequential and checkpoint.seq_no != expected_seq:
+            if checkpoint.seq_no > expected_seq:
+                reasons.append("seq_gap_detected")
+            else:
+                reasons.append("seq_replay_or_regression")
+
+        now_ts = int(time.time())
+        if abs(now_ts - checkpoint.created_at) > self._max_nonce_age_seconds:
+            reasons.append("checkpoint_stale")
+
+        nonce_seen_ts = self._seen_nonces.get(checkpoint.nonce)
+        if nonce_seen_ts is not None and checkpoint.seq_no <= self._last_seq_no:
+            reasons.append("nonce_replay_detected")
+
+        if checkpoint.prev_checkpoint_hash != self._last_checkpoint_hash and checkpoint.seq_no > 1:
+            reasons.append("prev_hash_mismatch")
+
+        payload = self._checkpoint_payload(checkpoint)
+        for signer in checkpoint.signer_ids:
+            if signer in self._revoked_peers:
+                reasons.append(f"revoked_signer:{signer}")
+                continue
+            signature = checkpoint.signatures.get(signer)
+            if not signature:
+                continue
+            if not self._mesh.verify_peer_signature(signer, payload, signature):
+                reasons.append(f"invalid_signature:{signer}")
+                continue
+            attested, failures = self._mesh.verify_external_peer(signer, (attestation_bundle or {}).get(signer))
+            if not attested:
+                reasons.extend(f"attestation_failed:{f['provider']}:{signer}" for f in failures)
+                continue
+            verified_signers.append(signer)
+
+        quorum_met = len(set(verified_signers)) >= self._quorum_size
+        if not quorum_met:
+            reasons.append("quorum_not_met")
+
+        checkpoint_hash = checkpoint.checkpoint_hash
+        notary_set = self._notaries_by_hash.setdefault(checkpoint_hash, set())
+        for signer in verified_signers:
+            notary_set.add(signer)
+        if source_peer:
+            notary_set.add(str(source_peer))
+
+        prior_hash = self._seq_hash_index.get(checkpoint.seq_no)
+        if prior_hash and prior_hash != checkpoint_hash:
+            reasons.append("split_brain_checkpoint_detected")
+
+        accepted = quorum_met and not reasons
+        if observe_state and accepted:
+            self._last_seq_no = checkpoint.seq_no
+            self._last_checkpoint_hash = checkpoint_hash
+            self._seq_hash_index[checkpoint.seq_no] = checkpoint_hash
+            self._seen_nonces[checkpoint.nonce] = checkpoint.created_at
+            cutoff = now_ts - self._max_nonce_age_seconds
+            self._seen_nonces = {k: v for k, v in self._seen_nonces.items() if v >= cutoff}
+
+        return CheckpointValidationResult(
+            accepted=accepted,
+            reasons=sorted(set(reasons)),
+            quorum_met=quorum_met,
+            verified_signers=sorted(set(verified_signers)),
+            observed_notaries=len(notary_set),
+        )
+
+    def gossip_observe(self, checkpoint: MeshCheckpoint, source_peer: str) -> CheckpointValidationResult:
+        return self.validate_checkpoint(checkpoint, observe_state=False, source_peer=source_peer)
 
 
 class FriendlyPeerRegistry:

@@ -34,6 +34,7 @@ from sentinel_containment.security import (
     FriendlyPeerRegistry,
     HardwareKeyVerifier,
     HumanConfirmationVerifier,
+    MeshCheckpointLedger,
     PeerVerificationMesh,
     TPMQuoteVerifier,
 )
@@ -290,6 +291,16 @@ class SentinelRuntime:
         )
         self._peer_verification_interval = float(p2p_cfg.get("interval_seconds", 5.0))
         self._next_peer_verification_due = 0.0
+        self._p2p_signer_ids = [str(pid).strip() for pid in p2p_cfg.get("checkpoint_signers", configured_peer_ids) if str(pid).strip()]
+        self._p2p_replication_targets = [str(x).strip() for x in p2p_cfg.get("replication_targets", configured_peer_ids) if str(x).strip()]
+        self._p2p_attestation_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        self.checkpoint_ledger = MeshCheckpointLedger(
+            self.peer_mesh,
+            quorum_size=int(p2p_cfg.get("checkpoint_quorum", 2)),
+            replication_targets=self._p2p_replication_targets,
+            max_nonce_age_seconds=int(p2p_cfg.get("checkpoint_nonce_max_age_seconds", 900)),
+            require_sequential=bool(p2p_cfg.get("checkpoint_require_sequential", True)),
+        )
 
         friendly_cfg = settings.get("friendly_enrollment", {})
         self.friendly_registry = FriendlyPeerRegistry(
@@ -676,7 +687,8 @@ class SentinelRuntime:
         return payload
 
     def _run_peer_verification(self) -> dict[str, Any]:
-        result = self.peer_mesh.run_attestation_cycle()
+        self._p2p_attestation_cache = self._build_peer_attestation_evidence()
+        result = self.peer_mesh.run_attestation_cycle(external_attestations=self._p2p_attestation_cache)
         payload = {
             "verified": result.ok,
             "verified_pairs": result.verified_pairs,
@@ -699,6 +711,83 @@ class SentinelRuntime:
         )
         if not result.ok:
             self.audit.append("peer_verification_failed", payload)
+        return payload
+
+
+    def _build_peer_attestation_evidence(self) -> dict[str, dict[str, dict[str, Any]]]:
+        p2p_cfg = self.settings.get("peer_verification", {})
+        tpm_refs = p2p_cfg.get("external_tpm_attestation", {}).get("trusted_measurements", {})
+        cloud_cfg = p2p_cfg.get("external_cloud_attestation", {})
+        issuers = cloud_cfg.get("trusted_issuers", [])
+        cloud_issuer = str(issuers[0]) if isinstance(issuers, list) and issuers else ""
+        nonce_prefix = str(cloud_cfg.get("required_nonce_prefix", "hegemon"))
+
+        evidence: dict[str, dict[str, dict[str, Any]]] = {}
+        now = int(time.time())
+        for peer in self.peer_mesh.process_ids:
+            evidence[peer] = {
+                "tpm_quote": {"measurement": str(tpm_refs.get(peer, ""))},
+                "cloud_attestation": {
+                    "issuer": cloud_issuer,
+                    "nonce": f"{nonce_prefix}-{now}-{peer}",
+                    "workload": peer,
+                },
+            }
+        return evidence
+
+    def _checkpoint_critical_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        directive_payload = {
+            "autonomous_recon_directives": state.get("autonomous_recon_directives", []),
+            "stage_two_counteroffensive_directives": state.get("stage_two_counteroffensive_directives", []),
+            "level_three_hunting_directives": state.get("level_three_hunting_directives", []),
+            "counter_clone_actions": state.get("counter_clone_actions", []),
+            "candidate_severity": state.get("candidate_severity", 0),
+            "risk_confidence": state.get("risk_confidence", 0.0),
+        }
+        checkpoint = self.checkpoint_ledger.create_checkpoint(
+            entries=[directive_payload],
+            signer_ids=self._p2p_signer_ids,
+            attestation_bundle=self._p2p_attestation_cache,
+            replication_targets=self._p2p_replication_targets,
+        )
+        validation = self.checkpoint_ledger.validate_checkpoint(
+            checkpoint,
+            attestation_bundle=self._p2p_attestation_cache,
+            observe_state=True,
+        )
+        for target in checkpoint.replication_targets:
+            self.checkpoint_ledger.gossip_observe(checkpoint, source_peer=target)
+
+        payload = {
+            "accepted": validation.accepted,
+            "quorum_met": validation.quorum_met,
+            "reasons": validation.reasons,
+            "verified_signers": validation.verified_signers,
+            "observed_notaries": validation.observed_notaries,
+            "checkpoint": {
+                "seq_no": checkpoint.seq_no,
+                "epoch": checkpoint.epoch,
+                "nonce": checkpoint.nonce,
+                "created_at": checkpoint.created_at,
+                "prev_checkpoint_hash": checkpoint.prev_checkpoint_hash,
+                "merkle_root": checkpoint.merkle_root,
+                "entry_count": checkpoint.entry_count,
+                "signer_ids": checkpoint.signer_ids,
+                "replication_targets": checkpoint.replication_targets,
+                "checkpoint_hash": checkpoint.checkpoint_hash,
+            },
+        }
+
+        critical_directives = bool(
+            state.get("autonomous_recon_directives")
+            or state.get("stage_two_counteroffensive_directives")
+            or state.get("level_three_hunting_directives")
+        )
+        if critical_directives and not validation.accepted:
+            payload["directive_quarantine"] = True
+            state["autonomous_recon_directives"] = []
+            state["stage_two_counteroffensive_directives"] = []
+            state["level_three_hunting_directives"] = []
         return payload
 
     def enroll_friendly_software(
@@ -758,6 +847,7 @@ class SentinelRuntime:
         self._update_containment_decision_from_state(state)
         state["containment_decision"] = self.get_containment_decision_status()
         state["fast_lane_status"] = dict(self.fast_lane_status)
+        state["p2p_checkpoint"] = self._checkpoint_critical_state(state)
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return state

@@ -30,11 +30,14 @@ if __name__ == "__main__":
     runtime.start()
     runtime.run_once()  # prime state immediately
 
-    dashboard_url = f"http://{settings.get('dashboard_host','0.0.0.0').replace('0.0.0.0','localhost')}:{int(settings.get('dashboard_port',5000))}"
+    dashboard_host = str(settings.get('dashboard_host', '127.0.0.1')).strip()
+    if dashboard_host in {'0.0.0.0', '::', '*'}:
+        dashboard_host = '127.0.0.1'
+    dashboard_url = f"http://{dashboard_host}:{int(settings.get('dashboard_port',5000))}"
     threading.Thread(target=lambda: webbrowser.open(dashboard_url), daemon=True).start()
 
     app.run(
-        host=settings.get("dashboard_host", "0.0.0.0"),
+        host=dashboard_host,
         port=int(settings.get("dashboard_port", 5000)),
         debug=False,
     )

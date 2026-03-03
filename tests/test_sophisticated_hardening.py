@@ -87,3 +87,124 @@ def test_containment_executor_records_live_action_results(tmp_path):
     entries = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert entries
     assert "action_results" in entries[-1]
+
+
+def test_long_window_accumulation_detects_low_and_slow_exfil(tmp_path):
+    rules_path = tmp_path / "rules"
+    rules_path.mkdir()
+    (rules_path / "slow.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "title": "Low-slow test",
+                "severity": 87,
+                "detection": {
+                    "equals": {"action": "network_send"},
+                    "long_window_accumulation": {
+                        "metric": "egress_mb",
+                        "identity_fields": ["host", "user", "process"],
+                        "window_seconds": 7200,
+                        "max_per_event": 80,
+                        "min_events": 4,
+                        "min_total": 140,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    engine = RuleEngine(rules_path=rules_path)
+    alerts = []
+    for _ in range(5):
+        alerts = engine.evaluate(
+            {
+                "action": "network_send",
+                "host": "node-a",
+                "user": "svc-worker",
+                "process": "agent",
+                "egress_mb": 40,
+            }
+        )
+
+    assert alerts
+    assert alerts[0].rule == "Low-slow test"
+
+
+def test_field_entropy_flags_dns_tunneling_payload(tmp_path):
+    rules_path = tmp_path / "rules"
+    rules_path.mkdir()
+    (rules_path / "entropy.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "title": "Entropy DNS",
+                "severity": 89,
+                "detection": {
+                    "equals": {"action": "dns_query"},
+                    "field_entropy": {
+                        "fields": ["resource"],
+                        "min_length": 40,
+                        "min_entropy": 3.8,
+                        "min_fields": 1,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    alerts = RuleEngine(rules_path=rules_path).evaluate(
+        {
+            "action": "dns_query",
+            "resource": "x9a2f8q1m7p3k0z5v4t1w8y6u2r9n3c7b5d8f0g2h4j6l.example.com",
+        }
+    )
+    assert alerts
+    assert alerts[0].rule == "Entropy DNS"
+
+
+
+def test_windowed_count_detects_dns_tunneling_pattern(tmp_path):
+    rules_path = tmp_path / "rules"
+    rules_path.mkdir()
+    (rules_path / "dns.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "title": "DNS tunnel test",
+                "severity": 86,
+                "detection": {
+                    "equals": {"action": "dns_query"},
+                    "windowed_count": {
+                        "field": "metadata.dns_query_name",
+                        "identity_field": "host",
+                        "window_seconds": 3600,
+                        "count_threshold": 3,
+                    },
+                    "additional_checks": [
+                        {"field": "metadata.dns_query_length", "greater_than": 30},
+                        {"field": "metadata.dns_record_type", "equals": "TXT"},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    engine = RuleEngine(rules_path=rules_path)
+    alerts = []
+    seen = []
+    for i in range(3):
+        alerts = engine.evaluate(
+            {
+                "action": "dns_query",
+                "host": "node-a",
+                "metadata": {
+                    "dns_query_name": f"x{i}.exfil.example",
+                    "dns_query_length": 70,
+                    "dns_record_type": "TXT",
+                },
+            }
+        )
+        seen.extend(alerts)
+
+    assert seen
+    assert seen[0].rule == "DNS tunnel test"

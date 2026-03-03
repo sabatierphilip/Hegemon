@@ -10,7 +10,7 @@ from sentinel_containment.web.app import app, set_runtime
 @pytest.fixture
 def auth_headers(monkeypatch):
     monkeypatch.setenv("SENTINEL_DASHBOARD_TOKEN", "test-token")
-    return {"Authorization": "Bearer test-token"}
+    return {"Authorization": "Bearer test-token", "Origin": "http://localhost"}
 
 
 def test_permission_api_applies_notice(tmp_path: Path, auth_headers):
@@ -298,4 +298,63 @@ def test_human_gate_toggle_api_defaults_off_and_can_enable(tmp_path: Path, auth_
     disabled_payload = disabled.get_json()
     assert disabled_payload["human_required"] is False
     assert runtime.get_hardware_key_setup_notice()["completed"] is True
+    runtime.ingestion_service.stop()
+
+
+
+def test_dashboard_rejects_non_local_requests(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+
+    client = app.test_client()
+    response = client.get("/api/state", headers=auth_headers, environ_base={"REMOTE_ADDR": "203.0.113.10"})
+    assert response.status_code == 403
+    runtime.ingestion_service.stop()
+
+
+
+def test_dashboard_blocks_state_change_without_local_origin(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+
+    client = app.test_client()
+    headers = {"Authorization": "Bearer test-token", "Origin": "http://evil.example"}
+    response = client.post("/api/telemetry/permission", json={"granted": True}, headers=headers)
+    assert response.status_code == 403
     runtime.ingestion_service.stop()
