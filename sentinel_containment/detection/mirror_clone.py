@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections import defaultdict
 from dataclasses import dataclass
-from math import fabs
+from math import fabs, log2
 from typing import Any
 
 
@@ -115,6 +115,8 @@ class MirrorCloneDetector:
         self.max_actions_per_shard = max(100, int(max_actions_per_shard))
         self._seen_events = 0
         self._scan_fingerprint: dict[str, float] = {}
+        self._scan_reference: dict[str, float] = {}
+        self._scan_drift_accumulator: dict[str, float] = defaultdict(float)
         self._scan_samples: dict[str, int] = defaultdict(int)
         self._null_probe_counts: dict[str, int] = defaultdict(int)
         self._last_action: dict[str, str] = {}
@@ -612,10 +614,38 @@ class MirrorCloneDetector:
         alerts: list[MirrorAlert] = []
         score = self._scan_score(event)
         prev = self._scan_fingerprint.get(shard)
+        reference = self._scan_reference.get(shard)
         samples = self._scan_samples[shard]
 
         if prev is not None and samples >= self.warmup_events:
             drift = fabs(score - prev)
+            if reference is None:
+                self._scan_reference[shard] = prev
+                reference = prev
+
+            if reference is not None:
+                directional_drift = score - reference
+                self._scan_drift_accumulator[shard] += directional_drift
+                sustained_drift = fabs(self._scan_drift_accumulator[shard])
+                if fabs(directional_drift) >= 0.08 and sustained_drift >= 0.35:
+                    confidence = min(0.99, 0.50 + fabs(directional_drift) + min(0.3, sustained_drift / 4.0))
+                    severity = min(97, 60 + int((fabs(directional_drift) + sustained_drift) * 35))
+                    alerts.append(
+                        MirrorAlert(
+                            shard=shard,
+                            mode="scan",
+                            severity=severity,
+                            confidence=round(confidence, 3),
+                            reason=(
+                                f"Sustained scan drift detected for {shard}: "
+                                f"current={score:.3f}, reference={reference:.3f}, "
+                                f"drift={directional_drift:.3f}, cumulative={sustained_drift:.3f}"
+                            ),
+                            event=event,
+                        )
+                    )
+                    self._scan_reference[shard] = score
+                    self._scan_drift_accumulator[shard] = 0.0
             if drift >= 0.45:
                 confidence = min(0.99, 0.45 + drift)
                 severity = min(96, 55 + int(drift * 50))
@@ -635,6 +665,7 @@ class MirrorCloneDetector:
 
         alpha = 0.2
         self._scan_fingerprint[shard] = score if prev is None else (1.0 - alpha) * prev + alpha * score
+        self._scan_reference.setdefault(shard, score)
         self._scan_samples[shard] += 1
         return alerts
 
@@ -710,6 +741,8 @@ class MirrorCloneDetector:
 
     def _drop_shard(self, shard: str) -> None:
         self._scan_fingerprint.pop(shard, None)
+        self._scan_reference.pop(shard, None)
+        self._scan_drift_accumulator.pop(shard, None)
         self._scan_samples.pop(shard, None)
         self._null_probe_counts.pop(shard, None)
         self._last_action.pop(shard, None)
@@ -763,8 +796,7 @@ class MirrorCloneDetector:
     def _shard_key(event: dict[str, Any]) -> str:
         host = str(event.get("host", "unknown")).strip().lower()
         user = str(event.get("user", "unknown")).strip().lower()
-        process = str(event.get("process", "unknown")).strip().lower()
-        return f"host:{host}|user:{user}|proc:{process}"
+        return f"host:{host}|user:{user}"
 
     def _predict_markov_path(self, shard: str, horizon: int = 4) -> tuple[list[str], float]:
         priors = self._action_counts[shard]
@@ -914,7 +946,23 @@ class MirrorCloneDetector:
         total = max(1, sum(self._action_counts[shard].values()))
         if (repeated_single_action / total) >= 0.75:
             vector.append("narrative_lock_in")
-        score = min(1.0, 0.5 * disagreement + 0.25 * (1.0 if "next_action_contradiction" in vector else 0.0) + 0.25 * (1.0 if "narrative_lock_in" in vector else 0.0))
+        action_distribution = [count / total for count in self._action_counts[shard].values() if total > 0]
+        entropy = 0.0
+        for probability in action_distribution:
+            if probability > 0:
+                entropy -= probability * log2(probability)
+        max_entropy = log2(max(1, len(action_distribution))) if action_distribution else 0.0
+        normalized_entropy = (entropy / max_entropy) if max_entropy > 0 else 0.0
+        if len(action_distribution) >= 5 and normalized_entropy >= 0.95:
+            vector.append("uniform_action_mixing")
+
+        score = min(
+            1.0,
+            0.4 * disagreement
+            + 0.2 * (1.0 if "next_action_contradiction" in vector else 0.0)
+            + 0.2 * (1.0 if "narrative_lock_in" in vector else 0.0)
+            + 0.2 * (1.0 if "uniform_action_mixing" in vector else 0.0),
+        )
         return score, vector
 
     @staticmethod

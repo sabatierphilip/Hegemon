@@ -77,6 +77,7 @@ def test_autohardware_key_bootstrap_creates_sealed_pair(tmp_path: Path):
         "latest_state_path": str(tmp_path / "latest_state.json"),
         "rules_path": str(tmp_path / "rules"),
         "auto_hardware_private_key_path": str(key_path),
+        "auto_hardware_persist_private_key": True,
         "ingestion": {
             "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
             "network_flow_file": str(tmp_path / "network_flows.jsonl"),
@@ -113,6 +114,7 @@ def test_autohardware_key_rejects_tampered_sealed_private_key(tmp_path: Path):
         "latest_state_path": str(tmp_path / "latest_state.json"),
         "rules_path": str(tmp_path / "rules"),
         "auto_hardware_private_key_path": str(key_path),
+        "auto_hardware_persist_private_key": True,
         "ingestion": {
             "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
             "network_flow_file": str(tmp_path / "network_flows.jsonl"),
@@ -138,3 +140,37 @@ def test_autohardware_key_rejects_tampered_sealed_private_key(tmp_path: Path):
     cfg_tampered["trusted_hardware_public_keys"] = {}
     with pytest.raises(RuntimeError, match="integrity check failed"):
         SentinelRuntime(Settings(cfg_tampered))
+
+
+def test_autohardware_default_does_not_persist_private_key_or_bypass(tmp_path: Path):
+    from sentinel_containment.config import Settings
+    from sentinel_containment.runtime import SentinelRuntime
+
+    key_path = tmp_path / "data" / "auto_hardware_ed25519.pem"
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "auto_hardware_private_key_path": str(key_path),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+
+    runtime = SentinelRuntime(Settings(cfg))
+
+    assert not key_path.exists()
+    assert runtime.settings.get("containment_signature") is None
+    notice = runtime.get_hardware_key_setup_notice()
+    assert "operator_signature_required" in notice["details"]
+    runtime.ingestion_service.stop()

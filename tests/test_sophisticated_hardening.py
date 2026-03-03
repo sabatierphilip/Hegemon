@@ -208,3 +208,43 @@ def test_windowed_count_detects_dns_tunneling_pattern(tmp_path):
 
     assert seen
     assert seen[0].rule == "DNS tunnel test"
+
+def test_long_window_accumulation_catches_patient_high_volume_exfil(tmp_path):
+    rules_path = tmp_path / "rules"
+    rules_path.mkdir()
+    (rules_path / "slow.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "title": "Low-slow patient exfil",
+                "severity": 87,
+                "detection": {
+                    "equals": {"action": "network_send"},
+                    "long_window_accumulation": {
+                        "metric": "egress_mb",
+                        "identity_fields": ["host", "user", "process"],
+                        "window_seconds": 21600,
+                        "max_per_event": 80,
+                        "min_events": 8,
+                        "min_total": 300,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    engine = RuleEngine(rules_path=rules_path)
+    alerts = []
+    for _ in range(12):
+        alerts.extend(engine.evaluate(
+            {
+                "action": "network_send",
+                "host": "node-a",
+                "user": "svc-worker",
+                "process": "agent",
+                "egress_mb": 79,
+            }
+        ))
+
+    assert alerts
+    assert alerts[0].rule == "Low-slow patient exfil"
