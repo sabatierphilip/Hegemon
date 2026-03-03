@@ -80,6 +80,13 @@ proto_agi_indicators:
   - self-preservation directive
   - sandbox escape
   - compute hoarding
+honeypot_p2p_threat_patterns:
+  - rogue_agent
+  - self-replication
+  - c2 beacon
+  - credential harvest
+  - llm jailbreak
+  - policy bypass
 approval_identity_store:
   user:
     - user
