@@ -4,11 +4,13 @@ import base64
 import http.server
 import json
 import logging
+import os
 import secrets
 import socketserver
 import ssl
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -517,6 +519,81 @@ class SentinelRuntime:
     def get_hardware_key_setup_notice(self) -> dict[str, Any]:
         return dict(self._hardware_key_setup_notice)
 
+    @staticmethod
+    def _sha256_hex(payload: bytes) -> str:
+        import hashlib
+
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _secure_write_new_file(path: Path, payload: bytes) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    def _load_or_create_autohardware_key(self, private_key_path: Path, key_id: str) -> tuple[ed25519.Ed25519PrivateKey, str]:
+        seal_path = private_key_path.with_suffix(f"{private_key_path.suffix}.seal")
+
+        if private_key_path.exists() and seal_path.exists():
+            private_bytes = private_key_path.read_bytes()
+            seal_payload = json.loads(seal_path.read_text(encoding="utf-8"))
+            expected_private_hash = str(seal_payload.get("private_key_sha256", "")).strip()
+            if expected_private_hash != self._sha256_hex(private_bytes):
+                raise RuntimeError("sealed hardware private key integrity check failed")
+            private_key = serialization.load_pem_private_key(private_bytes, password=None)
+            if not isinstance(private_key, ed25519.Ed25519PrivateKey):
+                raise RuntimeError("auto hardware private key is not Ed25519")
+            public_pem = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            ).decode("utf-8")
+            expected_public_hash = str(seal_payload.get("public_key_sha256", "")).strip()
+            if expected_public_hash != self._sha256_hex(public_pem.encode("utf-8")):
+                raise RuntimeError("sealed hardware public key integrity check failed")
+            return private_key, public_pem
+
+        if private_key_path.exists() or seal_path.exists():
+            quarantine_suffix = f".quarantine.{int(time.time())}"
+            if private_key_path.exists():
+                private_key_path.replace(private_key_path.with_name(private_key_path.name + quarantine_suffix))
+            if seal_path.exists():
+                seal_path.replace(seal_path.with_name(seal_path.name + quarantine_suffix))
+
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        private_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        public_pem = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("utf-8")
+        seal_payload = {
+            "version": 1,
+            "key_id": key_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "private_key_sha256": self._sha256_hex(private_bytes),
+            "public_key_sha256": self._sha256_hex(public_pem.encode("utf-8")),
+        }
+        seal_bytes = (json.dumps(seal_payload, sort_keys=True) + "\n").encode("utf-8")
+
+        self._secure_write_new_file(private_key_path, private_bytes)
+        self._secure_write_new_file(seal_path, seal_bytes)
+        return private_key, public_pem
+
     def auto_configure_hardware_keys(self, configure: bool) -> dict[str, Any]:
         if not configure:
             self._hardware_key_setup_notice = {
@@ -544,23 +621,7 @@ class SentinelRuntime:
         key_id = str(self.settings.get("auto_hardware_key_id", "auto-ed25519-local")).strip() or "auto-ed25519-local"
         private_key_path = Path(str(self.settings.get("auto_hardware_private_key_path", "data/auto_hardware_ed25519.pem")))
         private_key_path.parent.mkdir(parents=True, exist_ok=True)
-        if private_key_path.exists():
-            private_bytes = private_key_path.read_bytes()
-            private_key = serialization.load_pem_private_key(private_bytes, password=None)
-        else:
-            private_key = ed25519.Ed25519PrivateKey.generate()
-            private_key_path.write_bytes(
-                private_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-            )
-            private_key_path.chmod(0o600)
-        public_pem = private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        ).decode("utf-8")
+        private_key, public_pem = self._load_or_create_autohardware_key(private_key_path, key_id)
 
         self.fast_lane_containment.hardware_key_verifier.upsert_trusted_public_key(key_id, public_pem)
         auto_signature = private_key.sign(
