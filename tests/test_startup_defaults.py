@@ -131,3 +131,15 @@ def test_incident_drill_passes_with_default_autonomous_keys(tmp_path: Path):
     assert payload["approved"] is True
     assert "quarantine_host" in payload["actions_executed"]
     runtime.ingestion_service.stop()
+
+
+def test_runtime_defaults_containment_live_mode_enabled(tmp_path: Path):
+    cfg = _base_cfg(tmp_path)
+    (tmp_path / "rules").mkdir()
+
+    runtime = SentinelRuntime(Settings(cfg))
+
+    assert runtime.get_containment_live_mode_status()["containment_live_mode"] is True
+    assert runtime.containment.action_executor.active_mode is True
+    assert runtime.fast_lane_containment.action_executor.active_mode is True
+    runtime.ingestion_service.stop()

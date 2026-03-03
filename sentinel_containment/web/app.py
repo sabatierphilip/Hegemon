@@ -211,6 +211,11 @@ HTML = """
       <input id="human-gate-toggle" type="checkbox" />
       Require human confirmation for containment decisions
     </label>
+    <div class="small" id="containment-live-status" style="margin-top:6px;">Live containment toggle status loading.</div>
+    <label class="small" style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+      <input id="containment-live-toggle" type="checkbox" />
+      Enable live containment execution hooks
+    </label>
     <div class="small" id="telemetry-status">Telemetry permission pending.</div>
     <button id="drill-btn" style="margin-top:8px;padding:8px 12px;background:#4a2b6a;color:#e7d7ff;border:1px solid #6b3f96;border-radius:8px;cursor:pointer;">Run Incident Drill</button>
     <div class="small" id="hardware-key-status" style="margin-top:6px;">Hardware key bootstrap check pending.</div>
@@ -359,6 +364,34 @@ async function loadHumanGateStatus(){
 }
 
 
+async function loadContainmentLiveStatus(){
+  const status=document.getElementById("containment-live-status");
+  const toggle=document.getElementById("containment-live-toggle");
+  try{
+    const resp=await fetch("/api/containment-live-mode/status");
+    const payload=await resp.json();
+    if(toggle){toggle.checked=Boolean(payload.containment_live_mode);}
+    if(status){
+      status.textContent = payload.containment_live_mode
+        ? "Live containment is enabled: executor hooks run in active mode."
+        : "Live containment is disabled: executor hooks run in simulation mode.";
+    }
+  }catch(_err){
+    if(status){status.textContent="Containment live-mode status unavailable.";}
+  }
+}
+
+async function updateContainmentLiveMode(enabled){
+  const status=document.getElementById("containment-live-status");
+  const resp=await fetch("/api/containment-live-mode/toggle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({containment_live_mode:enabled})});
+  const payload=await resp.json();
+  if(status){
+    status.textContent = payload.containment_live_mode
+      ? "Live containment is enabled: executor hooks run in active mode."
+      : "Live containment is disabled: executor hooks run in simulation mode.";
+  }
+}
+
 async function runIncidentDrill(){
   const status=document.getElementById("containment-status");
   const resp=await fetch("/api/drill/incident",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:true})});
@@ -390,7 +423,11 @@ document.getElementById("human-gate-toggle")?.addEventListener("change",(event)=
   const target=event.target;
   updateHumanGate(Boolean(target && target.checked));
 });
-window.addEventListener("load",()=>{loadHumanGateStatus(); promptHardwareKeyBootstrap();});
+document.getElementById("containment-live-toggle")?.addEventListener("change",(event)=>{
+  const target=event.target;
+  updateContainmentLiveMode(Boolean(target && target.checked));
+});
+window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap();});
 </script>
 </body>
 </html>
@@ -498,6 +535,7 @@ def _readiness_payload() -> dict[str, object]:
         "token_ready": token_ready,
         "key_policy_ready": bool(runtime_payload.get("key_policy_ready", False)),
         "containment_ready": bool(runtime_payload.get("containment_ready", False)),
+        "containment_live_mode": bool(runtime_payload.get("containment_live_mode", True)),
         "startup_warning": str(runtime_payload.get("startup_warning", "")),
         "blocked_reasons": list(runtime_payload.get("blocked_reasons", [])),
     }
@@ -617,6 +655,32 @@ def human_gate_toggle():
     if _runtime is None:
         return jsonify({"human_required": bool(human_required_value), "completed": False, "details": ["runtime_not_initialized"]}), 503
     return jsonify(_runtime.set_human_gate(bool(human_required_value)))
+
+
+@app.get("/api/containment-live-mode/status")
+def containment_live_mode_status():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if _runtime is None:
+        return jsonify({"containment_live_mode": True, "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.get_containment_live_mode_status())
+
+
+@app.post("/api/containment-live-mode/toggle")
+def containment_live_mode_toggle():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    live_mode_value = payload.get("containment_live_mode", True)
+    if not isinstance(live_mode_value, bool):
+        return jsonify({"error": "invalid_payload", "message": "containment_live_mode must be a boolean"}), 400
+    if _runtime is None:
+        return jsonify({"containment_live_mode": bool(live_mode_value), "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.set_containment_live_mode(bool(live_mode_value)))
 
 
 @app.get("/api/hardware-keys/status")
