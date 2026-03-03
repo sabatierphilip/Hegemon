@@ -1084,6 +1084,16 @@ class MirrorCloneDetector:
         if len(action_distribution) >= 3 and normalized_entropy >= 0.95:
             vector.append("uniform_action_mixing")
 
+        if len(action_distribution) == 2 and normalized_entropy >= 0.98 and total >= 8:
+            transition_peaks = []
+            for source, targets in self._transitions[shard].items():
+                source_total = sum(targets.values())
+                if source_total <= 0:
+                    continue
+                transition_peaks.append(max(targets.values()) / source_total)
+            if transition_peaks and (sum(transition_peaks) / len(transition_peaks)) >= 0.95:
+                vector.append("bi_action_oscillation")
+
         action_count = len(action_counts)
         unique_resources = len(self._unique_resources[shard])
         if action_count <= 1 and unique_resources >= 5:
@@ -1106,6 +1116,7 @@ class MirrorCloneDetector:
             + 0.16 * (1.0 if "narrative_lock_in" in vector else 0.0)
             + 0.16 * (1.0 if "uniform_action_mixing" in vector else 0.0)
             + 0.11 * (1.0 if "resource_action_semantic_drift" in vector else 0.0)
+            + 0.08 * (1.0 if "bi_action_oscillation" in vector else 0.0)
             + 0.11 * (1.0 if "improbable_transition_pressure" in vector else 0.0),
         )
         return score, vector

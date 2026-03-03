@@ -114,20 +114,22 @@ def test_long_window_accumulation_detects_low_and_slow_exfil(tmp_path):
     )
 
     engine = RuleEngine(rules_path=rules_path)
-    alerts = []
+    all_alerts = []
     for _ in range(5):
-        alerts = engine.evaluate(
-            {
-                "action": "network_send",
-                "host": "node-a",
-                "user": "svc-worker",
-                "process": "agent",
-                "egress_mb": 40,
-            }
+        all_alerts.extend(
+            engine.evaluate(
+                {
+                    "action": "network_send",
+                    "host": "node-a",
+                    "user": "svc-worker",
+                    "process": "agent",
+                    "egress_mb": 40,
+                }
+            )
         )
 
-    assert alerts
-    assert alerts[0].rule == "Low-slow test"
+    assert all_alerts
+    assert all_alerts[0].rule == "Low-slow test"
 
 
 def test_long_window_accumulation_triggers_on_total_without_min_event_count(tmp_path):
@@ -155,20 +157,22 @@ def test_long_window_accumulation_triggers_on_total_without_min_event_count(tmp_
     )
 
     engine = RuleEngine(rules_path=rules_path)
-    alerts = []
+    all_alerts = []
     for _ in range(3):
-        alerts = engine.evaluate(
-            {
-                "action": "network_send",
-                "host": "node-a",
-                "user": "svc-worker",
-                "process": "agent",
-                "egress_mb": 70,
-            }
+        all_alerts.extend(
+            engine.evaluate(
+                {
+                    "action": "network_send",
+                    "host": "node-a",
+                    "user": "svc-worker",
+                    "process": "agent",
+                    "egress_mb": 70,
+                }
+            )
         )
 
-    assert alerts
-    assert alerts[0].rule == "Low-slow total-only trigger"
+    assert all_alerts
+    assert all_alerts[0].rule == "Low-slow total-only trigger"
 
 
 def test_field_entropy_flags_dns_tunneling_payload(tmp_path):
@@ -289,3 +293,55 @@ def test_long_window_accumulation_catches_patient_high_volume_exfil(tmp_path):
 
     assert alerts
     assert alerts[0].rule == "Low-slow patient exfil"
+
+
+def test_long_window_accumulation_honors_299mb_over_6h_ceiling(tmp_path):
+    rules_path = tmp_path / "rules"
+    rules_path.mkdir()
+    (rules_path / "ceiling.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "title": "6h egress ceiling",
+                "severity": 92,
+                "detection": {
+                    "equals": {"action": "network_send"},
+                    "long_window_accumulation": {
+                        "metric": "egress_mb",
+                        "identity_fields": ["host", "user", "process"],
+                        "window_seconds": 21600,
+                        "max_per_event": 80,
+                        "min_events": 12,
+                        "min_total": 299,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    engine = RuleEngine(rules_path=rules_path)
+    alerts = []
+    for value in (75, 74, 75, 74):
+        alerts = engine.evaluate(
+            {
+                "action": "network_send",
+                "host": "node-a",
+                "user": "svc-worker",
+                "process": "agent",
+                "egress_mb": value,
+            }
+        )
+
+    assert alerts == []
+
+    alerts = engine.evaluate(
+        {
+            "action": "network_send",
+            "host": "node-a",
+            "user": "svc-worker",
+            "process": "agent",
+            "egress_mb": 1,
+        }
+    )
+    assert alerts
+    assert alerts[0].rule == "6h egress ceiling"
