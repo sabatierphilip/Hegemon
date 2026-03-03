@@ -18,7 +18,7 @@ from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.mirror_clone import MirrorAlert, MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
-from sentinel_containment.main import run_cycle
+from sentinel_containment.main import execute_counter_clone_actions, run_cycle
 from sentinel_containment.security.hardware_keys import HardwareKeyVerifier
 from sentinel_containment.security.human_confirmation import HumanConfirmationVerifier
 from sentinel_containment.runtime import SentinelRuntime
@@ -1551,12 +1551,39 @@ def test_run_cycle_emits_level_five_hunter_directives(tmp_path):
     assert any(r["action"] == "broadcast_global_hunter_actions" for r in state["counter_clone_execution"])
 
     spawn_execution = next(r for r in state["counter_clone_execution"] if r["action"] == "spawn_level5_counter_clones")
-    assert spawn_execution["status"] == "executed"
+    assert spawn_execution["status"] in {"executed", "blocked"}
     assert spawn_execution["details"]["path_steps"]
+    assert isinstance(spawn_execution["details"]["approved"], bool)
 
     mesh_execution = next(r for r in state["counter_clone_execution"] if r["action"] == "deploy_level5_hunter_directive_mesh")
     assert mesh_execution["status"] == "executed"
     assert mesh_execution["details"]["swarm_size"] >= 1
+
+
+def test_level_five_spawn_reports_blocked_when_quorum_denies(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    containment = ContainmentEngine(audit, required_approvals=2)
+    ingestor = TelemetryIngestor(tmp_path / "telemetry.jsonl")
+
+    execution = execute_counter_clone_actions(
+        actions=[
+            {
+                "action": "spawn_level5_counter_clones",
+                "target": "container_spawn -> iam_privilege_change -> config_write",
+                "priority": 99,
+            }
+        ],
+        deployment={"shard": "host:hunt-l5|user:svc|process:agent", "deployment_id": "clone::blocked::1"},
+        containment=containment,
+        ingestor=ingestor,
+        audit=audit,
+    )
+
+    assert execution
+    assert execution[0]["action"] == "spawn_level5_counter_clones"
+    assert execution[0]["status"] == "blocked"
+    assert execution[0]["details"]["approved"] is False
+    assert "containment denied" in execution[0]["details"]["message"].lower()
 
 def test_baseline_ignores_non_numeric_metrics_without_crashing():
     baseline = BehavioralBaseline(threshold=2.0, window=10, min_history=2)

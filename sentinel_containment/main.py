@@ -313,14 +313,16 @@ def execute_counter_clone_actions(
                 simulation_mode=False,
                 signature_bundle=signature_bundle,
             )
+            status = "executed" if result.approved else "blocked"
             _record(
                 action,
                 target,
-                "executed",
+                status,
                 {
                     "path_steps": steps,
                     "approved": result.approved,
                     "actions": result.actions_executed,
+                    "message": result.message,
                 },
             )
             continue
@@ -350,11 +352,12 @@ def execute_counter_clone_actions(
                 simulation_mode=False,
                 signature_bundle=signature_bundle,
             )
+            status = "executed" if result.approved else "blocked"
             _record(
                 action,
                 target,
-                "executed",
-                {"approved": result.approved, "actions": result.actions_executed},
+                status,
+                {"approved": result.approved, "actions": result.actions_executed, "message": result.message},
             )
             continue
 
