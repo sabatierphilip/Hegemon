@@ -69,5 +69,6 @@ def test_runtime_defaults_to_autonomous_mode_and_bootstraps_keys(tmp_path: Path)
 
     hardware = runtime.get_hardware_key_setup_notice()
     assert hardware["completed"] is True
-    assert runtime.settings.get("containment_signature") is not None
+    assert runtime.settings.get("containment_signature") is None
+    assert "operator_signature_required" in hardware["details"]
     runtime.ingestion_service.stop()

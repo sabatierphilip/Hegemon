@@ -1690,3 +1690,53 @@ def test_distributed_signal_flags_single_shard_high_density_strategy():
     signal = distributed_attack_signal(events)
     assert signal["concentrated_single_shard"] is True
     assert signal["is_distributed"] is True
+
+def test_mirror_scan_detects_sustained_slow_drift():
+    detector = MirrorCloneDetector(warmup_events=6)
+    alerts = []
+    for i in range(20):
+        event = {
+            "host": "drift-host",
+            "user": "svc",
+            "process": "proc-a",
+            "action": "scan",
+            "resource": f"synth://{'x' * (8 + i)}",
+            "egress_mb": i * 40,
+            "api_call_count": i * 35,
+        }
+        alerts.extend(detector.evaluate(event))
+
+    scan_alerts = [a for a in alerts if a.mode == "scan" and "Sustained scan drift" in a.reason]
+    assert scan_alerts
+
+
+def test_mirror_clone_model_survives_process_rotation():
+    detector = MirrorCloneDetector(warmup_events=6, min_prediction_confidence=0.4)
+    alerts = []
+    for i in range(50):
+        process = f"proc-{i // 5}"
+        action = "model_invoke"
+        if i >= 30 and i % 5 == 0:
+            action = "network_send"
+        event = {
+            "host": "rot-host",
+            "user": "svc",
+            "process": process,
+            "action": action,
+            "resource": f"cluster-{i % 3}",
+        }
+        alerts.extend(detector.evaluate(event))
+
+    assert any(a.mode == "trace" for a in alerts)
+
+
+def test_liespot_scores_uniform_action_mixing():
+    detector = MirrorCloneDetector(warmup_events=1)
+    shard = "host:uniform|user:svc"
+    actions = ["read", "write", "exec", "model_invoke", "network_send"] * 4
+    for action in actions:
+        detector.evaluate({"host": "uniform", "user": "svc", "process": "p", "action": action, "resource": "r"})
+
+    score, vector = detector._liespot_score_and_vector(shard)
+    assert "uniform_action_mixing" in vector
+    assert score > 0.0

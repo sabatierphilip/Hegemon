@@ -9,5 +9,5 @@ detection:
     identity_fields: [host, user, process]
     window_seconds: 21600
     max_per_event: 80
-    min_events: 12
+    min_events: 8
     min_total: 300

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import http.server
 import json
 import logging
@@ -619,40 +618,37 @@ class SentinelRuntime:
             return dict(self._hardware_key_setup_notice)
 
         key_id = str(self.settings.get("auto_hardware_key_id", "auto-ed25519-local")).strip() or "auto-ed25519-local"
-        private_key_path = Path(str(self.settings.get("auto_hardware_private_key_path", "data/auto_hardware_ed25519.pem")))
-        private_key_path.parent.mkdir(parents=True, exist_ok=True)
-        private_key, public_pem = self._load_or_create_autohardware_key(private_key_path, key_id)
+        persist_private_key = bool(self.settings.get("auto_hardware_persist_private_key", False))
+
+        if persist_private_key:
+            private_key_path = Path(str(self.settings.get("auto_hardware_private_key_path", "data/auto_hardware_ed25519.pem")))
+            private_key_path.parent.mkdir(parents=True, exist_ok=True)
+            _, public_pem = self._load_or_create_autohardware_key(private_key_path, key_id)
+            detail = f"public_key_loaded_from_sealed_store:{private_key_path.with_suffix(private_key_path.suffix + '.seal')}"
+            audit_payload = {"key_id": key_id, "local_only": True, "persist_private_key": True}
+        else:
+            private_key = ed25519.Ed25519PrivateKey.generate()
+            public_pem = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            ).decode("utf-8")
+            detail = "ephemeral_private_key_not_persisted"
+            audit_payload = {"key_id": key_id, "local_only": True, "persist_private_key": False}
 
         self.fast_lane_containment.hardware_key_verifier.upsert_trusted_public_key(key_id, public_pem)
-        auto_signature = private_key.sign(
-            HardwareKeyVerifier.canonical_payload(
-                host="*",
-                severity=0,
-                requested_actions=[],
-                approvals=[],
-                key_id=key_id,
-                key_type="yubikey",
-                authorize_all_containment=True,
-            )
-        )
         self.settings.data.setdefault("trusted_hardware_public_keys", {})[key_id] = public_pem
         self.settings.data["hardware_key_fail_closed"] = True
-        self.settings.data["containment_signature"] = {
-            "key_id": key_id,
-            "key_type": "yubikey",
-            "authorize_all_containment": True,
-            "signature": base64.b64encode(auto_signature).decode("ascii"),
-        }
+        self.settings.data.pop("containment_signature", None)
 
         self._hardware_key_setup_notice = {
             "required": True,
             "configured": True,
             "completed": True,
-            "details": ["hardware_key_profile_hardened", "runtime_trust_anchor_updated", f"private_key_persisted:{private_key_path}"],
+            "details": ["hardware_key_profile_hardened", "runtime_trust_anchor_updated", detail, "operator_signature_required"],
             "key_id": key_id,
             "local_only": True,
         }
-        self.audit.append("hardware_key_autoconfig_completed", {"key_id": key_id, "local_only": True, "private_key_path": str(private_key_path)})
+        self.audit.append("hardware_key_autoconfig_completed", audit_payload)
         return dict(self._hardware_key_setup_notice)
 
     def apply_telemetry_permission(self, granted: bool) -> dict[str, Any]:
