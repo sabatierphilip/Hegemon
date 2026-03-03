@@ -354,6 +354,7 @@ def run_cycle(
     honeypot_detector = honeypot_detector or HoneypotDetector(
         settings.get("honeypot_resources", []),
         settings.get("proto_agi_indicators", []),
+        settings.get("honeypot_p2p_threat_patterns", []),
     )
     mirror_clone_detector = mirror_clone_detector or MirrorCloneDetector(
         warmup_events=int(settings.get("clone_warmup_events", 6)),
@@ -710,6 +711,7 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
     honeypot_detector = HoneypotDetector(
         settings.get("honeypot_resources", []),
         settings.get("proto_agi_indicators", []),
+        settings.get("honeypot_p2p_threat_patterns", []),
     )
     mirror_clone_detector = MirrorCloneDetector(
         warmup_events=int(settings.get("clone_warmup_events", 6)),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import http.server
 import json
 import logging
@@ -147,6 +148,7 @@ class SentinelRuntime:
         self.honeypot_detector = HoneypotDetector(
             settings.get("honeypot_resources", []),
             settings.get("proto_agi_indicators", []),
+            settings.get("honeypot_p2p_threat_patterns", []),
         )
         self.mirror_clone_detector = MirrorCloneDetector(
             warmup_events=int(settings.get("clone_warmup_events", 6)),
@@ -235,6 +237,8 @@ class SentinelRuntime:
         }
         self._containment_decision_lock = threading.Lock()
         self._holding_hosts: set[str] = set()
+        self._auto_hardware_private_key: ed25519.Ed25519PrivateKey | None = None
+        self._auto_hardware_key_id: str | None = None
 
         self.fast_lane_server: FastLaneServer | None = None
         self.fast_lane_status: dict[str, Any] = {"enabled": bool(settings.get("fast_lane", {}).get("enabled", False)), "active": False, "missing_tls_files": []}
@@ -365,6 +369,35 @@ class SentinelRuntime:
             payload["holding_hosts"] = sorted(self._holding_hosts)
             return payload
 
+    def _autonomous_containment_signature_bundle(
+        self,
+        host: str,
+        severity: int,
+        requested_actions: list[str],
+        approvals: list[str],
+    ) -> dict[str, Any] | None:
+        private_key = self._auto_hardware_private_key
+        key_id = str(self._auto_hardware_key_id or "").strip()
+        if private_key is None or not key_id:
+            return None
+
+        digest = HardwareKeyVerifier.canonical_payload(
+            host,
+            severity,
+            requested_actions,
+            approvals,
+            key_id,
+            "yubikey",
+            authorize_all_containment=False,
+        )
+        signature = base64.b64encode(private_key.sign(digest)).decode("utf-8")
+        return {
+            "key_id": key_id,
+            "key_type": "yubikey",
+            "signature": signature,
+            "authorize_all_containment": False,
+        }
+
     def apply_containment_decision(self, execute: bool) -> dict[str, Any]:
         with self._containment_decision_lock:
             if not self._containment_decision.get("pending", False):
@@ -386,14 +419,24 @@ class SentinelRuntime:
             }
 
             if execute:
+                approvals = list(self.settings.get("automated_approvers", ["user"]))
+                signature_bundle = self.settings.get("containment_signature")
+                if not signature_bundle:
+                    signature_bundle = self._autonomous_containment_signature_bundle(
+                        host=host,
+                        severity=severity,
+                        requested_actions=recommended_actions,
+                        approvals=approvals,
+                    )
+
                 result = self.fast_lane_containment.execute(
                     host=host,
                     severity=severity,
                     requested_actions=recommended_actions,
-                    approvals=list(self.settings.get("automated_approvers", ["user"])),
+                    approvals=approvals,
                     simulation_mode=False,
                     hard_quarantine_threshold=int(self.settings.get("hard_quarantine_threshold", 90)),
-                    signature_bundle=self.settings.get("containment_signature"),
+                    signature_bundle=signature_bundle,
                     confirmation_bundle=self.settings.get("containment_confirmation"),
                 )
                 response.update(
@@ -623,7 +666,7 @@ class SentinelRuntime:
         if persist_private_key:
             private_key_path = Path(str(self.settings.get("auto_hardware_private_key_path", "data/auto_hardware_ed25519.pem")))
             private_key_path.parent.mkdir(parents=True, exist_ok=True)
-            _, public_pem = self._load_or_create_autohardware_key(private_key_path, key_id)
+            private_key, public_pem = self._load_or_create_autohardware_key(private_key_path, key_id)
             detail = f"public_key_loaded_from_sealed_store:{private_key_path.with_suffix(private_key_path.suffix + '.seal')}"
             audit_payload = {"key_id": key_id, "local_only": True, "persist_private_key": True}
         else:
@@ -639,12 +682,20 @@ class SentinelRuntime:
         self.settings.data.setdefault("trusted_hardware_public_keys", {})[key_id] = public_pem
         self.settings.data["hardware_key_fail_closed"] = True
         self.settings.data.pop("containment_signature", None)
+        self._auto_hardware_private_key = private_key
+        self._auto_hardware_key_id = key_id
 
         self._hardware_key_setup_notice = {
             "required": True,
             "configured": True,
             "completed": True,
-            "details": ["hardware_key_profile_hardened", "runtime_trust_anchor_updated", detail, "operator_signature_required"],
+            "details": [
+                "hardware_key_profile_hardened",
+                "runtime_trust_anchor_updated",
+                detail,
+                "operator_signature_required",
+                "autonomous_runtime_signature_enabled",
+            ],
             "key_id": key_id,
             "local_only": True,
         }

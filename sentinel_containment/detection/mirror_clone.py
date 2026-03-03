@@ -427,7 +427,7 @@ class MirrorCloneDetector:
         return alerts
 
     def deploy_counter_clone(self, alert: MirrorAlert) -> CloneDeployment:
-        shard = alert.shard
+        shard = self._canonicalize_shard(alert.shard)
         if shard in self._deployments:
             return self._deployments[shard]
 
@@ -462,6 +462,7 @@ class MirrorCloneDetector:
         return deployment
 
     def capture_rogue_clone(self, shard: str, confidence: float) -> CapturedClone:
+        shard = self._canonicalize_shard(shard)
         action_counts = self._action_counts[shard]
         total_actions = float(sum(action_counts.values()))
         priors = {a: (c / total_actions) for a, c in action_counts.items()} if total_actions > 0 else {"unknown": 1.0}
@@ -550,6 +551,7 @@ class MirrorCloneDetector:
         return sorted(dedup.values(), key=lambda item: item.priority, reverse=True)
 
     def predict_actions_for_shard(self, shard: str, top_k: int = 3) -> list[tuple[str, float]]:
+        shard = self._canonicalize_shard(shard)
         previous = self._last_action.get(shard)
         if previous is None:
             return []
@@ -562,6 +564,7 @@ class MirrorCloneDetector:
 
     def _ensemble_predictions(self, shard: str, top_k: int = 3) -> list[tuple[str, float]]:
         transition_preds = dict(self.predict_actions_for_shard(shard, top_k=6))
+        shard = self._canonicalize_shard(shard)
         action_counts = self._action_counts[shard]
         total_actions = float(sum(action_counts.values()))
         frequency_preds = {action: (count / total_actions) for action, count in action_counts.items()} if total_actions > 0 else {}
@@ -583,6 +586,7 @@ class MirrorCloneDetector:
 
     def _model_disagreement(self, shard: str) -> float:
         transition = self.predict_actions_for_shard(shard, top_k=1)
+        shard = self._canonicalize_shard(shard)
         ensemble = self._ensemble_predictions(shard, top_k=1)
         if not transition or not ensemble:
             return 0.0
@@ -798,6 +802,13 @@ class MirrorCloneDetector:
         user = str(event.get("user", "unknown")).strip().lower()
         return f"host:{host}|user:{user}"
 
+    @staticmethod
+    def _canonicalize_shard(shard: str) -> str:
+        parts = [part.strip().lower() for part in str(shard).split("|") if part.strip()]
+        host = next((p.split(":", 1)[1] for p in parts if p.startswith("host:")), "unknown")
+        user = next((p.split(":", 1)[1] for p in parts if p.startswith("user:")), "unknown")
+        return f"host:{host}|user:{user}"
+
     def _predict_markov_path(self, shard: str, horizon: int = 4) -> tuple[list[str], float]:
         priors = self._action_counts[shard]
         if not priors:
@@ -851,6 +862,7 @@ class MirrorCloneDetector:
 
     def _resource_risk_score(self, shard: str, action: str) -> float:
         resources = self._resource_counts[shard].get(action, {})
+        shard = self._canonicalize_shard(shard)
         if not resources:
             return 0.1
 
@@ -935,6 +947,7 @@ class MirrorCloneDetector:
 
     def _liespot_score_and_vector(self, shard: str) -> tuple[float, list[str]]:
         vector: list[str] = []
+        shard = self._canonicalize_shard(shard)
         transition = self.predict_actions_for_shard(shard, top_k=1)
         ensemble = self._ensemble_predictions(shard, top_k=1)
         disagreement = self._model_disagreement(shard)
@@ -942,11 +955,14 @@ class MirrorCloneDetector:
             vector.append("predictive_model_conflict")
         if transition and ensemble and transition[0][0] != ensemble[0][0]:
             vector.append("next_action_contradiction")
-        repeated_single_action = max(self._action_counts[shard].values(), default=0)
-        total = max(1, sum(self._action_counts[shard].values()))
+
+        action_counts = self._action_counts[shard]
+        repeated_single_action = max(action_counts.values(), default=0)
+        total = max(1, sum(action_counts.values()))
         if (repeated_single_action / total) >= 0.75:
             vector.append("narrative_lock_in")
-        action_distribution = [count / total for count in self._action_counts[shard].values() if total > 0]
+
+        action_distribution = [count / total for count in action_counts.values() if total > 0]
         entropy = 0.0
         for probability in action_distribution:
             if probability > 0:
@@ -956,12 +972,29 @@ class MirrorCloneDetector:
         if len(action_distribution) >= 3 and normalized_entropy >= 0.95:
             vector.append("uniform_action_mixing")
 
+        action_count = len(action_counts)
+        unique_resources = len(self._unique_resources[shard])
+        if action_count <= 1 and unique_resources >= 5:
+            vector.append("resource_action_semantic_drift")
+
+        transition_totals = []
+        for source, targets in self._transitions[shard].items():
+            source_total = sum(targets.values())
+            if source_total <= 0:
+                continue
+            peak = max(targets.values()) / source_total
+            transition_totals.append(peak)
+        if transition_totals and (sum(transition_totals) / len(transition_totals)) <= 0.45:
+            vector.append("improbable_transition_pressure")
+
         score = min(
             1.0,
-            0.4 * disagreement
-            + 0.2 * (1.0 if "next_action_contradiction" in vector else 0.0)
-            + 0.2 * (1.0 if "narrative_lock_in" in vector else 0.0)
-            + 0.2 * (1.0 if "uniform_action_mixing" in vector else 0.0),
+            0.3 * disagreement
+            + 0.16 * (1.0 if "next_action_contradiction" in vector else 0.0)
+            + 0.16 * (1.0 if "narrative_lock_in" in vector else 0.0)
+            + 0.16 * (1.0 if "uniform_action_mixing" in vector else 0.0)
+            + 0.11 * (1.0 if "resource_action_semantic_drift" in vector else 0.0)
+            + 0.11 * (1.0 if "improbable_transition_pressure" in vector else 0.0),
         )
         return score, vector
 

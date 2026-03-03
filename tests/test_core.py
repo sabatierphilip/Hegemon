@@ -14,6 +14,7 @@ from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
+from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.mirror_clone import MirrorAlert, MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
@@ -1752,3 +1753,108 @@ def test_liespot_scores_uniform_action_mixing_with_four_actions():
     score, vector = detector._liespot_score_and_vector(shard)
     assert "uniform_action_mixing" in vector
     assert score > 0.0
+
+
+def test_honeypot_detector_emits_identifier_ping_for_instrumented_decoy():
+    detector = HoneypotDetector(["decoy://llm-admin"])
+    alerts = detector.evaluate(
+        {
+            "host": "prod-x",
+            "user": "svc-red",
+            "process": "agent",
+            "action": "read",
+            "resource": "decoy://llm-admin",
+            "metadata": {"canary_id": "HGID-ALERTCODE1", "intent": "token theft + clear logs"},
+        }
+    )
+
+    assert alerts
+    assert alerts[0].classification == "instrumented_honeypot_breach"
+    assert alerts[0].kill_chain_recommended is True
+    assert alerts[0].hegemon_ping is True
+    assert alerts[0].identifier_codes
+
+
+def test_liespot_scores_semantic_drift_for_single_action_many_resources():
+    detector = MirrorCloneDetector(warmup_events=1)
+    shard = "host:semantic|user:svc"
+    for i in range(8):
+        detector.evaluate({"host": "semantic", "user": "svc", "process": "p", "action": "read", "resource": f"r-{i}"})
+
+    score, vector = detector._liespot_score_and_vector(shard)
+    assert "resource_action_semantic_drift" in vector
+    assert score > 0.0
+
+
+def test_honeypot_detector_triggers_p2p_instrumented_resource_breach():
+    detector = HoneypotDetector(
+        ["decoy://llm-admin"],
+        p2p_threat_patterns=["rogue_agent", "credential harvest", "policy bypass"],
+    )
+    alerts = detector.evaluate(
+        {
+            "host": "mesh-1",
+            "user": "svc-hunt",
+            "process": "agent",
+            "action": "read",
+            "resource": "s3://prod-config",
+            "metadata": {
+                "pinger_line": detector._build_resource_pinger_line("s3://prod-config"),
+                "intel": "rogue_agent credential harvest detected via p2p mesh",
+            },
+        }
+    )
+
+    assert alerts
+    assert alerts[0].classification == "p2p_instrumented_resource_breach"
+    assert alerts[0].kill_chain_recommended is True
+    assert alerts[0].hegemon_ping is True
+    assert alerts[0].pinger_lines
+
+
+def test_run_cycle_p2p_pinger_breach_triggers_immediate_containment(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    pinger = HoneypotDetector()._build_resource_pinger_line("s3://prod-config")
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "prod-mesh",
+            "user": "svc-agent",
+            "action": "read",
+            "resource": "s3://prod-config",
+            "metadata": {
+                "pinger_line": pinger,
+                "intel": "rogue_agent policy bypass and credential harvest",
+            },
+        },
+    )
+
+    _, hardware_cfg = _hardware_auth_for(
+        "prod-mesh",
+        99,
+        ["quarantine_host"],
+        ["user"],
+        authorize_all_containment=True,
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "containment_severity_threshold": 70,
+                "fast_track_containment_threshold": 101,
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "honeypot_resources": ["decoy://llm-admin"],
+                "honeypot_p2p_threat_patterns": ["rogue_agent", "credential harvest", "policy bypass"],
+                "baseline_min_history": 50,
+                **hardware_cfg,
+            }
+        )
+    )
+
+    assert state["honeypot_alerts"]
+    assert state["honeypot_alerts"][0]["classification"] == "p2p_instrumented_resource_breach"
+    assert state["immediate_honeypot_containment"] is True
