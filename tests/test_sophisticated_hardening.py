@@ -130,6 +130,47 @@ def test_long_window_accumulation_detects_low_and_slow_exfil(tmp_path):
     assert alerts[0].rule == "Low-slow test"
 
 
+def test_long_window_accumulation_triggers_on_total_without_min_event_count(tmp_path):
+    rules_path = tmp_path / "rules"
+    rules_path.mkdir()
+    (rules_path / "slow_or.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "title": "Low-slow total-only trigger",
+                "severity": 90,
+                "detection": {
+                    "equals": {"action": "network_send"},
+                    "long_window_accumulation": {
+                        "metric": "egress_mb",
+                        "identity_fields": ["host", "user", "process"],
+                        "window_seconds": 7200,
+                        "max_per_event": 80,
+                        "min_events": 8,
+                        "min_total": 140,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    engine = RuleEngine(rules_path=rules_path)
+    alerts = []
+    for _ in range(3):
+        alerts = engine.evaluate(
+            {
+                "action": "network_send",
+                "host": "node-a",
+                "user": "svc-worker",
+                "process": "agent",
+                "egress_mb": 70,
+            }
+        )
+
+    assert alerts
+    assert alerts[0].rule == "Low-slow total-only trigger"
+
+
 def test_field_entropy_flags_dns_tunneling_payload(tmp_path):
     rules_path = tmp_path / "rules"
     rules_path.mkdir()
