@@ -218,6 +218,9 @@ class SentinelRuntime:
             kernel_webhook_port=int(ingest_cfg.get("kernel_webhook_port", 5515)),
             kernel_webhook_path=ingest_cfg.get("kernel_webhook_path", "/kernel-event"),
             on_kernel_event=self.process_priority_event,
+            kernel_webhook_hmac_key=ingest_cfg.get("kernel_webhook_hmac_key") or settings.env("HEGEMON_KERNEL_WEBHOOK_HMAC_KEY", ""),
+            kernel_webhook_hmac_required=bool(ingest_cfg.get("kernel_webhook_hmac_required", True)),
+            kernel_webhook_hmac_max_skew_seconds=int(ingest_cfg.get("kernel_webhook_hmac_max_skew_seconds", 300)),
             counterclone_integrity_key=ingest_cfg.get("counterclone_integrity_key"),
         )
 
@@ -298,6 +301,7 @@ class SentinelRuntime:
             process_keys=process_keys,
             max_clock_skew_seconds=int(p2p_cfg.get("max_clock_skew_seconds", 30)),
             external_verifiers=external_verifiers,
+            require_external_verifiers=bool(p2p_cfg.get("require_external_verifiers", True)),
         )
         self._peer_verification_interval = float(p2p_cfg.get("interval_seconds", 5.0))
         self._next_peer_verification_due = 0.0

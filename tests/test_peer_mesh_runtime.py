@@ -11,6 +11,7 @@ def _runtime_cfg(tmp_path: Path) -> dict:
         "rules_path": str(tmp_path / "rules"),
         "peer_verification": {
             "interval_seconds": 1,
+            "require_external_verifiers": False,
             "peer_ids": ["p1", "p2", "p3"],
             "checkpoint_quorum": 2,
             "checkpoint_signers": ["p1", "p2", "p3"],

@@ -14,7 +14,7 @@ from sentinel_containment.security.peer_mesh import (
 
 
 def test_peer_mesh_detects_tampered_peer_key():
-    mesh = PeerVerificationMesh({"a": "ka", "b": "kb", "c": "kc"}, max_clock_skew_seconds=999999)
+    mesh = PeerVerificationMesh({"a": "ka", "b": "kb", "c": "kc"}, max_clock_skew_seconds=999999, require_external_verifiers=False)
 
     now = time.time()
     healthy = mesh.run_attestation_cycle(now=now)
@@ -106,7 +106,7 @@ def test_peer_mesh_requires_external_attestation_verifiers():
 
 
 def test_checkpoint_ledger_requires_quorum_and_monotonic_seq_with_replay_protection():
-    mesh = PeerVerificationMesh({"a": "ka", "b": "kb", "c": "kc"})
+    mesh = PeerVerificationMesh({"a": "ka", "b": "kb", "c": "kc"}, require_external_verifiers=False)
     ledger = MeshCheckpointLedger(mesh, quorum_size=2, replication_targets=["ra", "rb"])
 
     chk1 = ledger.create_checkpoint(entries=[{"k": 1}], signer_ids=["a", "b"])
@@ -139,7 +139,7 @@ def test_checkpoint_ledger_requires_quorum_and_monotonic_seq_with_replay_protect
 
 
 def test_checkpoint_ledger_rejects_revoked_signer_and_detects_split_brain():
-    mesh = PeerVerificationMesh({"a": "ka", "b": "kb", "c": "kc"})
+    mesh = PeerVerificationMesh({"a": "ka", "b": "kb", "c": "kc"}, require_external_verifiers=False)
     ledger = MeshCheckpointLedger(mesh, quorum_size=2)
 
     chk1 = ledger.create_checkpoint(entries=[{"x": 1}], signer_ids=["a", "b"])
@@ -169,3 +169,21 @@ def test_checkpoint_ledger_rejects_revoked_signer_and_detects_split_brain():
     )
     gossip = ledger.gossip_observe(alt, source_peer="peer-z")
     assert "split_brain_checkpoint_detected" in gossip.reasons
+
+
+def test_peer_mesh_fails_closed_when_external_verifiers_unconfigured_by_default():
+    mesh = PeerVerificationMesh({"a": "ka", "b": "kb"})
+
+    result = mesh.run_attestation_cycle(now=time.time())
+
+    assert result.ok is False
+    assert any("external_attestation:no_verifiers_configured" == f["reason"] for f in result.failures)
+
+
+def test_peer_mesh_can_explicitly_allow_no_external_verifiers_for_lab_mode():
+    mesh = PeerVerificationMesh({"a": "ka", "b": "kb"}, require_external_verifiers=False)
+
+    ok, failures = mesh.verify_external_peer("a", evidence_bundle=None)
+
+    assert ok is True
+    assert failures == []

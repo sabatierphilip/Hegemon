@@ -72,6 +72,9 @@ ingestion:
   kernel_webhook_host: 0.0.0.0
   kernel_webhook_port: 5515
   kernel_webhook_path: /kernel-event
+  kernel_webhook_hmac_required: true
+  kernel_webhook_hmac_key: ""
+  kernel_webhook_hmac_max_skew_seconds: 300
   cloudtrail_file: data/cloudtrail.jsonl
   network_flow_file: data/network_flows.jsonl
   model_api_file: data/model_api.jsonl
@@ -117,6 +120,7 @@ fast_lane:
 peer_verification:
   interval_seconds: 5
   max_clock_skew_seconds: 30
+  require_external_verifiers: true
   peer_ids:
     - ingestion_service
     - detection_engine

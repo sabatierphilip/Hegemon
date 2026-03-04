@@ -38,6 +38,9 @@ if __name__ == "__main__":
         kernel_webhook_host=ingest_cfg.get("kernel_webhook_host", "0.0.0.0"),
         kernel_webhook_port=int(ingest_cfg.get("kernel_webhook_port", 5515)),
         kernel_webhook_path=ingest_cfg.get("kernel_webhook_path", "/kernel-event"),
+        kernel_webhook_hmac_key=ingest_cfg.get("kernel_webhook_hmac_key") or settings.env("HEGEMON_KERNEL_WEBHOOK_HMAC_KEY", ""),
+        kernel_webhook_hmac_required=bool(ingest_cfg.get("kernel_webhook_hmac_required", True)),
+        kernel_webhook_hmac_max_skew_seconds=int(ingest_cfg.get("kernel_webhook_hmac_max_skew_seconds", 300)),
         counterclone_integrity_key=ingest_cfg.get("counterclone_integrity_key"),
     )
 
