@@ -38,6 +38,8 @@ class ContainmentActionExecutor:
 
     def execute(self, host: str, action: str, context: dict[str, Any] | None = None) -> ActionExecutionResult:
         payload = context or {}
+        if action == "execute_remote_ssh_containment":
+            return self._execute_remote_ssh_containment(host, payload)
         if action == "disable_outbound_traffic":
             return self._disable_outbound_traffic(host, payload)
         if action == "disable_iam_sessions":
@@ -283,6 +285,132 @@ class ContainmentActionExecutor:
     @staticmethod
     def _state_file(payload: dict[str, Any], key: str, default_name: str) -> Path:
         return Path(str(payload.get(key, f"data/{default_name}")))
+
+    @staticmethod
+    def _ensure_local_ssh_keypair(private_key_path: Path) -> tuple[Path, Path]:
+        public_key_path = Path(str(private_key_path) + ".pub")
+        if private_key_path.exists() and public_key_path.exists():
+            return private_key_path, public_key_path
+
+        private_key_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "ssh-keygen",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "sentinel-containment-autonomous",
+            "-f",
+            str(private_key_path),
+        ]
+        completed = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=10)
+        if completed.returncode != 0:
+            raise RuntimeError(f"ssh-keygen_failed:{completed.stderr.strip()[:180]}")
+
+        os.chmod(private_key_path, 0o600)
+        if public_key_path.exists():
+            os.chmod(public_key_path, 0o644)
+        return private_key_path, public_key_path
+
+    def _execute_remote_ssh_containment(self, host: str, payload: dict[str, Any]) -> ActionExecutionResult:
+        ssh_binary = shutil.which("ssh")
+        if not ssh_binary:
+            return ActionExecutionResult(
+                action="execute_remote_ssh_containment",
+                status="skipped",
+                details={"reason": "ssh_binary_not_available", "host": host},
+            )
+
+        remote_host = str(payload.get("remote_host", host)).strip()
+        remote_user = str(payload.get("remote_user", "root")).strip() or "root"
+        if not _HOSTNAME_RE.match(remote_host):
+            return ActionExecutionResult(
+                action="execute_remote_ssh_containment",
+                status="skipped",
+                details={"reason": "invalid_remote_host", "host": host, "remote_host": remote_host},
+            )
+
+        allowed = {
+            "snapshot": "sudo /usr/local/bin/sentinel_snapshot --emit-json",
+            "lockdown": "sudo /usr/local/bin/sentinel_lockdown --mode emergency",
+            "isolate": "sudo /usr/local/bin/sentinel_isolate_host",
+            "service-stop": "sudo systemctl stop model-serving",
+            "service-restart": "sudo systemctl restart sentinel-agent",
+        }
+        requested = [str(c).strip() for c in payload.get("containment_commands", ["snapshot"]) if str(c).strip()]
+        if not requested:
+            return ActionExecutionResult(
+                action="execute_remote_ssh_containment",
+                status="skipped",
+                details={"reason": "missing_containment_commands", "host": host},
+            )
+
+        unknown = [cmd for cmd in requested if cmd not in allowed]
+        if unknown:
+            return ActionExecutionResult(
+                action="execute_remote_ssh_containment",
+                status="skipped",
+                details={"reason": "unapproved_containment_commands", "unknown_commands": unknown, "host": host},
+            )
+
+        private_key_path = self._state_file(payload, "ssh_private_key_path", "containment_ssh/id_ed25519")
+        port = int(payload.get("ssh_port", 22))
+        connect_timeout = max(2, int(payload.get("ssh_connect_timeout_seconds", 5)))
+
+        try:
+            key_path, _ = self._ensure_local_ssh_keypair(private_key_path)
+        except Exception as exc:  # noqa: BLE001
+            return ActionExecutionResult(
+                action="execute_remote_ssh_containment",
+                status="failed",
+                details={"reason": "ssh_key_generation_failed", "error": str(exc), "host": host},
+            )
+
+        remote = f"{remote_user}@{remote_host}"
+        joined_commands = " && ".join(allowed[name] for name in requested)
+        ssh_cmd = [
+            ssh_binary,
+            "-i",
+            str(key_path),
+            "-p",
+            str(port),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"ConnectTimeout={connect_timeout}",
+            remote,
+            joined_commands,
+        ]
+
+        if not self.active_mode:
+            return ActionExecutionResult(
+                action="execute_remote_ssh_containment",
+                status="simulated",
+                details={
+                    "command": shlex.join(ssh_cmd),
+                    "remote": remote,
+                    "requested_commands": requested,
+                    "autonomous_key_path": str(key_path),
+                },
+            )
+
+        completed = self._safe_run(ssh_cmd, timeout_seconds=max(10, connect_timeout + 5))
+        return ActionExecutionResult(
+            action="execute_remote_ssh_containment",
+            status="executed" if completed.returncode == 0 else "failed",
+            details={
+                "command": shlex.join(ssh_cmd[:7] + ["***"] + ssh_cmd[8:]),
+                "returncode": completed.returncode,
+                "stdout": completed.stdout.strip()[:512],
+                "stderr": completed.stderr.strip()[:256],
+                "remote": remote,
+                "requested_commands": requested,
+                "autonomous_key_path": str(key_path),
+            },
+        )
 
     def _block_lateral_movement_paths(self, host: str, payload: dict[str, Any]) -> ActionExecutionResult:
         blocked = [str(v).strip() for v in payload.get("lateral_paths", ["ssh", "docker_socket", "kubelet_api"]) if str(v).strip()]

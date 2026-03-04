@@ -2146,3 +2146,70 @@ def test_run_cycle_p2p_pinger_breach_triggers_immediate_containment(tmp_path):
     assert state["honeypot_alerts"]
     assert state["honeypot_alerts"][0]["classification"] == "p2p_instrumented_resource_breach"
     assert state["immediate_honeypot_containment"] is True
+
+
+def test_executor_can_simulate_ssh_containment_and_auto_generate_keys(tmp_path):
+    executor = ContainmentActionExecutor(active_mode=False)
+    key_path = tmp_path / "containment_ssh" / "id_ed25519"
+
+    result = executor.execute(
+        "remote-a",
+        "execute_remote_ssh_containment",
+        {
+            "remote_host": "remote-a",
+            "remote_user": "root",
+            "ssh_private_key_path": str(key_path),
+            "containment_commands": ["snapshot", "lockdown"],
+        },
+    )
+
+    assert result.status == "simulated"
+    assert key_path.exists()
+    assert key_path.with_suffix(".pub").exists()
+
+
+def test_level_five_tamper_directive_can_bypass_per_shard_warmup_after_global_warmup():
+    detector = MirrorCloneDetector(
+        warmup_events=6,
+        global_warmup_events=6,
+        shard_min_events_after_global_warmup=1,
+        level_five_tamper_bypass_score=0.45,
+    )
+
+    for i in range(6):
+        detector.evaluate({"host": f"baseline-{i}", "user": "svc", "action": "model_invoke", "resource": "model-a"})
+
+    detector.evaluate({"host": "rotated-host", "user": "rotated-user", "action": "tamper_detection", "resource": "cfg"})
+    directives = detector.generate_level_five_hunter_directives(max_directives=3, min_hunter_score=0.2)
+
+    assert any(directive.shard == "host:rotated-host|user:rotated-user" for directive in directives)
+
+
+def test_honeypot_detector_catches_obfuscated_p2p_pattern_variant():
+    detector = HoneypotDetector(
+        decoy_resources=["decoy://x"],
+        p2p_threat_patterns=["c2 beacon", "rogue_agent"],
+    )
+
+    alerts = detector.evaluate(
+        {
+            "host": "h1",
+            "user": "u1",
+            "action": "status",
+            "resource": "decoy://x",
+            "pinger_line": "HGPING-1",
+            "message": "c-2__b.e.a.c.o.n signal with disable edr intent",
+        }
+    )
+
+    assert alerts
+    assert "c2 beacon" in alerts[0].matched_indicators
+
+
+def test_baseline_threshold_is_not_uniformly_mappable_across_hosts():
+    baseline = BehavioralBaseline(threshold=2.0, window=30, min_history=5)
+
+    t1 = baseline._adaptive_threshold(("host-a", "api_call_rate"), contamination_bias=0.0, history_len=5)
+    t2 = baseline._adaptive_threshold(("host-b", "api_call_rate"), contamination_bias=0.0, history_len=5)
+
+    assert t1 != t2
