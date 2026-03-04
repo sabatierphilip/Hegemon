@@ -81,7 +81,7 @@ def test_verify_and_execute_order(tmp_path):
 
 def test_rejects_unsigned_order(tmp_path):
     agent, control_signers = _agent_and_signers(tmp_path)
-    order = _build_order(agent, [control_signers[0]], required_quorum=1)
+    order = _build_order(agent, [control_signers[0], control_signers[1]], required_quorum=2)
     order["signatures"] = []
     try:
         agent.verify_containment_order(order)
@@ -316,3 +316,52 @@ def test_phase9_rejects_bad_control_approval(tmp_path):
         assert "control-plane approval" in str(exc)
     else:
         raise AssertionError("expected control approval rejection")
+
+
+def test_signed_ledger_tolerates_truncated_last_line(tmp_path):
+    signer = signing.SigningKey.generate()
+    ledger = SignedLedger(tmp_path / "ledger.log", signer)
+    ledger.append("one", {"a": 1})
+    with (tmp_path / "ledger.log").open("a", encoding="utf-8") as fp:
+        fp.write('{"bad":')
+    rows = ledger.read_all()
+    assert len(rows) == 1
+
+
+def test_wasm_request_action_requires_containment_capability(tmp_path):
+    signer = signing.SigningKey.generate()
+    ledger = SignedLedger(tmp_path / "ledger.log", signer)
+    loader = WasmModuleLoader([signer.verify_key], ["process_inspect", "containment_execute"], ledger)
+
+    wasm_path = tmp_path / "mod.wasm"
+    wasm_path.write_bytes(b"\x00asm\x01\x00\x00\x00")
+    digest = hashlib.sha256(wasm_path.read_bytes()).hexdigest().encode("utf-8")
+    sig_path = tmp_path / "mod.sig"
+    sig_path.write_text(base64.b64encode(signer.sign(digest).signature).decode("ascii"))
+
+    manifest_path = tmp_path / "mod.manifest.json"
+    manifest_path.write_text(json.dumps({
+        "module_id": "m1",
+        "version": "1.0.0",
+        "capabilities": ["process_inspect"],
+        "required_abi": ["request_action"],
+    }))
+
+    try:
+        loader.load_signed_module(wasm_path, manifest_path, sig_path)
+    except WasmSecurityError as exc:
+        assert "request_action ABI requires" in str(exc)
+    else:
+        raise AssertionError("expected request_action capability rejection")
+
+
+def test_agent_rejects_replayed_nonce(tmp_path):
+    agent, control_signers = _agent_and_signers(tmp_path)
+    order = _build_order(agent, [control_signers[0], control_signers[1]], required_quorum=2)
+    agent.verify_containment_order(order)
+    try:
+        agent.verify_containment_order(order)
+    except SecurityError as exc:
+        assert "replayed order nonce" in str(exc)
+    else:
+        raise AssertionError("expected replay rejection")
