@@ -325,6 +325,80 @@ class IngestionService:
         self._started = False
 
 
+
+
+class AdvancedKernelTelemetryReader:
+    """Collect richer kernel telemetry from procfs/sysfs and kernel-space command surfaces."""
+
+    def __init__(self, ingestor: TelemetryIngestor, poll_interval_seconds: float = 15.0):
+        self.ingestor = ingestor
+        self.poll_interval_seconds = poll_interval_seconds
+
+    @staticmethod
+    def _read_lines(path: Path, limit: int = 2000) -> list[str]:
+        if not path.exists():
+            return []
+        try:
+            return path.read_text(encoding="utf-8", errors="replace").splitlines()[:limit]
+        except OSError:
+            return []
+
+    def _collect_kernel_inventory(self) -> dict[str, Any]:
+        modules = self._read_lines(Path("/proc/modules"), limit=4000)
+        cmdline = " ".join(self._read_lines(Path("/proc/cmdline"), limit=1))
+        version = " ".join(self._read_lines(Path("/proc/version"), limit=1))
+        lsm = " ".join(self._read_lines(Path("/sys/kernel/security/lsm"), limit=1))
+        kallsyms_visible = Path("/proc/kallsyms").exists()
+        bpf_summary = self._safe_run(["bpftool", "prog", "show"])[:4000]
+        dmesg_tail = self._safe_run(["dmesg", "--ctime", "--nopager", "--level=err,warn"])[-4000:]
+
+        kernel_threads = self._safe_run(["ps", "-eo", "pid,comm"])
+        kthreads = [line.strip() for line in kernel_threads.splitlines() if " k" in f" {line} " or "[k" in line][:300]
+
+        return {
+            "kernel_version": version,
+            "kernel_cmdline": cmdline,
+            "linux_security_modules": lsm,
+            "loaded_module_count": len(modules),
+            "loaded_modules_head": modules[:120],
+            "kallsyms_visible": kallsyms_visible,
+            "kernel_threads_head": kthreads,
+            "bpf_program_inventory": bpf_summary,
+            "kernel_warning_tail": dmesg_tail,
+        }
+
+    def _safe_run(self, command: list[str]) -> str:
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=4)
+            output = result.stdout.strip()
+            output = re.sub(r"(?i)(token|secret|password)=[^\s]+", r"\1=<redacted>", output)
+            return output
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return ""
+
+    def poll_once(self) -> None:
+        host = platform.node() or "localhost"
+        kernel_payload = self._collect_kernel_inventory()
+        self.ingestor.ingest(
+            "host_kernel",
+            {
+                "host": host,
+                "process": "advanced-kernel-reader",
+                "action": "kernel_surface_inventory",
+                "resource": "kernel://local",
+                "collector_level": "runtime",
+                "telemetry_scope": "kernel_surface",
+                **kernel_payload,
+            },
+        )
+
+    def run_forever(self, stop_check: Callable[[], bool] | None = None) -> None:
+        while True:
+            if stop_check and stop_check():
+                return
+            self.poll_once()
+            time.sleep(self.poll_interval_seconds)
+
 class DynamicSystemTelemetrySource:
     """Collects lightweight, real host telemetry snapshots from procfs and platform commands."""
 

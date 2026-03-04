@@ -42,6 +42,7 @@ from sentinel_containment.security import (
 )
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import (
+    AdvancedKernelTelemetryReader,
     DynamicSystemTelemetrySource,
     IngestionService,
     discover_live_file_sources,
@@ -918,6 +919,15 @@ class SentinelRuntime:
         t.start()
         self._dynamic_threads.append(t)
         details.append("enabled_dynamic_system_runtime")
+
+        kernel_reader = AdvancedKernelTelemetryReader(
+            self.ingestor,
+            poll_interval_seconds=float(ingest_cfg.get("advanced_kernel_poll_seconds", 15.0)),
+        )
+        kt = threading.Thread(target=kernel_reader.run_forever, args=(lambda: self._stop.is_set(),), daemon=True)
+        kt.start()
+        self._dynamic_threads.append(kt)
+        details.append("enabled_advanced_kernel_reader")
         return details
 
     def process_priority_event(self, event: dict[str, Any]) -> dict[str, Any]:
