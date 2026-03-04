@@ -5,6 +5,7 @@ from typing import Any
 
 from sentinel_containment.containment.executors import ContainmentActionExecutor
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
+from sentinel_containment.security.distributor import SecurityDistributorEngine
 from sentinel_containment.security import HardwareKeyVerifier, HumanConfirmationVerifier
 
 
@@ -24,6 +25,7 @@ class ContainmentEngine:
         hardware_key_verifier: HardwareKeyVerifier | None = None,
         human_confirmation_verifier: HumanConfirmationVerifier | None = None,
         action_executor: ContainmentActionExecutor | None = None,
+        distributor_engine: SecurityDistributorEngine | None = None,
     ):
         self.audit_log = audit_log
         self.contained_hosts: set[str] = set()
@@ -33,6 +35,7 @@ class ContainmentEngine:
         self.hardware_key_verifier = hardware_key_verifier or HardwareKeyVerifier()
         self.human_confirmation_verifier = human_confirmation_verifier or HumanConfirmationVerifier()
         self.action_executor = action_executor or ContainmentActionExecutor(active_mode=False)
+        self.distributor_engine = distributor_engine
 
     def execute(
         self,
@@ -148,6 +151,7 @@ class ContainmentEngine:
             "offensive_actions": False,
             "simulation_mode": simulation_mode,
             "action_results": action_results,
+            "distributor_snapshot": self.distributor_engine.current_snapshot() if self.distributor_engine else {},
         })
         return ContainmentResult(True, executed, "Containment actions executed")
 

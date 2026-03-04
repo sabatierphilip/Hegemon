@@ -39,6 +39,7 @@ from sentinel_containment.security import (
     MeshCheckpointLedger,
     PeerVerificationMesh,
     TPMQuoteVerifier,
+    SecurityDistributorEngine,
 )
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 from sentinel_containment.telemetry.sources import (
@@ -124,7 +125,14 @@ class SentinelRuntime:
         telemetry_path = Path(
             settings.get("telemetry_index_path", ingest_cfg.get("index_path", "data/telemetry_index.jsonl"))
         )
-        self.ingestor = TelemetryIngestor(telemetry_path)
+        distributor_cfg = settings.get("security_distributor", {})
+        self.distributor = SecurityDistributorEngine(
+            risk_window_seconds=int(distributor_cfg.get("risk_window_seconds", 900)),
+            max_events_per_component=int(distributor_cfg.get("max_events_per_component", 2000)),
+            sensitive_resource_markers=distributor_cfg.get("sensitive_resource_markers"),
+        )
+
+        self.ingestor = TelemetryIngestor(telemetry_path, distributor_engine=self.distributor)
         self.baseline = BehavioralBaseline(
             threshold=float(settings.get("anomaly_threshold", 2.0)),
             window=int(settings.get("baseline_window", 30)),
@@ -180,6 +188,7 @@ class SentinelRuntime:
                 fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
             ),
             action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
+            distributor_engine=self.distributor,
         )
         self.fast_lane_containment = ContainmentEngine(
             self.audit,
@@ -196,6 +205,7 @@ class SentinelRuntime:
                 fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
             ),
             action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
+            distributor_engine=self.distributor,
         )
 
         extra_sources = {
@@ -1022,6 +1032,7 @@ class SentinelRuntime:
                 "counterclone_integrity_verified": result.ok,
             },
         )
+        self.distributor.observe_peer_attestation({**payload, "peers": self.peer_mesh.process_ids})
         if not result.ok:
             self.audit.append("peer_verification_failed", payload)
         return payload
@@ -1162,12 +1173,14 @@ class SentinelRuntime:
             mapper=self.asset_mapper,
             ingestor=self.ingestor,
             containment=self.containment,
+            distributor=self.distributor,
         )
         self._update_containment_decision_from_state(state)
         state["containment_decision"] = self.get_containment_decision_status()
         state["fast_lane_status"] = dict(self.fast_lane_status)
         state["readiness"] = self.get_readiness_status()
         state["p2p_checkpoint"] = self._checkpoint_critical_state(state)
+        state["distributor"] = self.distributor.current_snapshot()
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return state

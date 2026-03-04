@@ -28,7 +28,7 @@ from sentinel_containment.detection.graph_anomaly import parse_event_time
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
-from sentinel_containment.security import HardwareKeyVerifier, HumanConfirmationVerifier
+from sentinel_containment.security import HardwareKeyVerifier, HumanConfirmationVerifier, SecurityDistributorEngine
 from sentinel_containment.soar.workflow import SoarEngine
 from sentinel_containment.telemetry.ingestor import TelemetryIngestor
 
@@ -573,6 +573,7 @@ def run_cycle(
     mapper: AssetMapper | None = None,
     ingestor: TelemetryIngestor | None = None,
     containment: ContainmentEngine | None = None,
+    distributor: SecurityDistributorEngine | None = None,
 ) -> dict:
     out_of_band = settings.get("audit_out_of_band_path")
     audit = audit or ImmutableAuditLog(out_of_band_path=Path(out_of_band) if out_of_band else None)
@@ -623,6 +624,7 @@ def run_cycle(
         hardware_key_verifier=_build_hardware_key_verifier(settings),
         human_confirmation_verifier=_build_human_confirmation_verifier(settings),
         action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
+        distributor_engine=distributor,
     )
     blast_radius_analyzer = CredentialBlastRadiusAnalyzer()
     soar = SoarEngine(Path(settings.get("playbook_path", "playbooks/default_playbook.yaml")), audit)
@@ -707,6 +709,7 @@ def run_cycle(
     containment_result = None
     soar_actions = []
     blast_radius = blast_radius_analyzer.analyze(detector_events, topology)
+    distributor_snapshot = distributor.current_snapshot() if distributor else {}
 
     baseline_ready = all(len(values) >= baseline.min_history for values in baseline.series.values()) if baseline.series else False
 
@@ -745,6 +748,12 @@ def run_cycle(
 
     if active_horizons >= 2:
         candidate_severity = min(99, candidate_severity + 5)
+
+    if distributor_snapshot:
+        if float(distributor_snapshot.get("risk_score", 0.0)) >= 0.6:
+            candidate_severity = min(99, candidate_severity + 7)
+        elif float(distributor_snapshot.get("risk_score", 0.0)) >= 0.4:
+            candidate_severity = min(99, candidate_severity + 4)
 
     autonomous_recon_directives = [
         asdict(d)
@@ -1004,6 +1013,7 @@ def run_cycle(
         "risk_confidence": risk_confidence,
         "distributed_attack_signal": distributed_signal,
         "credential_blast_radius": asdict(blast_radius),
+        "distributor": distributor_snapshot,
         "containment": asdict(containment_result) if containment_result else None,
         "baseline_ready": baseline_ready,
         "soar_actions": soar_actions,
@@ -1056,7 +1066,13 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
     out_of_band = settings.get("audit_out_of_band_path")
     audit = ImmutableAuditLog(out_of_band_path=Path(out_of_band) if out_of_band else None)
     mapper = AssetMapper(CloudProviderAdapter(simulated=bool(settings.get("simulated_mode", False))))
-    ingestor = TelemetryIngestor(Path(settings.get("telemetry_index_path", "data/telemetry_index.jsonl")))
+    distributor_cfg = settings.get("security_distributor", {})
+    distributor = SecurityDistributorEngine(
+        risk_window_seconds=int(distributor_cfg.get("risk_window_seconds", 900)),
+        max_events_per_component=int(distributor_cfg.get("max_events_per_component", 2000)),
+        sensitive_resource_markers=distributor_cfg.get("sensitive_resource_markers"),
+    )
+    ingestor = TelemetryIngestor(Path(settings.get("telemetry_index_path", "data/telemetry_index.jsonl")), distributor_engine=distributor)
     containment = ContainmentEngine(
         audit,
         identity_store=settings.get("approval_identity_store", {}),
@@ -1064,6 +1080,7 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
         hardware_key_verifier=_build_hardware_key_verifier(settings),
         human_confirmation_verifier=_build_human_confirmation_verifier(settings),
         action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
+        distributor_engine=distributor,
     )
     while True:
         state = run_cycle(
@@ -1079,6 +1096,7 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
             mapper=mapper,
             ingestor=ingestor,
             containment=containment,
+            distributor=distributor,
         )
         burst_threshold = int(settings.get("burst_cycle_severity_threshold", 80))
         burst_interval_seconds = float(settings.get("burst_cycle_seconds", 0.1))
