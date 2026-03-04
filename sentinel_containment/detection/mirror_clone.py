@@ -137,12 +137,18 @@ class MirrorCloneDetector:
         rapid_clone_minutes: int = 3,
         max_tracked_shards: int = 2048,
         max_actions_per_shard: int = 20000,
+        global_warmup_events: int | None = None,
+        shard_min_events_after_global_warmup: int = 1,
+        level_five_tamper_bypass_score: float = 0.45,
     ):
         self.warmup_events = warmup_events
         self.min_prediction_confidence = min_prediction_confidence
         self.rapid_clone_minutes = max(1, rapid_clone_minutes)
         self.max_tracked_shards = max(1, int(max_tracked_shards))
         self.max_actions_per_shard = max(100, int(max_actions_per_shard))
+        self.global_warmup_events = max(self.warmup_events, int(global_warmup_events or (self.warmup_events * 3)))
+        self.shard_min_events_after_global_warmup = max(1, int(shard_min_events_after_global_warmup))
+        self.level_five_tamper_bypass_score = max(0.0, min(1.0, float(level_five_tamper_bypass_score)))
         self._seen_events = 0
         self._scan_fingerprint: dict[str, float] = {}
         self._scan_reference: dict[str, float] = {}
@@ -160,6 +166,12 @@ class MirrorCloneDetector:
         self._unique_resources: dict[str, set[str]] = defaultdict(set)
         self._deployments: dict[str, CloneDeployment] = {}
 
+
+    def _shard_warm_enough(self, total_events: int) -> bool:
+        if total_events >= self.warmup_events:
+            return True
+        return self._seen_events >= self.global_warmup_events and total_events >= self.shard_min_events_after_global_warmup
+
     def generate_autonomous_recon_directives(
         self,
         max_directives: int = 4,
@@ -167,7 +179,7 @@ class MirrorCloneDetector:
     ) -> list[ReconDirective]:
         directives: list[ReconDirective] = []
         for shard, action_counts in self._action_counts.items():
-            if sum(action_counts.values()) < self.warmup_events:
+            if not self._shard_warm_enough(sum(action_counts.values())):
                 continue
 
             path, confidence = self._predict_markov_path(shard, horizon=4)
@@ -269,7 +281,7 @@ class MirrorCloneDetector:
         directives: list[StageTwoDirective] = []
         for shard, action_counts in self._action_counts.items():
             total = sum(action_counts.values())
-            if total < self.warmup_events:
+            if not self._shard_warm_enough(total):
                 continue
 
             kill_chain_path, confidence = self._predict_markov_path(shard, horizon=5)
@@ -348,7 +360,7 @@ class MirrorCloneDetector:
     ) -> list[LevelThreeDirective]:
         directives: list[LevelThreeDirective] = []
         for shard, action_counts in self._action_counts.items():
-            if sum(action_counts.values()) < self.warmup_events:
+            if not self._shard_warm_enough(sum(action_counts.values())):
                 continue
 
             kill_chain_path, confidence = self._predict_markov_path(shard, horizon=6)
@@ -450,7 +462,7 @@ class MirrorCloneDetector:
         directives: list[LevelFourDirective] = []
         for shard, action_counts in self._action_counts.items():
             total = sum(action_counts.values())
-            if total < self.warmup_events:
+            if not self._shard_warm_enough(total):
                 continue
 
             kill_chain_path, confidence = self._predict_markov_path(shard, horizon=7)
@@ -548,11 +560,13 @@ class MirrorCloneDetector:
         directives: list[LevelFiveDirective] = []
         for shard, action_counts in self._action_counts.items():
             total = sum(action_counts.values())
-            if total < self.warmup_events:
-                continue
 
             kill_chain_path, confidence = self._predict_markov_path(shard, horizon=8)
             if not kill_chain_path:
+                continue
+
+            local_tamper_score = self._local_tamper_pressure(kill_chain_path)
+            if not self._shard_warm_enough(total) and local_tamper_score < self.level_five_tamper_bypass_score:
                 continue
 
             markov_score = self._markov_kill_chain_score(kill_chain_path)
@@ -560,7 +574,6 @@ class MirrorCloneDetector:
             sustained_abuse = self._sustained_compute_abuse_score(shard)
             p2p_verification_score = min(1.0, 0.45 + (0.25 * confidence) + (0.15 * drift) + (0.15 * sustained_abuse))
             reactive_signal_score = min(1.0, (0.45 * markov_score) + (0.35 * drift) + (0.20 * sustained_abuse))
-            local_tamper_score = self._local_tamper_pressure(kill_chain_path)
             hunter_score = min(
                 1.0,
                 (0.20 * confidence)

@@ -612,6 +612,9 @@ def run_cycle(
         rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
         max_tracked_shards=int(settings.get("clone_max_tracked_shards", 2048)),
         max_actions_per_shard=int(settings.get("clone_max_actions_per_shard", 20000)),
+        global_warmup_events=int(settings.get("clone_global_warmup_events", settings.get("clone_warmup_events", 6) * 3)),
+        shard_min_events_after_global_warmup=int(settings.get("clone_shard_min_events_after_global_warmup", 1)),
+        level_five_tamper_bypass_score=float(settings.get("level_five_tamper_bypass_score", 0.45)),
     )
     containment = containment or ContainmentEngine(
         audit,
@@ -932,6 +935,7 @@ def run_cycle(
                 "block_lateral_movement_paths",
                 "quarantine_host",
                 "forensic_snapshot_metadata",
+                "execute_remote_ssh_containment",
             ]
         elif candidate_severity >= int(settings.get("hard_response_action_threshold", 85)):
             requested_actions.extend([
@@ -956,6 +960,14 @@ def run_cycle(
             simulation_context={"blast_radius": asdict(blast_radius)},
             signature_bundle=_containment_signature(settings),
             confirmation_bundle=_containment_confirmation(settings),
+            action_context={
+                "remote_host": target_host,
+                "remote_user": str(settings.get("containment_ssh_remote_user", "root")),
+                "ssh_port": int(settings.get("containment_ssh_port", 22)),
+                "ssh_connect_timeout_seconds": int(settings.get("containment_ssh_connect_timeout_seconds", 5)),
+                "ssh_private_key_path": str(settings.get("containment_ssh_private_key_path", "data/containment_ssh/id_ed25519")),
+                "containment_commands": settings.get("containment_ssh_command_profile", ["snapshot", "lockdown"]),
+            },
         )
 
     severity_alerts = build_severity_alerts(
@@ -1037,6 +1049,9 @@ def run_forever(config_path: str = "config/config.yaml") -> None:
         rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
         max_tracked_shards=int(settings.get("clone_max_tracked_shards", 2048)),
         max_actions_per_shard=int(settings.get("clone_max_actions_per_shard", 20000)),
+        global_warmup_events=int(settings.get("clone_global_warmup_events", settings.get("clone_warmup_events", 6) * 3)),
+        shard_min_events_after_global_warmup=int(settings.get("clone_shard_min_events_after_global_warmup", 1)),
+        level_five_tamper_bypass_score=float(settings.get("level_five_tamper_bypass_score", 0.45)),
     )
     out_of_band = settings.get("audit_out_of_band_path")
     audit = ImmutableAuditLog(out_of_band_path=Path(out_of_band) if out_of_band else None)

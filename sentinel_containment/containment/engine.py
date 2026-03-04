@@ -112,6 +112,7 @@ class ContainmentEngine:
             "forensic_snapshot_metadata",
             "sinkhole_suspicious_destinations",
             "block_lateral_movement_paths",
+            "execute_remote_ssh_containment",
         }
 
         executed = [a for a in requested_actions if a in safe_actions]

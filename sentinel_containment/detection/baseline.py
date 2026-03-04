@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
@@ -133,7 +134,7 @@ class BehavioralBaseline:
 
             contamination_bias = min(2.5, dynamic_state.contamination_score / 4.0)
             adjusted_score = score + contamination_bias
-            effective_threshold = self.threshold - min(0.55, contamination_bias * 0.35)
+            effective_threshold = self._adaptive_threshold(key, contamination_bias, len(history))
 
             if len(history) >= self.min_history and adjusted_score > effective_threshold:
                 severity = min(100, int(45 + (adjusted_score - effective_threshold) * 18))
@@ -148,6 +149,14 @@ class BehavioralBaseline:
                 self._anchor_mean[key] = (1.0 - alpha) * self._anchor_mean[key] + alpha * current
 
         return anomalies
+
+
+    def _adaptive_threshold(self, key: tuple[str, str], contamination_bias: float, history_len: int) -> float:
+        key_digest = hashlib.sha256(f"{key[0]}|{key[1]}".encode("utf-8")).digest()
+        profile = (key_digest[0] / 255.0) - 0.5
+        jitter = profile * 0.18
+        early_life_sensitivity = 0.12 if history_len < max(self.min_history * 2, 10) else 0.0
+        return self.threshold + jitter - min(0.55, contamination_bias * 0.35) - early_life_sensitivity
 
     @staticmethod
     def _coerce_float(value: Any) -> float | None:

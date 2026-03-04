@@ -174,17 +174,38 @@ class HoneypotDetector:
             hits.append(pinger_line)
         return sorted(set(hits)), bool(hits)
 
+    def _normalize_pattern(self, value: str) -> str:
+        mapped = value.lower()
+        mapped = mapped.replace("two", "2").replace("to", "2")
+        mapped = mapped.replace("zero", "0").replace("one", "1")
+        return self._normalize_blob(mapped)
+
+    def _obfuscated_pattern_regex(self, value: str) -> re.Pattern[str] | None:
+        normalized = "".join(ch for ch in value.lower() if ch.isalnum())
+        if not normalized:
+            return None
+        escaped = [re.escape(ch) for ch in normalized]
+        pattern = r"[^a-z0-9]*".join(escaped)
+        return re.compile(pattern)
+
     def _p2p_dynamic_pattern_matches(self, event: dict[str, Any], metadata_blob: str, decoded_blob: str) -> list[str]:
         action = str(event.get("action", "")).strip().lower()
         resource = str(event.get("resource", "")).strip().lower()
         search_blob = f"{metadata_blob} {decoded_blob} {action} {resource}"
         normalized_search_blob = self._normalize_blob(search_blob)
 
-        matches = sorted(
-            pattern
-            for pattern in self._p2p_threat_patterns
-            if pattern in search_blob or self._normalize_blob(pattern) in normalized_search_blob
-        )
+        matches: list[str] = []
+        for pattern in sorted(self._p2p_threat_patterns):
+            normalized_pattern = self._normalize_pattern(pattern)
+            compact_pattern = "".join(ch for ch in pattern.lower() if ch.isalnum())
+            regex = self._obfuscated_pattern_regex(pattern)
+            if (
+                pattern in search_blob
+                or normalized_pattern in normalized_search_blob
+                or compact_pattern in normalized_search_blob
+                or (regex is not None and regex.search(self._normalize_blob(search_blob)) is not None)
+            ):
+                matches.append(pattern)
         if matches:
             shard = str(event.get("host", "unknown")).strip().lower()
             for match in matches:

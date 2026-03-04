@@ -157,6 +157,9 @@ class SentinelRuntime:
             rapid_clone_minutes=int(settings.get("clone_rapid_deploy_minutes", 3)),
             max_tracked_shards=int(settings.get("clone_max_tracked_shards", 2048)),
             max_actions_per_shard=int(settings.get("clone_max_actions_per_shard", 20000)),
+            global_warmup_events=int(settings.get("clone_global_warmup_events", settings.get("clone_warmup_events", 6) * 3)),
+            shard_min_events_after_global_warmup=int(settings.get("clone_shard_min_events_after_global_warmup", 1)),
+            level_five_tamper_bypass_score=float(settings.get("level_five_tamper_bypass_score", 0.45)),
         )
         self.audit = ImmutableAuditLog(
             out_of_band_path=Path(settings.get("audit_out_of_band_path")) if settings.get("audit_out_of_band_path") else None
