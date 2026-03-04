@@ -67,7 +67,10 @@ class Phase6OrderVerifier:
             raise OrderVerificationError("human confirmation invalid")
 
     def _verify_freshness(self, order: Dict[str, Any]) -> None:
-        ts = datetime.fromisoformat(order["order"]["timestamp"])
+        try:
+            ts = datetime.fromisoformat(order["order"]["timestamp"])
+        except Exception as exc:  # noqa: BLE001
+            raise OrderVerificationError("order timestamp invalid") from exc
         if abs((datetime.now(timezone.utc) - ts).total_seconds()) > self.clock_skew_seconds:
             raise OrderVerificationError("order timestamp stale")
 
@@ -86,9 +89,17 @@ class Phase6OrderVerifier:
 
 
 class TransparencyPublisher:
-    def __init__(self, endpoint: str, timeout: int = 5) -> None:
-        self.endpoint = endpoint
+    def __init__(self, endpoint: str | Sequence[str], timeout: int = 5) -> None:
+        if isinstance(endpoint, str):
+            self.endpoints = [ep.strip() for ep in endpoint.split(",") if ep.strip()]
+        else:
+            self.endpoints = list(endpoint)
         self.timeout = timeout
 
-    def publish(self, signed_decision: Dict[str, Any]) -> requests.Response:
-        return requests.post(self.endpoint, json=signed_decision, timeout=self.timeout)
+    def publish(self, signed_decision: Dict[str, Any]) -> list[requests.Response]:
+        if not self.endpoints:
+            raise RuntimeError("no transparency endpoints configured")
+        responses = []
+        for endpoint in self.endpoints:
+            responses.append(requests.post(endpoint, json=signed_decision, timeout=self.timeout))
+        return responses

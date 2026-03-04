@@ -21,12 +21,19 @@ class SecureKeyStore:
         self.path = path
         self.passphrase = passphrase or os.environ.get("HEGEMON_KEYSTORE_PASSPHRASE", "dev-passphrase")
 
+    def _ensure_secure_parent(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
+        mode = self.path.parent.stat().st_mode & 0o777
+        if mode != 0o700:
+            raise PermissionError(f"keystore directory permissions must be 0o700, got {oct(mode)}")
+
     def _derive_key(self, salt: bytes) -> bytes:
         kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
         return base64.urlsafe_b64encode(kdf.derive(self.passphrase.encode("utf-8")))
 
     def store_secret(self, name: str, secret: bytes) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_secure_parent()
         blob = self._load_blob()
         salt = base64.b64decode(blob["salt"]) if blob else os.urandom(16)
         data = self._decrypt_payload(blob, salt) if blob else {}
@@ -48,6 +55,9 @@ class SecureKeyStore:
     def _load_blob(self):
         if not self.path.exists():
             return None
+        mode = self.path.stat().st_mode & 0o777
+        if mode != 0o600:
+            raise PermissionError(f"keystore file permissions must be 0o600, got {oct(mode)}")
         return json.loads(self.path.read_text())
 
     def _encrypt_payload(self, data: dict, salt: bytes) -> dict:

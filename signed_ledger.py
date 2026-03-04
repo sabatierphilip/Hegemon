@@ -4,6 +4,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import pwd
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,12 +30,28 @@ class LedgerEntry:
 
 
 class SignedLedger:
-    def __init__(self, path: Path, signer: signing.SigningKey) -> None:
+    def __init__(self, path: Path, signer: signing.SigningKey, expected_owner: str | None = None) -> None:
         self.path = path
         self.signer = signer
+        self.expected_owner = expected_owner
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
+        self._validate_permissions(self.path.parent, allowed_modes={0o700, 0o750})
         if not self.path.exists():
-            self.path.write_text("\n")
+            with self.path.open("w", encoding="utf-8"):
+                pass
+            os.chmod(self.path, 0o600)
+        self._validate_permissions(self.path, allowed_modes={0o600})
+
+    def _validate_permissions(self, target: Path, allowed_modes: set[int]) -> None:
+        st = target.stat()
+        mode = st.st_mode & 0o777
+        if mode not in allowed_modes:
+            raise PermissionError(f"unsafe permissions on {target}: {oct(mode)}")
+        if self.expected_owner:
+            expected_uid = pwd.getpwnam(self.expected_owner).pw_uid
+            if st.st_uid != expected_uid:
+                raise PermissionError(f"unsafe owner on {target}: uid={st.st_uid} expected={expected_uid}")
 
     def append(self, event_type: str, payload: Dict[str, Any]) -> LedgerEntry:
         prev_hash = self.last_hash()
@@ -47,7 +66,30 @@ class SignedLedger:
         entry = {**core, "entry_hash": entry_hash, "signature": signature}
         with self.path.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(entry, sort_keys=True) + "\n")
+            fp.flush()
+            os.fsync(fp.fileno())
+        self._anchor_checkpoint(entry_hash)
         return LedgerEntry(**entry)
+
+    def _anchor_checkpoint(self, entry_hash: str) -> None:
+        anchor_path = self.path.with_suffix(self.path.suffix + ".anchor")
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ledger": str(self.path),
+            "entry_hash": entry_hash,
+            "entries": len(self.read_all()),
+        }
+        fd, tmp_name = tempfile.mkstemp(prefix=anchor_path.name, dir=str(anchor_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write(json.dumps(payload, sort_keys=True) + "\n")
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_name, anchor_path)
+            os.chmod(anchor_path, 0o600)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
 
     def last_hash(self) -> str:
         entries = self.read_all()
@@ -60,7 +102,11 @@ class SignedLedger:
                 line = line.strip()
                 if not line:
                     continue
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # tolerate interrupted final line, preserving prior chain continuity
+                    break
         return rows
 
     def verify_chain(self) -> bool:

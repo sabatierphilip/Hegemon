@@ -78,3 +78,5 @@ class WasmModuleLoader:
         unknown_abi = [abi for abi in manifest.required_abi if abi not in ALLOWED_HOST_ABI]
         if unknown_abi:
             raise WasmSecurityError(f"unknown host ABI requested: {unknown_abi}")
+        if "request_action" in manifest.required_abi and "containment_execute" not in manifest.capabilities:
+            raise WasmSecurityError("request_action ABI requires containment_execute capability")

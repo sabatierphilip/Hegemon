@@ -27,7 +27,7 @@ import psutil
 import requests
 from nacl import encoding, exceptions as nacl_exceptions, signing
 
-from attestation import SoftwareAttestationProvider
+from attestation import SoftwareAttestationProvider, TPMAttestationProvider
 from kernel_telemetry import KernelTelemetryConfig, KernelTelemetryManager
 from phase5_update import SecureUpdater
 from phase6_controlplane import Phase6OrderVerifier, TransparencyPublisher
@@ -140,6 +140,8 @@ class AgentConfig:
     monitored_binaries: Sequence[Path] = ()
     host_id: str = socket.gethostname()
     tls_verify: bool = True
+    mtls_client_cert: Optional[str] = None
+    mtls_client_key: Optional[str] = None
     request_timeout_seconds: int = 10
     dashboard_settings_url: Optional[str] = None
     autonomous_containment_enabled: bool = True
@@ -167,8 +169,9 @@ class HegemonAgent:
         self.plugins = plugins or []
         self._stop = threading.Event()
         self.last_checkpoint = "genesis"
+        self._seen_order_nonces: set[str] = set()
         self.ledger = ledger or SignedLedger(Path(".agent/ledger.log"), signing_key)
-        self.attestation = SoftwareAttestationProvider(signing_key)
+        self.attestation = self._build_attestation_provider(signing_key)
         self.wasm_loader = WasmModuleLoader(control_plane_verify_keys, ["process_inspect", "network_inspect", "containment_execute"], self.ledger)
         self.kernel_manager = KernelTelemetryManager(
             KernelTelemetryConfig(
@@ -191,6 +194,15 @@ class HegemonAgent:
             human_hmac_key=self.human_hmac_key,
         )
         self.ledger.append("kernel_telemetry_init", self.kernel_manager.initialize())
+
+    def _build_attestation_provider(self, signing_key: signing.SigningKey):
+        provider = TPMAttestationProvider(signing_key)
+        try:
+            provider.attest("startup-self-test")
+            return provider
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("TPM attestation unavailable, falling back to software_keystore: %s", exc)
+            return SoftwareAttestationProvider(signing_key)
 
     def refresh_dashboard_settings(self) -> None:
         if not self.config.dashboard_settings_url:
@@ -232,11 +244,15 @@ class HegemonAgent:
         }
 
     def post_telemetry(self, telemetry: Dict[str, Any]) -> requests.Response:
+        cert = None
+        if self.config.mtls_client_cert and self.config.mtls_client_key:
+            cert = (self.config.mtls_client_cert, self.config.mtls_client_key)
         return requests.post(
             self.config.control_plane_url,
             json=self.signed_envelope(telemetry),
             timeout=self.config.request_timeout_seconds,
             verify=self.config.tls_verify,
+            cert=cert,
         )
 
     def run_forever(self) -> None:
@@ -308,9 +324,16 @@ class HegemonAgent:
             raise SecurityError("human confirmation HMAC is invalid")
 
     def _validate_freshness(self, core_payload: Dict[str, Any], skew_seconds: int = 120) -> None:
-        issued = datetime.fromisoformat(core_payload["timestamp"])
+        try:
+            issued = datetime.fromisoformat(core_payload["timestamp"])
+        except Exception as exc:  # noqa: BLE001
+            raise SecurityError("invalid order timestamp format") from exc
         if abs((utc_now() - issued).total_seconds()) > skew_seconds:
             raise SecurityError("order timestamp outside clock skew bounds")
+        nonce = str(core_payload.get("nonce", ""))
+        if nonce in self._seen_order_nonces:
+            raise SecurityError("replayed order nonce")
+        self._seen_order_nonces.add(nonce)
 
     def verify_containment_order(self, order: Dict[str, Any]) -> None:
         core_payload = self._validate_required_order_fields(order)
@@ -424,6 +447,8 @@ def run_cli() -> int:
     parser.add_argument("--monitor-bin", action="append", default=[sys.executable])
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--insecure-no-tls-verify", action="store_true", help="Dev only: disable TLS certificate verification")
+    parser.add_argument("--mtls-client-cert", default=None, help="Optional client cert path for mTLS")
+    parser.add_argument("--mtls-client-key", default=None, help="Optional client key path for mTLS")
     parser.add_argument("--disable-autonomous-containment", action="store_true", help="Disable autonomous containment unless explicit --approve is provided")
     parser.add_argument("--ledger-path", default=".agent/ledger.log")
     parser.add_argument("--disable-kernel-telemetry", action="store_true", help="Disable kernel-adjacent telemetry")
@@ -471,6 +496,8 @@ def run_cli() -> int:
             monitored_binaries=[Path(p) for p in args.monitor_bin],
             tls_verify=not args.insecure_no_tls_verify,
             dashboard_settings_url=args.dashboard_settings_url,
+            mtls_client_cert=args.mtls_client_cert,
+            mtls_client_key=args.mtls_client_key,
             autonomous_containment_enabled=not args.disable_autonomous_containment,
             kernel_telemetry_enabled=not args.disable_kernel_telemetry,
             ebpf_program_path=Path(args.ebpf_program) if args.ebpf_program else None,
