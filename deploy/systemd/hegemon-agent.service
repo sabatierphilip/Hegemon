@@ -1,0 +1,21 @@
+[Unit]
+Description=Hegemon Agent Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hegemon
+Group=hegemon
+ExecStart=/usr/bin/python3 /opt/hegemon/hegemon_agent.py run
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_KILL
+ReadWritePaths=/opt/hegemon/.agent /opt/hegemon/.keys
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY hegemon_agent.py /app/hegemon_agent.py
+COPY secure_key_store.py /app/secure_key_store.py
+COPY signed_ledger.py /app/signed_ledger.py
+COPY wasm_security.py /app/wasm_security.py
+COPY attestation.py /app/attestation.py
+COPY kernel_telemetry.py /app/kernel_telemetry.py
+COPY phase6_controlplane.py /app/phase6_controlplane.py
+COPY phase5_update.py /app/phase5_update.py
+COPY phase9_capabilities.py /app/phase9_capabilities.py
+COPY phase7_containment.py /app/phase7_containment.py
+COPY tests/test_hegemon_agent.py /app/tests/test_hegemon_agent.py
+
+CMD ["pytest", "-q", "tests/test_hegemon_agent.py"]

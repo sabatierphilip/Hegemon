@@ -1,0 +1,13 @@
+<Service>
+  <Name>HegemonAgent</Name>
+  <DisplayName>Hegemon Agent</DisplayName>
+  <Description>Defensive endpoint agent for Hegemon control plane</Description>
+  <StartMode>Automatic</StartMode>
+  <RunAs>NT SERVICE\HegemonAgent</RunAs>
+  <FailureActions>
+    <Restart DelayMs="5000" />
+    <Restart DelayMs="5000" />
+    <None />
+  </FailureActions>
+  <Command>python.exe C:\Hegemon\hegemon_agent.py run</Command>
+</Service>

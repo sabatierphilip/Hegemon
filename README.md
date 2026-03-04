@@ -144,3 +144,72 @@ Rules now support structured matching that goes beyond simple equality/threshold
 - `long_window_accumulation` for low-and-slow exfil detection over extended windows
 - `field_entropy` for covert-channel spotting (encoded/high-entropy payloads in DNS or API fields)
 - `windowed_count` + `additional_checks` for low-and-slow DNS tunnel detection across long windows
+
+## Hegemon Agent (Phase 6 baseline with deep Phase 4/5/6 implementation)
+
+### What is implemented now
+- **Phase 4**: kernel-adjacent telemetry manager (`kernel_telemetry.py`) with signed eBPF admission checks, Linux BCC path, Windows ETW abstraction, and safe fallback counters.
+- **Phase 5**: secure update primitives (`phase5_update.py`) that verify signed manifest, checksum, and reproducible fingerprint before atomic swap.
+- **Phase 6**: containment verification (`phase6_controlplane.py`) including valid-signature quorum checks, human confirmation HMAC checks, freshness validation, checkpoint causality checks, and transparency publication hooks.
+
+### Run control-plane service
+
+```bash
+python control_plane_service.py --port 9443
+```
+
+### Toggle autonomous containment (dashboard API)
+
+```bash
+curl -X POST http://localhost:9443/dashboard/settings -H 'Content-Type: application/json' -d '{"autonomous_containment_enabled": false}'
+```
+
+### Issue a containment order from control-plane endpoint
+
+```bash
+curl -X POST http://localhost:9443/orders/containment -H 'Content-Type: application/json' -d '{"target_host":"localhost","pid":12345,"quorum":2,"checkpoint":"genesis"}'
+```
+
+### Run agent
+
+```bash
+python hegemon_agent.py --control-plane-url http://localhost:9443/telemetry --dashboard-settings-url http://localhost:9443/dashboard/settings --transparency-url http://localhost:9443/transparency/decisions run
+```
+
+### Run with signed eBPF source (Linux)
+
+```bash
+python hegemon_agent.py --ebpf-program ./ebpf/exec_net.c --ebpf-signature ./ebpf/exec_net.sig run
+```
+
+### Tests
+
+```bash
+pytest -q tests/test_hegemon_agent.py
+```
+
+## Phase 9 adaptive runtime capabilities (implemented)
+
+The agent now supports a persistent capability lifecycle for WASM modules:
+- Dual-approval install path: control-plane signature over canonical manifest + human HMAC over manifest digest.
+- Signed module admission and manifest capability policy checks are enforced before install.
+- Persistent capability registry (`.agent/capability_registry.json`) stores module metadata and reproducible build fingerprint.
+- Revocation flow disables module capabilities immediately and records revocation to the signed ledger.
+- Peer revocation broadcast scaffolding records intended revocation propagation.
+
+New CLI actions:
+
+```bash
+python hegemon_agent.py module-install \
+  --wasm ./module.wasm \
+  --manifest ./module.manifest.json \
+  --module-signature ./module.sig \
+  --control-signature <base64-control-signature> \
+  --operator-id op-1 \
+  --nonce nonce-1 \
+  --human-hmac <hmac>
+```
+
+```bash
+python hegemon_agent.py module-revoke --module-id m9
+```
