@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from sentinel_containment.security.distributor import SecurityDistributorEngine
 from sentinel_containment.telemetry.schema import NormalizedEvent
 
 
@@ -38,12 +39,14 @@ class TelemetryIngestor:
         output_path: Path = Path("data/telemetry_index.jsonl"),
         signing_key: str | None = None,
         key_rotation_seconds: int = 300,
+        distributor_engine: SecurityDistributorEngine | None = None,
     ):
         self.output_path = output_path
         self.signing_key = (signing_key or os.getenv("TELEMETRY_SIGNING_KEY") or "hegemon-default-telemetry-key").encode("utf-8")
         self.key_rotation_seconds = max(60, int(key_rotation_seconds))
         protected_paths = os.getenv("TELEMETRY_PROTECTED_PATH_PATTERNS", r"^/(etc|boot|root|var/lib/kubelet|var/lib/docker|sys|proc)")
         self._protected_path_pattern = re.compile(protected_paths)
+        self.distributor_engine = distributor_engine
 
     def _epoch(self, event_ts: str) -> int:
         dt = datetime.fromisoformat(event_ts.replace("Z", "+00:00"))
@@ -108,6 +111,7 @@ class TelemetryIngestor:
         epoch = self._epoch(event_ts)
         collector_level = str(raw_event.get("collector_level", "workload"))
         verification = self._core_and_file_access_verification(source_type, doc, raw_event)
+        distributor_envelope = self.distributor_engine.enrich_event(source_type, doc) if self.distributor_engine else {}
         integrity_payload = {
             **doc,
             "collector_level": collector_level,
@@ -118,6 +122,7 @@ class TelemetryIngestor:
             "hypervisor_visible": bool(raw_event.get("hypervisor_visible", source_type == "hypervisor")),
             "collector_level_verified": self._collector_level_verified(source_type, collector_level),
             "verification": verification,
+            "distributor": distributor_envelope,
             "integrity": {
                 "prev_chain_hash": prev_chain_hash,
                 "signature_epoch": epoch,
