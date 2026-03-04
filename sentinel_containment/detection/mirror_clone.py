@@ -592,10 +592,10 @@ class MirrorCloneDetector:
                     target_resource=target_resource,
                     kill_chain_path=kill_chain_path,
                     friendly_shields=[
-                        "p2p_directive_verification_quorum",
-                        "reactive_local_tamper_lockdown",
-                        "friendlies_clone_shielding",
-                        "global_action_signal_broadcast",
+                        "peer:p2p_directive_verification_quorum",
+                        "peer:reactive_local_tamper_lockdown",
+                        "peer:friendlies_clone_shielding",
+                        "peer:global_action_signal_broadcast",
                     ],
                     rationale=(
                         "Level-5 hunter directive generated for friendly-system anti-compromise posture: "

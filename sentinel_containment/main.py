@@ -251,7 +251,19 @@ def execute_counter_clone_actions(
             continue
 
         if action == "isolate_proto_agi_mesh":
-            _record(action, target, "simulated", {"mode": "proto_agi_mesh_isolation", "rule": "mesh_sinkhole"})
+            result = containment.execute(
+                host=simulated_host,
+                severity=90,
+                requested_actions=["sinkhole_suspicious_destinations", "block_lateral_movement_paths", "disable_outbound_traffic"],
+                approvals=["user"],
+                simulation_mode=False,
+                signature_bundle=signature_bundle,
+                action_context={
+                    "destinations": [segment.strip() for segment in target.split("||") if segment.strip()],
+                    "lateral_paths": ["mesh-control-plane", "east-west-overlay", "agent-sidecar-channel"],
+                },
+            )
+            _record(action, target, "executed" if result.approved else "blocked", {"approved": result.approved, "actions": result.actions_executed, "message": result.message})
             continue
 
         if action == "deploy_level4_persistent_hunter_mesh":
@@ -277,7 +289,20 @@ def execute_counter_clone_actions(
             continue
 
         if action == "continuous_objective_enforcement":
-            _record(action, target, "executed", {"mode": "always_on_objectives"})
+            objectives = [segment.strip() for segment in target.split("|") if segment.strip()]
+            route_denial_applied = False
+            if "adversarial_route_denial" in objectives:
+                denial_result = containment.execute(
+                    host=simulated_host,
+                    severity=88,
+                    requested_actions=["block_lateral_movement_paths"],
+                    approvals=["user"],
+                    simulation_mode=False,
+                    signature_bundle=signature_bundle,
+                    action_context={"lateral_paths": ["route:egress", "route:mesh-east-west", "route:c2-beacon"]},
+                )
+                route_denial_applied = denial_result.approved
+            _record(action, target, "executed", {"mode": "always_on_objectives", "objectives": objectives, "adversarial_route_denial_applied": route_denial_applied})
             continue
 
         if action == "deploy_level5_hunter_directive_mesh":
@@ -329,8 +354,9 @@ def execute_counter_clone_actions(
 
         if action == "p2p_verify_hunter_directives":
             shields = [segment.strip() for segment in target.split("|") if segment.strip()]
-            quorum = 2 if len(shields) > 1 else 1
-            verified = len(shields) >= quorum
+            attested = [shield for shield in shields if shield.startswith("peer:")]
+            quorum = 2 if len(attested) > 1 else 1
+            verified = len(attested) >= quorum
             _record(
                 action,
                 target,
@@ -339,6 +365,7 @@ def execute_counter_clone_actions(
                     "verified": verified,
                     "quorum": quorum,
                     "available_shields": shields,
+                    "attested_peers": attested,
                 },
             )
             continue
@@ -413,6 +440,74 @@ def compute_risk_confidence(
     return round((severity_norm * 0.55) + (detector_consensus * 0.30) + (blast_norm * 0.15), 4)
 
 
+
+
+def build_severity_alerts(
+    rule_alerts: list,
+    graph_anomalies: list,
+    attack_chains: list,
+    honeypot_alerts: list,
+    mirror_alerts: list,
+    baseline_anomalies: list,
+) -> list[dict[str, Any]]:
+    alerts: list[dict[str, Any]] = []
+
+    for alert in rule_alerts:
+        alerts.append({
+            "source": "rule_engine",
+            "severity": int(getattr(alert, "severity", 0)),
+            "title": str(getattr(alert, "rule", "rule_alert")),
+            "summary": str(getattr(alert, "description", "")),
+            "host": str(getattr(alert, "event", {}).get("host", "unknown")),
+        })
+
+    for anomaly in graph_anomalies:
+        alerts.append({
+            "source": "graph_anomaly",
+            "severity": int(getattr(anomaly, "severity", 0)),
+            "title": str(getattr(anomaly, "relation", "graph_edge")),
+            "summary": f"{getattr(anomaly, 'source', 'unknown')} -> {getattr(anomaly, 'target', 'unknown')}",
+            "host": str(getattr(anomaly, "event", {}).get("host", "unknown")),
+        })
+
+    for chain in attack_chains:
+        alerts.append({
+            "source": "attack_chain",
+            "severity": int(getattr(chain, "severity", 0)),
+            "title": "attack_chain",
+            "summary": str(getattr(chain, "summary", "")),
+            "host": str(getattr(chain, "host", "unknown")),
+        })
+
+    for anomaly in baseline_anomalies:
+        alerts.append({
+            "source": "baseline_anomaly",
+            "severity": int(getattr(anomaly, "severity", 0)),
+            "title": str(getattr(anomaly, "metric", "baseline_metric")),
+            "summary": f"value={getattr(anomaly, 'value', 'unknown')} z={getattr(anomaly, 'zscore', 'unknown')}",
+            "host": str(getattr(anomaly, "host", "unknown")),
+        })
+
+    for alert in honeypot_alerts:
+        alerts.append({
+            "source": "honeypot",
+            "severity": int(getattr(alert, "severity", 0)),
+            "title": str(getattr(alert, "classification", "honeypot")),
+            "summary": ", ".join(getattr(alert, "matched_indicators", [])[:4]),
+            "host": str(getattr(alert, "event", {}).get("host", "unknown")),
+        })
+
+    for alert in mirror_alerts:
+        alerts.append({
+            "source": "mirror_clone",
+            "severity": int(getattr(alert, "severity", 0)),
+            "title": str(getattr(alert, "classification", "mirror_clone")),
+            "summary": str(getattr(alert, "description", "")),
+            "host": str(getattr(alert, "event", {}).get("host", "unknown")),
+        })
+
+    alerts.sort(key=lambda item: int(item.get("severity", 0)), reverse=True)
+    return alerts
 def should_simulate_containment(settings: Settings, severity: int, blast_radius_score: int, immediate: bool) -> bool:
     simulation_default = bool(settings.get("containment_simulation_mode", False))
     if immediate or not simulation_default:
@@ -615,12 +710,16 @@ def run_cycle(
     candidate_severity = 0
     if correlated:
         candidate_severity = correlated.severity
+    if rule_alerts:
+        candidate_severity = max(candidate_severity, max(a.severity for a in rule_alerts))
     if graph_anomalies:
         candidate_severity = max(candidate_severity, max(a.severity for a in graph_anomalies))
     if attack_chains:
         candidate_severity = max(candidate_severity, max(c.severity for c in attack_chains))
     if honeypot_alerts:
         candidate_severity = max(candidate_severity, max(a.severity for a in honeypot_alerts))
+    if baseline_alerts:
+        candidate_severity = max(candidate_severity, max(a.severity for a in baseline_alerts))
     if mirror_alerts:
         candidate_severity = max(candidate_severity, max(a.severity for a in mirror_alerts))
         deploy_threshold = int(settings.get("clone_deploy_severity_threshold", 75))
@@ -859,6 +958,15 @@ def run_cycle(
             confirmation_bundle=_containment_confirmation(settings),
         )
 
+    severity_alerts = build_severity_alerts(
+        rule_alerts,
+        graph_anomalies,
+        attack_chains,
+        honeypot_alerts,
+        mirror_alerts,
+        baseline_alerts,
+    )
+
     state = {
         "topology": topology,
         "events_processed": len(recent_events),
@@ -880,6 +988,7 @@ def run_cycle(
         "level_five_hunter_directives": level_five_hunter_directives,
         "correlated": asdict(correlated) if correlated else None,
         "candidate_severity": candidate_severity,
+        "severity_alerts": severity_alerts,
         "risk_confidence": risk_confidence,
         "distributed_attack_signal": distributed_signal,
         "credential_blast_radius": asdict(blast_radius),
