@@ -123,10 +123,12 @@ class PeerVerificationMesh:
         process_keys: dict[str, str],
         max_clock_skew_seconds: int = 30,
         external_verifiers: list[ExternalAttestationVerifier] | None = None,
+        require_external_verifiers: bool = True,
     ):
         self._process_keys = dict(process_keys)
         self._max_clock_skew_seconds = max(5, int(max_clock_skew_seconds))
         self._external_verifiers = list(external_verifiers or [])
+        self._require_external_verifiers = bool(require_external_verifiers)
 
     @property
     def process_ids(self) -> list[str]:
@@ -149,6 +151,8 @@ class PeerVerificationMesh:
 
     def verify_external_peer(self, peer_id: str, evidence_bundle: dict[str, dict[str, Any]] | None) -> tuple[bool, list[dict[str, Any]]]:
         if not self._external_verifiers:
+            if self._require_external_verifiers:
+                return False, [{"peer_id": peer_id, "provider": "external_attestation", "reason": "no_verifiers_configured"}]
             return True, []
         failures = []
         for verifier in self._external_verifiers:
@@ -196,6 +200,22 @@ class PeerVerificationMesh:
 
         for responder in peers:
             evidence_for_peer = peer_external_evidence.get(responder, {})
+            if not self._external_verifiers and self._require_external_verifiers:
+                verdict = {
+                    "responder": responder,
+                    "provider": "external_attestation",
+                    "verified": False,
+                    "reason": "no_verifiers_configured",
+                }
+                external_verification.append(verdict)
+                failures.append(
+                    {
+                        "challenger": "external_verifier",
+                        "responder": responder,
+                        "reason": "external_attestation:no_verifiers_configured",
+                    }
+                )
+                continue
             for verifier in self._external_verifiers:
                 evidence = evidence_for_peer.get(verifier.provider_name)
                 verified, reason = verifier.verify(responder, evidence)

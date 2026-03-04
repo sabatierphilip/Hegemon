@@ -12,6 +12,7 @@ python scripts/start_sentinel.py
 
 What starts automatically:
 - Syslog UDP listener (`5514`)
+- Kernel webhook listener (`5515`) with HMAC request authentication (`X-Hegemon-Timestamp` + `X-Hegemon-Signature`)
 - JSONL ingestion watchers (`cloudtrail`, `network_flows`, `model_api`, `osquery`, `kernel`, `runtime`, `hypervisor`, `counterclone`)
 - Periodic detection/correlation/containment cycles
 - Probabilistic MITRE-aware attack chain extraction
@@ -41,6 +42,11 @@ Write real events to the configured files (or bind mount/pipe your collector out
 
 Send syslog to UDP `5514`.
 
+For kernel webhook ingestion (`5515`), sign POST payloads as `HMAC_SHA256(<timestamp> + "." + <raw_body>)` with your shared key and send:
+- `X-Hegemon-Timestamp: <unix-seconds>`
+- `X-Hegemon-Signature: <hex>` (or `sha256=<hex>`)
+
+
 ## Configuration
 
 Main settings are in `config/config.yaml`:
@@ -53,6 +59,7 @@ Main settings are in `config/config.yaml`:
 - `hard_quarantine_threshold` to force quarantine at elevated severity
 - `fast_track_containment_threshold`/`fast_track_risk_confidence` for immediate containment based on multi-signal confidence
 - `ingestion.*` for real source locations and ports across cloud, host, runtime, hypervisor, and counter-clone feeds
+- `ingestion.kernel_webhook_hmac_required` / `ingestion.kernel_webhook_hmac_key` / `ingestion.kernel_webhook_hmac_max_skew_seconds` to enforce signed kernel webhook events (also supports `HEGEMON_KERNEL_WEBHOOK_HMAC_KEY`)
 - `approval_quorum` and `automated_approvers` to control single-person fast authorization
 - `trusted_hardware_public_keys` and `containment_signature` to require YubiKey/TPM-backed signatures before any containment execution
 - `honeypot_resources` for decoy assets that should never be accessed
@@ -69,6 +76,7 @@ Main settings are in `config/config.yaml`:
 - `level_four_max_directives`/`level_four_min_dominance_score` to tune continuously deployed level-4 hunting meshes
 - `level_five_max_directives`/`level_five_min_hunter_score` to tune level-5 friendly-integrity hunter meshes
 - `incident_drill_severity` and `drill_auto_configure_hardware_keys` to run deterministic severe-alert drill simulations through the same approval path
+- `fast_lane.server_cert_path` / `server_key_path` / `client_ca_cert_path` must exist at deploy time; if missing, fast-lane is intentionally disabled and only the standard ingestion/detection path remains active
 
 
 ## GitHub zip download + cryptographic sealing

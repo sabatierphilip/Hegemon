@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.server
+from http.client import HTTPMessage
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import threading
 import time
 import hmac
 import hashlib
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -93,6 +95,14 @@ class PushWebhookHandler(http.server.BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
+
+        verified, reason = server.verify_request_auth(raw, self.headers)
+        if not verified:
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "invalid_signature", "reason": reason}).encode("utf-8"))
+            return
+
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -130,12 +140,48 @@ class PushWebhookServer(ThreadingHTTPServer):
         source_type: str,
         path: str,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        hmac_key: str | None = None,
+        hmac_required: bool = True,
+        hmac_max_skew_seconds: int = 300,
     ):
         self.ingestor = ingestor
         self.source_type = source_type
         self.path = path
         self.on_event = on_event
+        self.hmac_key = str(hmac_key or "").strip()
+        self.hmac_required = bool(hmac_required)
+        self.hmac_max_skew_seconds = max(1, int(hmac_max_skew_seconds))
+        if self.hmac_required and not self.hmac_key:
+            logger.warning("Kernel webhook HMAC is required but no key is configured; requests will be rejected")
         super().__init__((host, port), PushWebhookHandler)
+
+    def verify_request_auth(self, raw: bytes, headers: HTTPMessage) -> tuple[bool, str]:
+        if not self.hmac_required and not self.hmac_key:
+            return True, "disabled"
+        if not self.hmac_key:
+            return False, "missing_hmac_key"
+
+        timestamp = str(headers.get("X-Hegemon-Timestamp", "")).strip()
+        signature = str(headers.get("X-Hegemon-Signature", "")).strip().lower()
+        if signature.startswith("sha256="):
+            signature = signature.split("=", 1)[1]
+        if not timestamp or not signature:
+            return False, "missing_signature_headers"
+
+        try:
+            ts = int(timestamp)
+        except ValueError:
+            return False, "invalid_timestamp"
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        if abs(now - ts) > self.hmac_max_skew_seconds:
+            return False, "timestamp_out_of_window"
+
+        canonical = timestamp.encode("utf-8") + b"." + raw
+        expected = hmac.new(self.hmac_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return False, "signature_mismatch"
+        return True, "verified"
 
 
 def parse_syslog_line(line: str) -> dict[str, Any]:
@@ -260,6 +306,9 @@ class IngestionService:
         kernel_webhook_port: int = 5515,
         kernel_webhook_path: str = "/kernel-event",
         on_kernel_event: Callable[[dict[str, Any]], None] | None = None,
+        kernel_webhook_hmac_key: str | None = None,
+        kernel_webhook_hmac_required: bool = True,
+        kernel_webhook_hmac_max_skew_seconds: int = 300,
         counterclone_integrity_key: str | None = None,
     ):
         self.ingestor = ingestor
@@ -271,6 +320,9 @@ class IngestionService:
             source_type="host_kernel",
             path=kernel_webhook_path,
             on_event=on_kernel_event,
+            hmac_key=kernel_webhook_hmac_key,
+            hmac_required=kernel_webhook_hmac_required,
+            hmac_max_skew_seconds=kernel_webhook_hmac_max_skew_seconds,
         )
         self.file_sources = [
             JSONLinesFileSource(cloudtrail_path, "cloud_audit", ingestor),

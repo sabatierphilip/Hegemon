@@ -212,6 +212,31 @@ class HoneypotDetector:
                 self._recent_p2p_pattern_hits[shard].append(match)
         return matches
 
+    def _proto_agi_indicator_matches(
+        self,
+        metadata_blob: str,
+        normalized_metadata_blob: str,
+        decoded_blob: str,
+        normalized_decoded_blob: str,
+    ) -> list[str]:
+        matches: list[str] = []
+        combined_blob = f"{metadata_blob} {decoded_blob}".strip()
+        normalized_combined_blob = self._normalize_blob(combined_blob)
+        for indicator in sorted(self.proto_agi_indicators):
+            normalized_indicator = self._normalize_pattern(indicator)
+            compact_indicator = "".join(ch for ch in indicator.lower() if ch.isalnum())
+            regex = self._obfuscated_pattern_regex(indicator)
+            if (
+                indicator in metadata_blob
+                or normalized_indicator in normalized_metadata_blob
+                or indicator in decoded_blob
+                or normalized_indicator in normalized_decoded_blob
+                or compact_indicator in normalized_combined_blob
+                or (regex is not None and regex.search(normalized_combined_blob) is not None)
+            ):
+                matches.append(indicator)
+        return matches
+
     def evaluate(self, event: dict[str, Any]) -> list[HoneypotAlert]:
         resource = str(event.get("resource", "")).strip().lower()
         metadata_blob_raw = self._metadata_blob(event, lowercase=False)
@@ -223,15 +248,11 @@ class HoneypotDetector:
         pinger_lines, pinger_ping = self._resource_pinger_signals(event, metadata_blob)
         p2p_pattern_hits = self._p2p_dynamic_pattern_matches(event, metadata_blob, decoded_blob)
 
-        matched_indicators = sorted(
-            indicator
-            for indicator in self.proto_agi_indicators
-            if (
-                indicator in metadata_blob
-                or self._normalize_blob(indicator) in normalized_blob
-                or indicator in decoded_blob
-                or self._normalize_blob(indicator) in normalized_decoded_blob
-            )
+        matched_indicators = self._proto_agi_indicator_matches(
+            metadata_blob,
+            normalized_blob,
+            decoded_blob,
+            normalized_decoded_blob,
         )
         matched_tactics = self._match_advanced_tactics(metadata_blob)
         is_decoy_trip = any(decoy and (decoy in resource or decoy in metadata_blob) for decoy in self.decoy_resources)
@@ -261,6 +282,11 @@ class HoneypotDetector:
             kill_chain_recommended = True
             severity = min(100, 96 + len(matched_tactics))
             reason = f"Sophisticated decoy intrusion detected ({','.join(matched_tactics)})"
+        elif matched_indicators:
+            classification = "proto_agi_indicator_detected"
+            kill_chain_recommended = True
+            severity = 90
+            reason = "Proto-AGI indicators detected in telemetry; immediate containment recommended"
         elif is_decoy_trip:
             classification = "honeypot_tripwire"
             kill_chain_recommended = False

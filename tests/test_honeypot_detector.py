@@ -60,3 +60,20 @@ def test_honeypot_detector_catches_base64_encoded_indicator():
     assert alerts
     assert alerts[0].classification == "proto_agi_honeypot_tripwire"
     assert "policy evasion" in alerts[0].matched_indicators
+
+
+def test_honeypot_detector_auto_contains_plain_proto_agi_hit_without_decoy_touch():
+    detector = HoneypotDetector(["decoy://llm-admin"], ["recursive self-improvement"])
+
+    alerts = detector.evaluate(
+        {
+            "resource": "prod://inference-api",
+            "action": "model_update",
+            "message": "r3curs1v3 s3lf-1mpr0v3m3nt pipeline started",
+        }
+    )
+
+    assert alerts
+    assert alerts[0].classification == "proto_agi_indicator_detected"
+    assert alerts[0].kill_chain_recommended is True
+    assert alerts[0].severity >= 85
