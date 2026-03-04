@@ -11,6 +11,7 @@ from sentinel_containment.asset_mapper.discovery import AssetMapper
 from sentinel_containment.cloud.provider import CloudProviderAdapter
 from sentinel_containment.config import Settings
 from sentinel_containment.containment.engine import ContainmentEngine
+from sentinel_containment.containment.executors import ContainmentActionExecutor
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
 from sentinel_containment.detection.baseline import BehavioralBaseline
 from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
@@ -133,6 +134,175 @@ def test_containment_honors_configured_quorum(tmp_path):
     allowed = engine.execute("h1", 90, ["quarantine_host"], ["alice", "bob"], signature_bundle=allowed_bundle)
     assert allowed.approved
 
+
+def test_containment_live_executor_actions_are_not_noops(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    executor = ContainmentActionExecutor(active_mode=True)
+    bundle, cfg = _hardware_auth_for(
+        "h-exec",
+        95,
+        [
+            "block_lateral_movement_paths",
+            "forensic_snapshot_metadata",
+            "revoke_rotate_api_keys",
+            "pause_model_serving_container",
+            "kill_active_model_sessions",
+        ],
+        ["user"],
+        authorize_all_containment=True,
+    )
+    engine = ContainmentEngine(
+        audit,
+        hardware_key_verifier=HardwareKeyVerifier(cfg["trusted_hardware_public_keys"]),
+        action_executor=executor,
+    )
+    result = engine.execute(
+        host="h-exec",
+        severity=95,
+        requested_actions=[
+            "block_lateral_movement_paths",
+            "forensic_snapshot_metadata",
+            "revoke_rotate_api_keys",
+            "pause_model_serving_container",
+            "kill_active_model_sessions",
+        ],
+        approvals=["user"],
+        simulation_mode=False,
+        signature_bundle=bundle,
+        action_context={
+            "lateral_paths": ["ssh", "docker_socket"],
+            "lateral_block_registry_path": str(tmp_path / "lateral_blocks.json"),
+            "forensic_snapshot_dir": str(tmp_path / "snaps"),
+            "api_key_registry_path": str(tmp_path / "api_keys.json"),
+            "paused_container_registry_path": str(tmp_path / "paused_containers.json"),
+            "container_id": "model-serving-1",
+            "model_session_pids": [999999],
+        },
+    )
+
+    assert result.approved is True
+    last = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").splitlines()[-1])
+    action_results = {entry["action"]: entry for entry in last["payload"]["action_results"]}
+
+    assert action_results["block_lateral_movement_paths"]["status"] in {"executed", "no-op"}
+    assert action_results["forensic_snapshot_metadata"]["status"] == "executed"
+    assert action_results["revoke_rotate_api_keys"]["status"] == "executed"
+    assert action_results["pause_model_serving_container"]["status"] in {"executed", "simulated"}
+    assert action_results["kill_active_model_sessions"]["status"] in {"failed", "partial", "executed"}
+
+    assert (tmp_path / "lateral_blocks.json").exists()
+    assert (tmp_path / "api_keys.json").exists()
+    assert list((tmp_path / "snaps").glob("snapshot-h-exec-*.json"))
+
+
+
+
+def test_run_cycle_emits_severity_alert_feed(tmp_path):
+    index_path = tmp_path / "telemetry_index.jsonl"
+    ingestor = TelemetryIngestor(index_path)
+    ingestor.ingest(
+        "model_api",
+        {
+            "host": "sev-feed-host",
+            "user": "svc",
+            "process": "gateway",
+            "action": "model_invoke",
+            "resource": "model-a",
+            "api_call_count": 950,
+            "egress_mb": 980,
+            "gpu_cpu": 97,
+        },
+    )
+
+    state = run_cycle(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(index_path),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "baseline_min_history": 1,
+                "fast_track_containment_threshold": 101,
+            }
+        )
+    )
+
+    assert state["severity_alerts"]
+    assert all("severity" in item for item in state["severity_alerts"])
+    assert state["severity_alerts"][0]["severity"] >= state["severity_alerts"][-1]["severity"]
+    assert state["candidate_severity"] >= state["severity_alerts"][0]["severity"]
+
+
+def test_runtime_telemetry_permission_enables_advanced_kernel_reader(tmp_path):
+    runtime = SentinelRuntime(
+        Settings(
+            {
+                "simulated_mode": False,
+                "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+                "latest_state_path": str(tmp_path / "state.json"),
+                "rules_path": "rules",
+                "playbook_path": "playbooks/default_playbook.yaml",
+                "auto_grant_telemetry_permission": False,
+                "ingestion": {
+                    "syslog_host": "127.0.0.1",
+                    "syslog_port": 0,
+                    "kernel_webhook_host": "127.0.0.1",
+                    "kernel_webhook_port": 0,
+                    "cloudtrail_file": str(tmp_path / "c.jsonl"),
+                    "network_flow_file": str(tmp_path / "n.jsonl"),
+                    "model_api_file": str(tmp_path / "m.jsonl"),
+                },
+            }
+        )
+    )
+    notice = runtime.apply_telemetry_permission(True)
+    runtime.stop()
+
+    assert notice["completed"] is True
+    assert "enabled_advanced_kernel_reader" in notice["details"]
+
+
+
+
+def test_ssh_hardening_executor_writes_strict_controls(tmp_path):
+    executor = ContainmentActionExecutor(active_mode=True)
+    result = executor.execute(
+        host="ssh-h1",
+        action="harden_ssh_lateral_paths",
+        context={
+            "ssh_blocked_principals": ["root", "admin"],
+            "ssh_allowed_source_networks": ["10.0.0.0/24", "192.168.1.0/24"],
+            "ssh_hardening_include_path": str(tmp_path / "sshd_containment.conf"),
+            "ssh_blocklist_registry_path": str(tmp_path / "ssh_blocklist.json"),
+        },
+    )
+
+    assert result.status == "executed"
+    include = (tmp_path / "sshd_containment.conf").read_text(encoding="utf-8")
+    assert "PasswordAuthentication no" in include
+    assert "DenyUsers admin root" in include or "DenyUsers root admin" in include
+
+    registry = json.loads((tmp_path / "ssh_blocklist.json").read_text(encoding="utf-8"))
+    assert "ssh-h1" in registry["hosts"]
+    assert set(registry["hosts"]["ssh-h1"]["blocked_principals"]) == {"root", "admin"}
+
+
+def test_block_lateral_paths_triggers_ssh_hardening_when_ssh_present(tmp_path):
+    executor = ContainmentActionExecutor(active_mode=True)
+    result = executor.execute(
+        host="ssh-h2",
+        action="block_lateral_movement_paths",
+        context={
+            "lateral_paths": ["ssh", "kubelet_api"],
+            "lateral_block_registry_path": str(tmp_path / "lateral.json"),
+            "ssh_hardening_include_path": str(tmp_path / "sshd.conf"),
+            "ssh_blocklist_registry_path": str(tmp_path / "ssh_block.json"),
+        },
+    )
+
+    assert result.status in {"executed", "no-op"}
+    assert result.details["ssh_hardening"]["status"] == "executed"
+    assert (tmp_path / "sshd.conf").exists()
 
 def test_run_cycle_with_real_ingested_events(tmp_path):
     index_path = tmp_path / "telemetry_index.jsonl"

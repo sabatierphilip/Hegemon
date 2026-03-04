@@ -240,7 +240,7 @@ HTML = """
 
   <div class=\"grid\">
     <div class=\"card\"><div class=\"muted\">Events Processed</div><div class=\"kpi\">{{ events_processed }}</div></div>
-    <div class=\"card\"><div class=\"muted\">Rule Alerts</div><div class=\"kpi\">{{ alerts_count }}</div></div>
+    <div class=\"card\"><div class=\"muted\">Severity Alerts</div><div class=\"kpi\">{{ alerts_count }}</div></div>
     <div class=\"card\"><div class=\"muted\">Graph Edge Anomalies</div><div class=\"kpi\">{{ graph_count }}</div></div>
     <div class=\"card\"><div class=\"muted\">Attack Chains</div><div class=\"kpi\">{{ chains_count }}</div></div>
   </div>
@@ -279,6 +279,23 @@ HTML = """
     </div>
 
     <div>
+      <div class=\"panel\">
+        <h3>Severity Alert Feed</h3>
+        <table>
+          <thead><tr><th>Source</th><th>Host</th><th>Title</th><th>Severity</th></tr></thead>
+          <tbody>
+            {% for a in severity_alerts[:25] %}
+            <tr>
+              <td>{{ a.source }}</td>
+              <td>{{ a.host }}</td>
+              <td>{{ a.title }}</td>
+              <td class=\"sev {{ severity_class(a.severity) }}\">{{ a.severity }}</td>
+            </tr>
+            {% endfor %}
+            {% if not severity_alerts %}<tr><td colspan=\"4\" class=\"small muted\">No severity alerts in current cycle.</td></tr>{% endif %}
+          </tbody>
+        </table>
+      </div>
       <div class=\"panel\">
         <h3>Correlated Alert Overview</h3>
         <div class=\"json\"><pre>{{ correlated }}</pre></div>
@@ -553,12 +570,13 @@ def dashboard():
     return render_template_string(
         HTML,
         events_processed=state.get("events_processed", 0),
-        alerts_count=len(state.get("alerts", [])),
+        alerts_count=len(state.get("severity_alerts", state.get("alerts", []))),
         graph_count=len(state.get("graph_anomalies", [])),
         chains_count=len(state.get("attack_chains", [])),
         candidate_severity=state.get("candidate_severity", 0),
         graph_anomalies=state.get("graph_anomalies", []),
         attack_chains=state.get("attack_chains", []),
+        severity_alerts=state.get("severity_alerts", []),
         correlated=json.dumps(state.get("correlated", {}), indent=2),
         contained_hosts=json.dumps(state.get("contained_hosts", []), indent=2),
         soar_actions=json.dumps(state.get("soar_actions", []), indent=2),
