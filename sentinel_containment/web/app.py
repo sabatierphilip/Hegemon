@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 import time
 
@@ -735,9 +736,27 @@ def _api_token() -> str:
     configured = str(settings.get("dashboard_api_token", "")).strip()
     if configured:
         return configured
+
     env_token = str(settings.env("SENTINEL_DASHBOARD_TOKEN", "")).strip()
     if env_token:
         return env_token
+
+    token_file = str(
+        settings.env("SENTINEL_DASHBOARD_TOKEN_FILE", settings.get("dashboard_api_token_file", "data/dashboard_api_token"))
+    ).strip()
+    if token_file:
+        token_path = Path(token_file)
+        if token_path.exists():
+            file_token = token_path.read_text(encoding="utf-8").strip()
+            if file_token:
+                return file_token
+        elif bool(settings.get("dashboard_api_token_auto_configure", True)):
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            auto_token = secrets.token_urlsafe(48)
+            token_path.write_text(auto_token, encoding="utf-8")
+            os.chmod(token_path, 0o600)
+            logger.info("Autoconfigured dashboard API token at %s", token_path)
+            return auto_token
     if not _auth_warning_emitted:
         logger.error("Dashboard API token is not configured. Set dashboard_api_token or SENTINEL_DASHBOARD_TOKEN.")
         _auth_warning_emitted = True
@@ -1371,6 +1390,24 @@ def peer_registry():
     peers = _runtime.peer_mesh.process_ids if _runtime is not None else []
     return jsonify({"peers": peers})
 
+
+
+
+@app.post("/api/peer/advertise")
+def peer_advertise():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    if _runtime is None:
+        return jsonify({"status": "ignored", "reason": "runtime_not_initialized"}), 503
+    peer_id = str(payload.get("instance_id", "")).strip()
+    public_key = str(payload.get("public_key", "")).strip()
+    if peer_id and public_key:
+        _runtime.peer_mesh.add_or_update_peer(peer_id, public_key)
+    return jsonify({"status": "ok", "registered": bool(peer_id and public_key), "peer": peer_id})
 
 @app.post("/api/peer/verify")
 def peer_verify():

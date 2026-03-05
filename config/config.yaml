@@ -11,6 +11,8 @@ telemetry_batch_limit: 200
 latest_state_path: data/latest_state.json
 dashboard_host: 127.0.0.1
 dashboard_port: 5000
+dashboard_api_token_file: data/dashboard_api_token
+dashboard_api_token_auto_configure: true
 web_rate_base_window_seconds: 1.0
 web_rate_base_limit: 60
 web_rate_trigger_window_seconds: 5.0
@@ -141,6 +143,22 @@ peer_verification:
 friendly_enrollment:
   enrollment_user: user
   trusted_user_public_keys: {}
+
+notifications:
+  webhook_url: ""
+  smtp_host: ""
+  smtp_port: 587
+  smtp_from: ""
+  smtp_to: ""
+  smtp_starttls: true
+  smtp_username: ""
+  smtp_password: ""
+
+peer_mesh_advertisement:
+  enabled: true
+  instance_id: ""
+  local_url: http://127.0.0.1:5000
+  peer_urls: []
 
 incident_drill_severity: 98
 drill_auto_configure_hardware_keys: true

@@ -70,12 +70,15 @@ Main settings are in `config/config.yaml`:
 - `audit_out_of_band_path` for append-only out-of-band audit sink
 - `approval_identity_store` for canonical approval identity normalization
 - `dashboard_host`/`dashboard_port` for local UI binding (defaults to `127.0.0.1`)
+- `dashboard_api_token_file` + `dashboard_api_token_auto_configure` to auto-bootstrap a persistent API bearer token on first startup per machine (no manual token provisioning required)
 - `graph_horizons_minutes` for multi-horizon rolling graph anomaly summaries that catch patient low-and-slow campaigns
 - `web_rate_*` settings for adaptive event-triggered burst throttling that defends dashboard/API endpoints from request-flood DoS
 - `auto_configure_hardware_keys_on_startup` defaults to `true` so the runtime can self-bootstrap trust anchors for autonomous containment by default
 - `level_four_max_directives`/`level_four_min_dominance_score` to tune continuously deployed level-4 hunting meshes
 - `level_five_max_directives`/`level_five_min_hunter_score` to tune level-5 friendly-integrity hunter meshes
 - `incident_drill_severity` and `drill_auto_configure_hardware_keys` to run deterministic severe-alert drill simulations through the same approval path
+- `notifications.webhook_url` and `notifications.smtp_*` to dispatch real high-severity notifications to webhook and SMTP destinations
+- `peer_mesh_advertisement.enabled` / `instance_id` / `local_url` / `peer_urls` for autonomous peer advertisement to mesh neighbors
 - `fast_lane.server_cert_path` / `server_key_path` / `client_ca_cert_path` must exist at deploy time; if missing, fast-lane is intentionally disabled and only the standard ingestion/detection path remains active
 
 
