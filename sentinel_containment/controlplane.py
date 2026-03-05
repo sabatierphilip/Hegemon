@@ -567,11 +567,25 @@ class HegemonControlPlane:
 
     def _analyze_program_structure(self, program_root: str | None) -> dict[str, Any]:
         if not program_root:
-            return {"files_scanned": 0, "issues": [], "ast_confidence": 0.0, "graph_alignment": 0.0, "markov_kill_chain": 0.0}
+            return {
+                "files_scanned": 0,
+                "issues": [],
+                "ast_confidence": 0.0,
+                "graph_alignment": 0.0,
+                "markov_kill_chain": 0.0,
+                "program_graph": {"modules": 0, "functions": 0, "call_edges": 0, "entrypoints": []},
+            }
 
         root = Path(program_root).resolve()
         if not root.exists() or not root.is_dir():
-            return {"files_scanned": 0, "issues": [], "ast_confidence": 0.0, "graph_alignment": 0.0, "markov_kill_chain": 0.0}
+            return {
+                "files_scanned": 0,
+                "issues": [],
+                "ast_confidence": 0.0,
+                "graph_alignment": 0.0,
+                "markov_kill_chain": 0.0,
+                "program_graph": {"modules": 0, "functions": 0, "call_edges": 0, "entrypoints": []},
+            }
 
         skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache"}
         py_files: list[Path] = []
@@ -579,11 +593,12 @@ class HegemonControlPlane:
             if any(part in skip_dirs for part in candidate.parts):
                 continue
             py_files.append(candidate)
-            if len(py_files) >= 350:
+            if len(py_files) >= 400:
                 break
 
         imports_graph: dict[str, set[str]] = defaultdict(set)
         issues: list[dict[str, Any]] = []
+        module_trees: dict[str, ast.AST] = {}
 
         def node_name(node: ast.AST) -> str:
             if isinstance(node, ast.Name):
@@ -593,20 +608,36 @@ class HegemonControlPlane:
                 return f"{base}.{node.attr}" if base else node.attr
             return ""
 
-        def tainted_from_expr(expr: ast.AST, tainted_vars: set[str]) -> bool:
+        def stage_chain_for_issue(issue_id: str) -> list[str]:
+            chains = {
+                "tainted-cmd-exec": ["recon", "initial_access", "execution", "persistence", "impact"],
+                "tainted-sql-query": ["recon", "initial_access", "credential_access", "collection", "impact"],
+                "hardcoded-secret": ["recon", "credential_access", "lateral_movement", "impact"],
+                "weak-rng-auth": ["recon", "credential_access", "privilege_escalation", "impact"],
+                "dynamic-exec": ["initial_access", "execution", "defense_evasion", "impact"],
+                "pickle-loads": ["initial_access", "execution", "persistence", "impact"],
+                "yaml-unsafe-load": ["initial_access", "execution", "impact"],
+                "weak-hash": ["credential_access", "defense_evasion", "impact"],
+                "shell-true": ["initial_access", "execution", "impact"],
+            }
+            return chains.get(issue_id, ["recon", "execution", "impact"])
+
+        def tainted_from_expr(expr: ast.AST, tainted_vars: set[str], tainted_calls: set[str]) -> bool:
             if isinstance(expr, ast.Name):
                 return expr.id in tainted_vars
             if isinstance(expr, ast.JoinedStr):
-                return any(tainted_from_expr(v.value, tainted_vars) for v in expr.values if isinstance(v, ast.FormattedValue))
+                return any(tainted_from_expr(v.value, tainted_vars, tainted_calls) for v in expr.values if isinstance(v, ast.FormattedValue))
             if isinstance(expr, ast.BinOp):
-                return tainted_from_expr(expr.left, tainted_vars) or tainted_from_expr(expr.right, tainted_vars)
+                return tainted_from_expr(expr.left, tainted_vars, tainted_calls) or tainted_from_expr(expr.right, tainted_vars, tainted_calls)
             if isinstance(expr, ast.Call):
                 name = node_name(expr.func)
-                if name in {"input", "request.args.get", "request.form.get", "request.get_json"}:
+                if name in {"input", "request.args.get", "request.form.get", "request.get_json", "os.environ.get"}:
                     return True
-                return any(tainted_from_expr(a, tainted_vars) for a in expr.args)
+                if name in tainted_calls:
+                    return True
+                return any(tainted_from_expr(a, tainted_vars, tainted_calls) for a in expr.args)
             if isinstance(expr, ast.Attribute):
-                return tainted_from_expr(expr.value, tainted_vars)
+                return tainted_from_expr(expr.value, tainted_vars, tainted_calls)
             return False
 
         def add_issue(
@@ -620,12 +651,16 @@ class HegemonControlPlane:
             patch: str,
             details: list[str] | None = None,
             tags: list[str] | None = None,
+            dataflow_path: list[str] | None = None,
+            call_path: list[str] | None = None,
         ) -> None:
+            reconstructed_chain = stage_chain_for_issue(issue_id)
             issues.append(
                 {
                     "issue_id": issue_id,
                     "severity": severity,
                     "kill_chain_stage": stage,
+                    "reconstructed_kill_chain": reconstructed_chain,
                     "file": self._safe_relpath(file_path, root),
                     "line": line,
                     "confidence": confidence,
@@ -633,204 +668,338 @@ class HegemonControlPlane:
                     "reasoning_details": details or [],
                     "tags": tags or [],
                     "patch_hint": patch,
+                    "dataflow_path": dataflow_path or [],
+                    "call_path": call_path or [],
                 }
             )
 
-        severity_weight = {"low": 0.25, "medium": 0.55, "high": 0.82, "critical": 1.0}
-
+        # pass 1: parse modules
         for py_file in py_files:
             try:
                 source = py_file.read_text(encoding="utf-8")
                 tree = ast.parse(source)
             except (OSError, UnicodeDecodeError, SyntaxError):
                 continue
-
             module_name = self._safe_relpath(py_file, root)
-            tainted_vars: set[str] = set()
-
+            module_trees[module_name] = tree
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
                         imports_graph[module_name].add(alias.name.split(".")[0])
                 elif isinstance(node, ast.ImportFrom):
                     imports_graph[module_name].add((node.module or "").split(".")[0])
-                elif isinstance(node, ast.FunctionDef):
-                    for arg in node.args.args:
-                        tainted_vars.add(arg.arg)
-                elif isinstance(node, ast.Assign):
-                    value = node.value
-                    for target in node.targets:
+
+        function_profiles: dict[str, dict[str, Any]] = {}
+        call_graph: dict[str, set[str]] = defaultdict(set)
+        tainted_return_functions: set[str] = set()
+        risky_sink_functions: set[str] = set()
+
+        # pass 2: build function profiles + intraprocedural taint
+        for module_name, tree in module_trees.items():
+            for top in getattr(tree, "body", []):
+                if isinstance(top, ast.Assign) and isinstance(top.value, ast.Constant) and isinstance(top.value.value, str) and len(top.value.value) >= 18:
+                    for target in top.targets:
                         if isinstance(target, ast.Name):
                             var_name = target.id.lower()
-                            if tainted_from_expr(value, tainted_vars):
-                                tainted_vars.add(target.id)
-                            if isinstance(value, ast.Constant) and isinstance(value.value, str) and len(value.value) >= 12:
-                                if any(k in var_name for k in ("secret", "token", "password", "api_key", "auth")):
-                                    add_issue(
-                                        "hardcoded-secret",
-                                        "critical",
-                                        "credential_access",
-                                        py_file,
-                                        getattr(node, "lineno", 1),
-                                        0.97,
-                                        "High-entropy credential-like literal embedded in source can leak and enable account takeover.",
-                                        "Move secret to secret manager/env vault, rotate credential, and add leak scanning gate.",
-                                        details=[
-                                            "Secret-like variable naming pattern matched.",
-                                            "Literal length suggests credential/token material.",
-                                        ],
-                                        tags=["zero-day-like", "credential-exposure"],
-                                    )
-                elif isinstance(node, ast.Call):
-                    func_name = node_name(node.func)
-                    line = getattr(node, "lineno", 1)
+                            if any(k in var_name for k in ("secret", "token", "password", "api_key", "auth")):
+                                add_issue(
+                                    "hardcoded-secret",
+                                    "critical",
+                                    "credential_access",
+                                    root / module_name,
+                                    getattr(top, "lineno", 1),
+                                    0.97,
+                                    "Credential-like literal appears hardcoded in module scope and can be exfiltrated.",
+                                    "Move secret to vault/env provider, rotate immediately, and block secret literals in CI.",
+                                    details=["Module-level secret constant detected.", "Literal entropy/length suggests authentication material."],
+                                    tags=["zero-day-like", "credential-exposure"],
+                                    dataflow_path=["module_constant", var_name, "credential_usage"],
+                                    call_path=[f"{module_name}:<module>"],
+                                )
 
-                    if func_name in {"eval", "exec"}:
-                        add_issue(
-                            "dynamic-exec",
-                            "high",
-                            "execution",
-                            py_file,
-                            line,
-                            0.9,
-                            "Dynamic code execution enables payload execution and bypasses static trust boundaries.",
-                            "Replace eval/exec with explicit parser + whitelisted command map.",
-                            details=["Runtime code path cannot be fully constrained at compile time."],
-                            tags=["rce-surface"],
-                        )
+        for module_name, tree in module_trees.items():
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.FunctionDef):
+                    continue
+                fn_qname = f"{module_name}:{node.name}"
+                tainted_vars = {arg.arg for arg in node.args.args}
+                source_hits: list[str] = []
+                sink_hits: list[str] = []
+                returns_tainted = False
+                called_names: set[str] = set()
+                local_calls_tainted: set[str] = set(tainted_return_functions)
 
-                    if func_name.endswith("subprocess.run") or func_name.endswith("subprocess.Popen") or func_name == "os.system":
-                        shell_true = func_name == "os.system"
-                        for kw in node.keywords:
-                            if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
-                                shell_true = True
-                        arg0 = node.args[0] if node.args else ast.Constant(value="")
-                        tainted_cmd = tainted_from_expr(arg0, tainted_vars)
-                        if shell_true and tainted_cmd:
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Assign):
+                        value = child.value
+                        for target in child.targets:
+                            if isinstance(target, ast.Name):
+                                var_name = target.id.lower()
+                                if tainted_from_expr(value, tainted_vars, local_calls_tainted):
+                                    tainted_vars.add(target.id)
+                                if isinstance(value, ast.Constant) and isinstance(value.value, str) and len(value.value) >= 18:
+                                    if any(k in var_name for k in ("secret", "token", "password", "api_key", "auth")):
+                                        add_issue(
+                                            "hardcoded-secret",
+                                            "critical",
+                                            "credential_access",
+                                            root / module_name,
+                                            getattr(child, "lineno", 1),
+                                            0.97,
+                                            "Credential-like literal appears hardcoded in source and can be exfiltrated.",
+                                            "Move secret to vault/env provider, rotate immediately, and block secret literals in CI.",
+                                            details=[
+                                                "Variable naming indicates credential context.",
+                                                "Literal entropy/length suggests authentication material.",
+                                            ],
+                                            tags=["zero-day-like", "credential-exposure"],
+                                            dataflow_path=["constant_literal", var_name, "credential_usage"],
+                                            call_path=[fn_qname],
+                                        )
+                    elif isinstance(child, ast.Call):
+                        func_name = node_name(child.func)
+                        called_names.add(func_name)
+                        line = getattr(child, "lineno", 1)
+                        if func_name in {"input", "request.args.get", "request.form.get", "request.get_json", "os.environ.get"}:
+                            source_hits.append(func_name)
+                        if func_name in {"eval", "exec"}:
                             add_issue(
-                                "tainted-cmd-exec",
-                                "critical",
-                                "execution",
-                                py_file,
-                                line,
-                                0.98,
-                                "Potential zero-day command injection path: untrusted data reaches shell command sink.",
-                                "Replace shell invocation with allowlisted argv, strict input canonicalization, and policy guardrail tests.",
-                                details=[
-                                    "Dataflow: untrusted source/parameter propagated into command sink.",
-                                    "Shell interpreter enabled, allowing metacharacter expansion.",
-                                ],
-                                tags=["zero-day-like", "command-injection"],
-                            )
-                        elif shell_true:
-                            add_issue(
-                                "shell-true",
+                                "dynamic-exec",
                                 "high",
                                 "execution",
-                                py_file,
+                                root / module_name,
                                 line,
-                                0.86,
-                                "subprocess call with shell=True can allow command injection.",
-                                "Use argument array and shell=False; validate inputs.",
-                                details=["Shell parsing broadens attack surface even if current input looks controlled."],
-                                tags=["command-injection"],
+                                0.9,
+                                "Dynamic code execution can become an RCE pivot when attacker-controlled data reaches the sink.",
+                                "Replace eval/exec with deterministic parser and allowlisted operation dispatch.",
+                                details=["Execution sink accepts code-like input at runtime."],
+                                tags=["rce-surface"],
+                                dataflow_path=["tainted_input_or_code", func_name],
+                                call_path=[fn_qname, func_name],
                             )
-
-                    if func_name in {"pickle.loads", "loads"}:
-                        add_issue(
-                            "pickle-loads",
-                            "high",
-                            "initial_access",
-                            py_file,
-                            line,
-                            0.84,
-                            "Untrusted pickle deserialization may lead to RCE.",
-                            "Switch to JSON/msgpack and enforce schema validation.",
-                            details=["Pickle opcodes can instantiate attacker-controlled objects."],
-                            tags=["deserialization"],
-                        )
-
-                    if func_name == "yaml.load":
-                        safe_loader = any(kw.arg == "Loader" and isinstance(kw.value, ast.Attribute) and kw.value.attr == "SafeLoader" for kw in node.keywords)
-                        if not safe_loader:
+                            sink_hits.append(func_name)
+                            risky_sink_functions.add(fn_qname)
+                        if func_name.endswith("subprocess.run") or func_name.endswith("subprocess.Popen") or func_name == "os.system":
+                            shell_true = func_name == "os.system"
+                            for kw in child.keywords:
+                                if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                                    shell_true = True
+                            arg0 = child.args[0] if child.args else ast.Constant(value="")
+                            tainted_cmd = tainted_from_expr(arg0, tainted_vars, local_calls_tainted)
+                            if shell_true and tainted_cmd:
+                                add_issue(
+                                    "tainted-cmd-exec",
+                                    "critical",
+                                    "execution",
+                                    root / module_name,
+                                    line,
+                                    0.98,
+                                    "Probable command injection path: tainted data reaches shell-enabled command sink.",
+                                    "Replace shell command with strict argv allowlist + canonicalization + deny shell metacharacters.",
+                                    details=[
+                                        "Dataflow confirmed from source-like variable into command expression.",
+                                        "Shell execution context permits command chaining and expansion.",
+                                    ],
+                                    tags=["zero-day-like", "command-injection"],
+                                    dataflow_path=["source", "tainted_var", "shell_command_sink"],
+                                    call_path=[fn_qname, func_name],
+                                )
+                                sink_hits.append(func_name)
+                                risky_sink_functions.add(fn_qname)
+                            elif shell_true:
+                                add_issue(
+                                    "shell-true",
+                                    "high",
+                                    "execution",
+                                    root / module_name,
+                                    line,
+                                    0.86,
+                                    "shell=True broadens command injection surface even for currently constrained inputs.",
+                                    "Use subprocess with shell=False and explicit argv tokenization.",
+                                    details=["Shell parsing adds implicit expansion semantics."],
+                                    tags=["command-injection"],
+                                    dataflow_path=["command_template", "shell_sink"],
+                                    call_path=[fn_qname, func_name],
+                                )
+                                sink_hits.append(func_name)
+                                risky_sink_functions.add(fn_qname)
+                        if func_name in {"pickle.loads", "loads"}:
                             add_issue(
-                                "yaml-unsafe-load",
+                                "pickle-loads",
                                 "high",
                                 "initial_access",
-                                py_file,
+                                root / module_name,
                                 line,
-                                0.79,
-                                "yaml.load without SafeLoader can execute arbitrary objects.",
-                                "Use yaml.safe_load or Loader=yaml.SafeLoader.",
-                                details=["Unsafe object construction path present."],
+                                0.84,
+                                "Deserializing pickle payloads can instantiate attacker-controlled objects.",
+                                "Replace pickle deserialization with schema-validated JSON/msgpack.",
+                                details=["Unsafe object graph hydration detected."],
                                 tags=["deserialization"],
+                                dataflow_path=["external_payload", func_name],
+                                call_path=[fn_qname, func_name],
                             )
-
-                    if func_name in {"hashlib.md5", "hashlib.sha1", "md5", "sha1"}:
-                        add_issue(
-                            "weak-hash",
-                            "medium",
-                            "defense_evasion",
-                            py_file,
-                            line,
-                            0.65,
-                            "Weak hash primitive detected for integrity/security-sensitive operation.",
-                            "Use SHA-256/512 or BLAKE2 variants.",
-                            details=["Collision resistance insufficient for modern security boundaries."],
-                            tags=["crypto"],
-                        )
-
-                    if (func_name.endswith(".execute") or func_name == "execute") and node.args:
-                        query_expr = node.args[0]
-                        if isinstance(query_expr, (ast.JoinedStr, ast.BinOp)) and tainted_from_expr(query_expr, tainted_vars):
+                            sink_hits.append(func_name)
+                            risky_sink_functions.add(fn_qname)
+                        if func_name == "yaml.load":
+                            safe_loader = any(kw.arg == "Loader" and isinstance(kw.value, ast.Attribute) and kw.value.attr == "SafeLoader" for kw in child.keywords)
+                            if not safe_loader:
+                                add_issue(
+                                    "yaml-unsafe-load",
+                                    "high",
+                                    "initial_access",
+                                    root / module_name,
+                                    line,
+                                    0.79,
+                                    "yaml.load without SafeLoader can deserialize arbitrary objects.",
+                                    "Use yaml.safe_load and explicit schema validation.",
+                                    details=["Object constructors are not constrained to safe primitives."],
+                                    tags=["deserialization"],
+                                    dataflow_path=["yaml_untrusted_input", "object_deserialization"],
+                                    call_path=[fn_qname, func_name],
+                                )
+                                sink_hits.append(func_name)
+                                risky_sink_functions.add(fn_qname)
+                        if func_name in {"hashlib.md5", "hashlib.sha1", "md5", "sha1"}:
                             add_issue(
-                                "tainted-sql-query",
-                                "critical",
-                                "credential_access",
-                                py_file,
+                                "weak-hash",
+                                "medium",
+                                "defense_evasion",
+                                root / module_name,
                                 line,
-                                0.96,
-                                "Potential SQL injection: tainted input interpolated into query string.",
-                                "Use parameterized queries with bound variables and strict query templates.",
-                                details=[
-                                    "Dataflow: user-controlled variable reached SQL text expression.",
-                                    "String interpolation/concatenation bypasses DB driver escaping guarantees.",
-                                ],
-                                tags=["zero-day-like", "sql-injection"],
+                                0.65,
+                                "Weak hash primitive detected for integrity-sensitive flow.",
+                                "Use SHA-256/512 or BLAKE2 and include keyed construction where appropriate.",
+                                details=["Collision resistance can be bypassed by modern attack tooling."],
+                                tags=["crypto"],
+                                dataflow_path=["integrity_operation", func_name],
+                                call_path=[fn_qname, func_name],
                             )
+                        if (func_name.endswith(".execute") or func_name == "execute") and child.args:
+                            query_expr = child.args[0]
+                            if isinstance(query_expr, (ast.JoinedStr, ast.BinOp)) and tainted_from_expr(query_expr, tainted_vars, local_calls_tainted):
+                                add_issue(
+                                    "tainted-sql-query",
+                                    "critical",
+                                    "credential_access",
+                                    root / module_name,
+                                    line,
+                                    0.96,
+                                    "Probable SQL injection path: tainted data interpolated into query text.",
+                                    "Switch to parameterized query templates with bound variables only.",
+                                    details=[
+                                        "Tainted source propagated into SQL string expression.",
+                                        "Concatenation/interpolation bypasses parameter binding safety.",
+                                    ],
+                                    tags=["zero-day-like", "sql-injection"],
+                                    dataflow_path=["source", "query_string_build", "sql_execute_sink"],
+                                    call_path=[fn_qname, func_name],
+                                )
+                                sink_hits.append(func_name)
+                                risky_sink_functions.add(fn_qname)
+                        if func_name in {"random.random", "random.randint", "random.choice"}:
+                            parent_assign_name = ""
+                            for parent in ast.walk(node):
+                                if isinstance(parent, ast.Assign) and parent.value is child and parent.targets and isinstance(parent.targets[0], ast.Name):
+                                    parent_assign_name = parent.targets[0].id.lower()
+                                    break
+                            if any(k in parent_assign_name for k in {"token", "session", "nonce", "password"}):
+                                add_issue(
+                                    "weak-rng-auth",
+                                    "high",
+                                    "credential_access",
+                                    root / module_name,
+                                    line,
+                                    0.83,
+                                    "Non-cryptographic RNG appears used for auth/session material.",
+                                    "Use secrets.token_urlsafe / secrets.randbelow and expire legacy tokens.",
+                                    details=["Predictable random stream may allow token preimage attacks."],
+                                    tags=["auth", "crypto"],
+                                    dataflow_path=["auth_material_generation", func_name],
+                                    call_path=[fn_qname, func_name],
+                                )
 
-                    if func_name in {"random.random", "random.randint", "random.choice"}:
-                        parent_assign_name = ""
-                        for parent in ast.walk(tree):
-                            if isinstance(parent, ast.Assign) and parent.value is node and parent.targets and isinstance(parent.targets[0], ast.Name):
-                                parent_assign_name = parent.targets[0].id.lower()
-                                break
-                        if any(k in parent_assign_name for k in {"token", "session", "nonce", "password"}):
-                            add_issue(
-                                "weak-rng-auth",
-                                "high",
-                                "credential_access",
-                                py_file,
-                                line,
-                                0.83,
-                                "Non-cryptographic RNG appears to generate auth/session material.",
-                                "Use secrets.token_urlsafe / secrets.randbelow and rotate invalid tokens.",
-                                details=["Predictable RNG may enable token prediction attacks."],
-                                tags=["auth", "crypto"],
-                            )
+                    elif isinstance(child, ast.Return):
+                        if child.value and tainted_from_expr(child.value, tainted_vars, local_calls_tainted):
+                            returns_tainted = True
 
+                function_profiles[fn_qname] = {
+                    "sources": source_hits,
+                    "sinks": sink_hits,
+                    "returns_tainted": returns_tainted,
+                    "calls": sorted(called_names),
+                }
+
+        # pass 3: call graph + fixed-point taint returns propagation
+        for fn_qname, profile in function_profiles.items():
+            for callee in profile.get("calls", []):
+                short = callee.split(".")[-1]
+                same_module = f"{fn_qname.split(':')[0]}:{short}"
+                if same_module in function_profiles:
+                    call_graph[fn_qname].add(same_module)
+
+        changed = True
+        while changed:
+            changed = False
+            for fn_qname, callees in call_graph.items():
+                if function_profiles.get(fn_qname, {}).get("returns_tainted"):
+                    continue
+                if any(function_profiles.get(callee, {}).get("returns_tainted") for callee in callees):
+                    function_profiles[fn_qname]["returns_tainted"] = True
+                    changed = True
+
+        tainted_return_functions = {fn for fn, prof in function_profiles.items() if prof.get("returns_tainted")}
+
+        # pass 4: interprocedural issue augmentation via call graph
+        for fn_qname, callees in call_graph.items():
+            for callee in callees:
+                if callee in risky_sink_functions and fn_qname not in risky_sink_functions:
+                    add_issue(
+                        "interprocedural-sink-reachability",
+                        "high",
+                        "execution",
+                        root / fn_qname.split(":")[0],
+                        1,
+                        0.78,
+                        "Function reaches a downstream risky sink through call graph traversal.",
+                        "Introduce boundary validation at caller and enforce contract-level sanitization before calling risky routines.",
+                        details=[
+                            f"Caller {fn_qname} reaches sink-bearing callee {callee}.",
+                            "Combined pass reconstructed transitive risk path across function boundaries.",
+                        ],
+                        tags=["graph-based", "kill-chain-reconstructed"],
+                        dataflow_path=["caller", "transitive_call", "sink"],
+                        call_path=[fn_qname, callee],
+                    )
+
+        severity_weight = {"low": 0.25, "medium": 0.55, "high": 0.82, "critical": 1.0}
         issue_conf = [float(i["confidence"]) * severity_weight.get(str(i["severity"]), 0.55) for i in issues] or [0.0]
         ast_confidence = round(min(0.99, sum(issue_conf) / len(issue_conf) + (0.10 if issues else 0.0)), 3)
-        degree_values = [len(v) for v in imports_graph.values()] or [0]
-        graph_alignment = round(min(0.99, (sum(degree_values) / max(1, len(degree_values))) / 5.0), 3)
-        stages = [str(i["kill_chain_stage"]) for i in issues]
-        _markov, markov_score = self._kill_chain_transition_markov(stages)
+
+        module_degrees = [len(v) for v in imports_graph.values()] or [0]
+        call_degrees = [len(v) for v in call_graph.values()] or [0]
+        graph_alignment = round(min(0.99, ((sum(module_degrees) / max(1, len(module_degrees))) * 0.5 + (sum(call_degrees) / max(1, len(call_degrees))) * 0.8) / 5.0), 3)
+
+        all_stages: list[str] = []
+        for issue in issues:
+            all_stages.extend([str(s) for s in issue.get("reconstructed_kill_chain", [])])
+        if not all_stages:
+            all_stages = [str(i.get("kill_chain_stage", "execution")) for i in issues]
+        _markov, markov_score = self._kill_chain_transition_markov(all_stages)
+
+        entrypoints = sorted([fn for fn, p in function_profiles.items() if p.get("sources")])[:12]
         return {
             "files_scanned": len(py_files),
             "issues": issues,
             "ast_confidence": ast_confidence,
             "graph_alignment": graph_alignment,
             "markov_kill_chain": round(markov_score, 3),
+            "program_graph": {
+                "modules": len(module_trees),
+                "functions": len(function_profiles),
+                "call_edges": sum(len(v) for v in call_graph.values()),
+                "entrypoints": entrypoints,
+                "tainted_return_functions": len(tainted_return_functions),
+            },
         }
 
     def _structural_risk_fingerprint(self, endpoint: Endpoint, package: str, version: str, chain_risk: float, structural_report: dict[str, Any]) -> dict[str, Any]:
@@ -839,10 +1008,14 @@ class HegemonControlPlane:
             base_score += 0.08
         if endpoint.sbom_status != "valid":
             base_score += 0.07
+        program_graph = structural_report.get("program_graph", {})
+        call_edges = float(program_graph.get("call_edges", 0))
+        tainted_return_functions = float(program_graph.get("tainted_return_functions", 0))
+        graph_bonus = min(0.12, (call_edges / 1200.0) + (tainted_return_functions / 900.0))
         ast_confidence = min(0.99, round(max(base_score, float(structural_report.get("ast_confidence", 0.0))) + min(0.2, chain_risk * 0.30), 3))
-        graph_alignment = min(0.99, round(max(float(structural_report.get("graph_alignment", 0.0)), 0.42 + (chain_risk * 0.45)), 3))
+        graph_alignment = min(0.99, round(max(float(structural_report.get("graph_alignment", 0.0)), 0.42 + (chain_risk * 0.45)) + graph_bonus, 3))
         markov_kill_chain = min(0.99, round(max(float(structural_report.get("markov_kill_chain", 0.0)), chain_risk + 0.18), 3))
-        confirmations = int(ast_confidence >= 0.55) + int(graph_alignment >= 0.55) + int(markov_kill_chain >= 0.35)
+        confirmations = int(ast_confidence >= 0.55) + int(graph_alignment >= 0.55) + int(markov_kill_chain >= 0.35) + int(call_edges >= 25)
         return {
             "ast_confidence": ast_confidence,
             "graph_alignment": graph_alignment,
@@ -850,7 +1023,7 @@ class HegemonControlPlane:
             "confirmations": confirmations,
             "summary": (
                 f"AST confidence={ast_confidence:.2f}, graph alignment={graph_alignment:.2f}, "
-                f"markov_kill_chain={markov_kill_chain:.2f} for {package}@{version}"
+                f"markov_kill_chain={markov_kill_chain:.2f}, call_edges={int(call_edges)} for {package}@{version}"
             ),
         }
 
@@ -933,6 +1106,7 @@ class HegemonControlPlane:
                         "double_checks": double_checks,
                         "files_scanned": structural_report.get("files_scanned", 0),
                         "issues_detected": len(structural_report.get("issues", [])),
+                        "program_graph": structural_report.get("program_graph", {}),
                     }
                 )
                 finding = self.create_finding(
@@ -961,9 +1135,13 @@ class HegemonControlPlane:
             cvss = round(min(9.9, 5.0 + confidence * 4.1 + severity_boost.get(sev, 0.6)), 2)
             cve_id = f"HEGEMON-AST-{str(issue.get('issue_id', 'CHECK')).upper()}"
             reasoning_details = issue.get("reasoning_details", [])
+            reconstructed_chain = issue.get("reconstructed_kill_chain", [])
+            call_path = issue.get("call_path", [])
             reasoning = (
                 f"AST deep scan detected {issue.get('issue_id')} in {issue.get('file')}:{issue.get('line')}; "
                 f"severity={sev}; confidence={confidence:.2f}; kill_chain_stage={issue.get('kill_chain_stage')}; "
+                f"reconstructed_chain={' -> '.join(str(v) for v in reconstructed_chain)}; "
+                f"call_path={' -> '.join(str(v) for v in call_path)}; "
                 f"details={' | '.join(str(v) for v in reasoning_details)}"
             )
             local_structural = self.create_finding(

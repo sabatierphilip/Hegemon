@@ -284,7 +284,8 @@ def test_scan_can_use_nvd_as_additional_intel_source(tmp_path: Path, monkeypatch
     assert any(f.cve == 'CVE-2026-4242' for f in findings)
     cve = next(f for f in findings if f.cve == 'CVE-2026-4242')
     assert any(e.get('type') == 'nvd_live_query' for e in cve.evidence)
-    assert any(e.get('type') == 'ast_graph_double_check' for e in cve.evidence)
+    structural = next(e for e in cve.evidence if e.get('type') == 'ast_graph_double_check')
+    assert 'program_graph' in structural
 
 
 def test_autonomous_self_scan_generates_and_applies_patch(tmp_path: Path):
@@ -363,10 +364,13 @@ def run(user_input):
     assert 'HEGEMON-AST-HARDCODED-SECRET' in cves
 
     cmd_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-TAINTED-CMD-EXEC')
-    assert 'Dataflow' in cmd_finding.reasoning
+    ast_issue = next(e for e in cmd_finding.evidence if e.get('type') == 'ast_issue')
+    assert ast_issue.get('reconstructed_kill_chain')
+    assert ast_issue.get('dataflow_path')
+    assert 'call_path=' in cmd_finding.reasoning
     proposal = cp.generate_patch_proposal(cmd_finding.finding_id, actor='tester')
     assert 'shell=False' in proposal.code_diff
 
     sql_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-TAINTED-SQL-QUERY')
     sql_proposal = cp.generate_patch_proposal(sql_finding.finding_id, actor='tester')
-    assert 'parameterized queries' in sql_proposal.change_plan[0]
+    assert 'parameterized query' in sql_proposal.change_plan[0]
