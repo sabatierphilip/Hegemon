@@ -15,12 +15,14 @@ from flask import Flask, jsonify, request
 from nacl import encoding, signing
 
 from hegemon_agent import build_order_digest, sign_payload, verify_signature
+from sentinel_containment.controlplane import HegemonControlPlane
 
 app = Flask(__name__)
 TELEMETRY: List[Dict[str, Any]] = []
 SETTINGS: Dict[str, Any] = {"autonomous_containment_enabled": True}
 TRANSPARENCY_LOG: List[Dict[str, Any]] = []
 CONTROL_SIGNERS: List[signing.SigningKey] = [signing.SigningKey.generate() for _ in range(3)]
+CONTROL_PLANE = HegemonControlPlane()
 
 
 @app.post("/telemetry")
@@ -137,6 +139,109 @@ def export_public_keys(prefix: str = "control") -> None:
     for i, signer in enumerate(CONTROL_SIGNERS):
         Path(f"{prefix}_{i}.pub").write_bytes(signer.verify_key.encode(encoder=encoding.Base64Encoder))
 
+
+@app.get("/friends")
+def list_friends():
+    return jsonify([CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.friends.values()])
+
+
+@app.post("/friends")
+def add_friend():
+    body = request.get_json(force=True, silent=False)
+    actor = body.get("actor", "system")
+    friend = CONTROL_PLANE.add_friend(body, actor)
+    return jsonify(CONTROL_PLANE.as_dict(friend)), 201
+
+
+@app.post("/friends/<friend_id>/disable")
+def disable_friend(friend_id: str):
+    body = request.get_json(force=True, silent=True) or {}
+    actor = body.get("actor", "system")
+    if friend_id not in CONTROL_PLANE.friends:
+        return jsonify({"error": "not_found"}), 404
+    friend = CONTROL_PLANE.disable_friend(friend_id, actor)
+    return jsonify(CONTROL_PLANE.as_dict(friend))
+
+
+@app.get("/endpoints")
+def list_endpoints():
+    return jsonify([CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.endpoints.values()])
+
+
+@app.post("/endpoints")
+def add_endpoint():
+    body = request.get_json(force=True, silent=False)
+    actor = body.get("actor", "system")
+    try:
+        endpoint = CONTROL_PLANE.add_endpoint(body, actor)
+    except (ValueError, KeyError) as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(CONTROL_PLANE.as_dict(endpoint)), 201
+
+
+@app.post("/vulnerabilities")
+def create_vulnerability():
+    body = request.get_json(force=True, silent=False)
+    actor = body.get("actor", "scanner")
+    try:
+        finding = CONTROL_PLANE.create_finding(body, actor)
+    except (KeyError, ValueError) as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(CONTROL_PLANE.as_dict(finding)), 201
+
+
+@app.get("/vulnerabilities")
+def list_vulnerabilities():
+    return jsonify([CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.findings.values()])
+
+
+@app.post("/patch-proposals/generate")
+def generate_patch_proposal_endpoint():
+    body = request.get_json(force=True, silent=False)
+    actor = body.get("actor", "mtre")
+    finding_id = body.get("finding_id")
+    if finding_id not in CONTROL_PLANE.findings:
+        return jsonify({"error": "finding_not_found"}), 404
+    proposal = CONTROL_PLANE.generate_patch_proposal(finding_id, actor)
+    return jsonify(CONTROL_PLANE.as_dict(proposal)), 201
+
+
+@app.get("/patch-proposals")
+def list_patch_proposals():
+    return jsonify([CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.patch_proposals.values()])
+
+
+@app.post("/patch-proposals/<proposal_id>/approve")
+def approve_patch(proposal_id: str):
+    body = request.get_json(force=True, silent=False)
+    approver = body.get("approver", "operator-unknown")
+    if proposal_id not in CONTROL_PLANE.patch_proposals:
+        return jsonify({"error": "not_found"}), 404
+    proposal = CONTROL_PLANE.approve_patch(proposal_id, approver)
+    return jsonify(CONTROL_PLANE.as_dict(proposal))
+
+
+@app.post("/patch-proposals/<proposal_id>/apply")
+def apply_patch(proposal_id: str):
+    body = request.get_json(force=True, silent=False)
+    actor = body.get("actor", "operator")
+    if proposal_id not in CONTROL_PLANE.patch_proposals:
+        return jsonify({"error": "not_found"}), 404
+    try:
+        proposal = CONTROL_PLANE.apply_patch(proposal_id, actor)
+    except ValueError as exc:
+        return jsonify({"error": "precondition_failed", "message": str(exc)}), 400
+    return jsonify(CONTROL_PLANE.as_dict(proposal))
+
+
+@app.get("/entity-graph")
+def entity_graph():
+    return jsonify(CONTROL_PLANE.export_graph())
+
+
+@app.get("/audit/ledger")
+def audit_ledger():
+    return jsonify({"health": CONTROL_PLANE.ledger_health(), "entries": CONTROL_PLANE.audit_log()})
 
 def main() -> int:
     parser = argparse.ArgumentParser()

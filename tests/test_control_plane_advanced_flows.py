@@ -1,0 +1,114 @@
+from pathlib import Path
+
+import control_plane_service as cps
+from sentinel_containment.controlplane import HegemonControlPlane
+
+
+def _client(tmp_path: Path):
+    cps.CONTROL_PLANE = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    return cps.app.test_client()
+
+
+def test_friend_endpoint_vulnerability_and_patch_flow(tmp_path: Path):
+    client = _client(tmp_path)
+
+    friend = client.post(
+        "/friends",
+        json={
+            "actor": "admin-1",
+            "name": "Firmware Admin",
+            "identity_type": "user",
+            "identity_method": "public_key_upload",
+            "capabilities": ["approve_firmware"],
+            "expiry": "2030-01-01T00:00:00Z",
+        },
+    )
+    assert friend.status_code == 201
+    friend_payload = friend.get_json()
+    assert friend_payload["status"] == "pending"
+    assert friend_payload["approvals_required"] == 2
+
+    endpoint = client.post(
+        "/endpoints",
+        json={
+            "actor": "ops-1",
+            "host_name": "prod-app-1",
+            "endpoint_type": "on-prem",
+            "os": "ubuntu",
+            "kernel": "6.8",
+            "hypervisor": "kvm",
+            "firmware_baseline": "1.0.4",
+            "sbom_status": "valid",
+            "enrollment_method": "mdm",
+        },
+    )
+    assert endpoint.status_code == 201
+    endpoint_id = endpoint.get_json()["endpoint_id"]
+
+    finding = client.post(
+        "/vulnerabilities",
+        json={
+            "actor": "scanner",
+            "endpoint_id": endpoint_id,
+            "cve": "CVE-2026-0001",
+            "cvss": 9.8,
+            "exploit_availability": 8.0,
+            "topological_impact": 7.5,
+            "asset_value": 9.2,
+            "trust_level": 6.0,
+            "evidence": [{"type": "sbom_match", "package": "openssl"}],
+            "suggested_remediations": ["upgrade openssl to 3.0.18"],
+        },
+    )
+    assert finding.status_code == 201
+    finding_payload = finding.get_json()
+    assert finding_payload["risk_score"] > 0
+
+    proposal_resp = client.post("/patch-proposals/generate", json={"finding_id": finding_payload["finding_id"], "actor": "mtre"})
+    assert proposal_resp.status_code == 201
+    proposal = proposal_resp.get_json()
+    assert proposal["approvals_required"] == 2
+    assert proposal["graph_path_before"][-1] == "CVE-2026-0001"
+
+    apply_before = client.post(f"/patch-proposals/{proposal['proposal_id']}/apply", json={"actor": "admin-1"})
+    assert apply_before.status_code == 400
+
+    approve_1 = client.post(f"/patch-proposals/{proposal['proposal_id']}/approve", json={"approver": "admin-1"})
+    assert approve_1.status_code == 200
+    assert approve_1.get_json()["status"] == "pending_review"
+
+    approve_2 = client.post(f"/patch-proposals/{proposal['proposal_id']}/approve", json={"approver": "admin-2"})
+    assert approve_2.status_code == 200
+    assert approve_2.get_json()["status"] == "approved"
+
+    apply_after = client.post(f"/patch-proposals/{proposal['proposal_id']}/apply", json={"actor": "admin-2"})
+    assert apply_after.status_code == 200
+    assert apply_after.get_json()["status"] == "deployed_canary"
+
+    graph = client.get("/entity-graph")
+    assert graph.status_code == 200
+    graph_payload = graph.get_json()
+    assert len(graph_payload["nodes"]) >= 3
+    assert any(e["type"] == "patched_by" for e in graph_payload["edges"])
+
+    audit = client.get("/audit/ledger")
+    assert audit.status_code == 200
+    assert audit.get_json()["health"]["chain_valid"] is True
+
+
+def test_app_store_endpoint_requires_signature(tmp_path: Path):
+    client = _client(tmp_path)
+    resp = client.post(
+        "/endpoints",
+        json={
+            "actor": "ops-1",
+            "host_name": "steam-package",
+            "endpoint_type": "app-store-package",
+            "os": "windows",
+            "kernel": "nt",
+            "sbom_status": "valid",
+            "enrollment_method": "store-agent",
+        },
+    )
+    assert resp.status_code == 400
+    assert "publisher_signature" in resp.get_json()["message"]
