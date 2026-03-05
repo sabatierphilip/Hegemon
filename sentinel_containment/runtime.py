@@ -10,6 +10,7 @@ import socketserver
 import ssl
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,8 @@ from sentinel_containment.telemetry.sources import (
     IngestionService,
     discover_live_file_sources,
 )
+
+from kernel_telemetry import KernelTelemetryConfig, KernelTelemetryManager
 
 
 logger = logging.getLogger(__name__)
@@ -243,6 +246,9 @@ class SentinelRuntime:
             "details": [],
         }
         self._dynamic_threads: list[threading.Thread] = []
+        self._kernel_telemetry_bridge_started = False
+        self._kernel_telemetry_autonomous_mode = True
+        self._kernel_telemetry_reports: deque[dict[str, Any]] = deque(maxlen=120)
         self._containment_decision: dict[str, Any] = {
             "pending": False,
             "host": None,
@@ -945,7 +951,62 @@ class SentinelRuntime:
         kt.start()
         self._dynamic_threads.append(kt)
         details.append("enabled_advanced_kernel_reader")
+
+        if not self._kernel_telemetry_bridge_started:
+            kernel_bridge = threading.Thread(target=self._run_kernel_telemetry_bridge, daemon=True)
+            kernel_bridge.start()
+            self._dynamic_threads.append(kernel_bridge)
+            self._kernel_telemetry_bridge_started = True
+            details.append("enabled_kernel_telemetry_bridge")
         return details
+
+    def _run_kernel_telemetry_bridge(self) -> None:
+        ingest_cfg = self.settings.get("ingestion", {})
+        bridge_cfg = self.settings.get("kernel_telemetry", {})
+        manager = KernelTelemetryManager(
+            KernelTelemetryConfig(enabled=bool(bridge_cfg.get("enabled", True))),
+            trusted_verify_keys=[],
+        )
+        init_payload = manager.initialize()
+        self._kernel_telemetry_reports.append({"event": "init", "payload": init_payload})
+
+        poll_seconds = float(ingest_cfg.get("kernel_telemetry_poll_seconds", 5.0))
+        while not self._stop.is_set():
+            snapshot = manager.snapshot()
+            report = {
+                "captured_at": snapshot.get("captured_at", datetime.now(timezone.utc).isoformat()),
+                "platform": snapshot.get("platform", "unknown"),
+                "mode": snapshot.get("mode", snapshot.get("status", "unknown")),
+                "enabled": bool(snapshot.get("enabled", False)),
+                "autonomous": bool(self._kernel_telemetry_autonomous_mode),
+            }
+            self._kernel_telemetry_reports.append(report)
+            if self._kernel_telemetry_autonomous_mode:
+                self.ingestor.ingest(
+                    "host_kernel",
+                    {
+                        "host": self.settings.get("system_name", "hegemon"),
+                        "process": "kernel-telemetry-bridge",
+                        "action": "kernel_telemetry_snapshot",
+                        "resource": "kernel://telemetry",
+                        "collector_level": "runtime",
+                        "telemetry_scope": "kernel_bridge",
+                        "kernel_snapshot": snapshot,
+                    },
+                )
+            self._stop.wait(max(0.1, poll_seconds))
+
+    def get_kernel_telemetry_status(self) -> dict[str, Any]:
+        return {
+            "autonomous": bool(self._kernel_telemetry_autonomous_mode),
+            "reports": list(self._kernel_telemetry_reports)[-30:],
+        }
+
+    def set_kernel_telemetry_mode(self, autonomous: bool) -> dict[str, Any]:
+        self._kernel_telemetry_autonomous_mode = bool(autonomous)
+        payload = self.get_kernel_telemetry_status()
+        self.audit.append("kernel_telemetry_mode", payload)
+        return payload
 
     def process_priority_event(self, event: dict[str, Any]) -> dict[str, Any]:
         source_type = str(event.get("source_type", "fast_lane"))

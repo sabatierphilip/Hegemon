@@ -214,6 +214,7 @@ HTML = """
   <div class="tabs">
     <button class="tab-btn active" data-tab="overview">Overview</button>
     <button class="tab-btn" data-tab="control-plane">Control Plane</button>
+    <button class="tab-btn" data-tab="kernel-telemetry">Kernel Telemetry</button>
   </div>
 
   <div id="tab-overview" class="tab-panel active">
@@ -369,7 +370,31 @@ HTML = """
       <div class="small" id="cp-path-after">After: -</div>
       <div class="small" id="cp-diff-expl">Diff explanation: -</div>
       <div class="small" id="cp-reasoning">Agent reasoning: -</div>
-      <div class="json" style="margin-top:8px;"><pre id="cp-code-diff">No patch diff generated yet.</pre></div>
+      <div class="small" id="cp-patch-approval-status" style="margin-top:8px;">Approval status: waiting for proposal selection.</div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button id="cp-approve-latest-btn" style="padding:8px 12px;background:#2b4f7a;color:#d8e2ff;border:1px solid #3e6aa3;border-radius:8px;cursor:pointer;">Approve Latest Patch</button>
+        <button id="cp-approve-apply-btn" style="padding:8px 12px;background:#22543d;color:#d8e2ff;border:1px solid #2f855a;border-radius:8px;cursor:pointer;">Auto-Apply Approved Patch</button>
+      </div>
+      <div class="json" style="margin-top:8px;"><pre id="cp-code-diff">No code diff generated yet.</pre></div>
+      <div class="json" style="margin-top:8px;"><pre id="cp-patch-terminal">No generated patches yet.</pre></div>
+    </div>
+    <div class="panel">
+      <h3>Autonomous Scan Terminal</h3>
+      <div class="small">Detailed loopholes/bug findings from autonomous security scans.</div>
+      <div class="json" style="margin-top:8px;"><pre id="cp-scan-terminal">No scan reports generated yet.</pre></div>
+    </div>
+  </div>
+
+  <div id="tab-kernel-telemetry" class="tab-panel">
+    <div class="panel">
+      <h3>eBPF Kernel Telemetry Feed</h3>
+      <div class="small" id="kernel-telemetry-mode-status">Kernel telemetry mode loading.</div>
+      <label class="small" style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+        <input id="kernel-telemetry-mode-toggle" type="checkbox" checked />
+        Autonomous mode (default). Disable for manual-only staging.
+      </label>
+      <div class="small" style="margin-top:8px;">Terminal reports</div>
+      <div class="json" style="margin-top:8px;"><pre id="kernel-telemetry-terminal">No kernel telemetry reports yet.</pre></div>
     </div>
   </div>
 </div>
@@ -495,7 +520,7 @@ async function updateHumanGate(required){
 
 
 const tabButtons=[...document.querySelectorAll('.tab-btn')];
-const tabPanels={overview:document.getElementById('tab-overview'),'control-plane':document.getElementById('tab-control-plane')};
+const tabPanels={overview:document.getElementById('tab-overview'),'control-plane':document.getElementById('tab-control-plane'),'kernel-telemetry':document.getElementById('tab-kernel-telemetry')};
 for(const btn of tabButtons){
   btn.addEventListener('click',()=>{
     for(const b of tabButtons){b.classList.remove('active');}
@@ -548,6 +573,12 @@ async function loadControlPlane(){
       document.getElementById('cp-diff-expl').textContent='Diff explanation: '+(latest.diff_explanation||'-');
       document.getElementById('cp-code-diff').textContent=latest.code_diff||'No code diff';
       document.getElementById('cp-reasoning').textContent='Agent reasoning: '+(latest.reasoning||'-');
+      document.getElementById('cp-patch-approval-status').textContent=`Approval status: ${latest.status} (${(latest.approvals_received||[]).length}/${latest.approvals_required})`;
+    }
+    const patchTerminal=document.getElementById('cp-patch-terminal');
+    if(patchTerminal){
+      const proposals=(data.proposals||[]).slice(-12).map((p)=>`[${p.proposal_id}] status=${p.status} approvals=${(p.approvals_received||[]).length}/${p.approvals_required}\n  summary=${p.summary}\n  plan=${(p.change_plan||[]).join('; ')}`).join('\n\n');
+      patchTerminal.textContent = proposals || 'No generated patches yet.';
     }
     document.getElementById('cp-status').textContent='Control-plane synchronized.';
   }catch(_err){
@@ -558,10 +589,84 @@ async function loadControlPlane(){
 async function runAutonomousScan(){
   const endpointInput=document.getElementById('cp-scan-endpoint-input');
   const endpointId=(endpointInput && endpointInput.value.trim()) || 'ep-default-linux';
-  const resp=await fetch('/api/control-plane/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint_id:endpointId})});
+  const resp=await fetch('/api/control-plane/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint_id:endpointId, include_global_analysis:true, external_systems:[{system_id:'external-edge-01', host_name:'external-edge-01', network_exposure:'internet', unknown_integrity:true, telemetry_events:['recon','execution','lateral_movement']}]})});
   const data=await resp.json();
   document.getElementById('cp-status').textContent=`Autonomous scan cycle complete. findings=${(data.findings||[]).length}`;
+  const terminal=document.getElementById('cp-scan-terminal');
+  if(terminal){
+    const findings=(data.findings||[]).slice(0,25).map((f)=>({
+      cve:f.cve,
+      risk_score:f.risk_score,
+      cvss:f.cvss,
+      exploit_availability:f.exploit_availability,
+      endpoint_id:f.endpoint_id,
+      reasoning:f.reasoning || 'n/a',
+      evidence:(f.evidence||[]).slice(0,3),
+      remediations:(f.suggested_remediations||[]),
+    }));
+    terminal.textContent = JSON.stringify({
+      schema:'hegemon.scan_report.v2',
+      findings,
+      global_weakness_report:data.global_weakness_report || {},
+    }, null, 2);
+  }
   await loadControlPlane();
+}
+
+
+async function approveLatestPatch(){
+  const status=document.getElementById('cp-patch-approval-status');
+  const resp=await fetch('/api/control-plane/approve-latest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approver:'dashboard-operator'})});
+  const payload=await resp.json();
+  if(status){
+    if(resp.ok){
+      status.textContent=`Approval status: ${payload.status} (${payload.approvals_received}/${payload.approvals_required}) for ${payload.proposal_id}`;
+    }else{
+      status.textContent=`Approval failed: ${payload.message || payload.error || 'unknown_error'}`;
+    }
+  }
+  await loadControlPlane();
+}
+
+async function approveAndApplyLatestPatch(){
+  const status=document.getElementById('cp-patch-approval-status');
+  const resp=await fetch('/api/control-plane/approve-apply-latest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autonomous:true})});
+  const payload=await resp.json();
+  if(status){
+    if(resp.ok){
+      status.textContent=`Approval status: ${payload.status} (${payload.approvals_received}/${payload.approvals_required}) for ${payload.proposal_id}`;
+    }else{
+      status.textContent=`Approval failed: ${payload.message || payload.error || 'unknown_error'}`;
+    }
+  }
+  await loadControlPlane();
+}
+
+async function loadKernelTelemetryStatus(){
+  const modeStatus=document.getElementById('kernel-telemetry-mode-status');
+  const terminal=document.getElementById('kernel-telemetry-terminal');
+  const toggle=document.getElementById('kernel-telemetry-mode-toggle');
+  try{
+    const resp=await fetch('/api/kernel-telemetry/status');
+    const payload=await resp.json();
+    const autonomous=Boolean(payload.autonomous);
+    if(toggle){toggle.checked=autonomous;}
+    if(modeStatus){modeStatus.textContent=autonomous? 'Autonomous mode: kernel telemetry is forwarded into detection pipeline.' : 'Manual mode: kernel telemetry snapshots are staged only.';}
+    if(terminal){
+      const reports=Array.isArray(payload.reports)?payload.reports:[];
+      terminal.textContent = reports.length ? reports.map((row)=>JSON.stringify(row)).join('\n') : 'No kernel telemetry reports yet.';
+    }
+  }catch(_err){
+    if(modeStatus){modeStatus.textContent='Kernel telemetry status unavailable.';}
+  }
+}
+
+async function updateKernelTelemetryMode(autonomous){
+  const modeStatus=document.getElementById('kernel-telemetry-mode-status');
+  const resp=await fetch('/api/kernel-telemetry/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autonomous})});
+  const payload=await resp.json();
+  if(modeStatus){modeStatus.textContent=payload.autonomous ? 'Autonomous mode: kernel telemetry is forwarded into detection pipeline.' : 'Manual mode: kernel telemetry snapshots are staged only.';}
+  await loadKernelTelemetryStatus();
 }
 
 document.getElementById('cp-seed-btn')?.addEventListener('click', async()=>{
@@ -598,6 +703,8 @@ document.getElementById('cp-scan-endpoint-input')?.addEventListener('input', asy
   const dl=document.getElementById('cp-endpoint-suggestions');
   if(dl){ dl.innerHTML=suggestions.map((s)=>`<option value="${s}"></option>`).join(''); }
 });
+document.getElementById('cp-approve-latest-btn')?.addEventListener('click', approveLatestPatch);
+document.getElementById('cp-approve-apply-btn')?.addEventListener('click', approveAndApplyLatestPatch);
 
 document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
 document.getElementById("drill-btn")?.addEventListener("click",runIncidentDrill);
@@ -611,7 +718,11 @@ document.getElementById("containment-live-toggle")?.addEventListener("change",(e
   const target=event.target;
   updateContainmentLiveMode(Boolean(target && target.checked));
 });
-window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadControlPlane(); runAutonomousScan(); window.setInterval(runAutonomousScan, 60000);});
+document.getElementById("kernel-telemetry-mode-toggle")?.addEventListener("change",(event)=>{
+  const target=event.target;
+  updateKernelTelemetryMode(Boolean(target && target.checked));
+});
+window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadControlPlane(); runAutonomousScan(); loadKernelTelemetryStatus(); window.setInterval(runAutonomousScan, 60000); window.setInterval(loadKernelTelemetryStatus, 5000);});
 </script>
 </body>
 </html>
@@ -894,6 +1005,32 @@ def hardware_key_auto_configure():
     return jsonify(_runtime.auto_configure_hardware_keys(configure_value))
 
 
+@app.get("/api/kernel-telemetry/status")
+def kernel_telemetry_status():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if _runtime is None:
+        return jsonify({"autonomous": True, "reports": [], "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.get_kernel_telemetry_status())
+
+
+@app.post("/api/kernel-telemetry/mode")
+def kernel_telemetry_mode_toggle():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    autonomous_value = payload.get("autonomous", True)
+    if not isinstance(autonomous_value, bool):
+        return jsonify({"error": "invalid_payload", "message": "autonomous must be a boolean"}), 400
+    if _runtime is None:
+        return jsonify({"autonomous": bool(autonomous_value), "reports": [], "completed": False, "details": ["runtime_not_initialized"]}), 503
+    return jsonify(_runtime.set_kernel_telemetry_mode(bool(autonomous_value)))
+
+
 @app.get("/api/readiness")
 def api_readiness():
     unauthorized = _require_auth()
@@ -1027,6 +1164,9 @@ def control_plane_scan():
     if error:
         return error
     endpoint_id = str(payload.get("endpoint_id", "")).strip()
+    include_global_analysis = bool(payload.get("include_global_analysis", True))
+    external_systems_raw = payload.get("external_systems", [])
+    external_systems = external_systems_raw if isinstance(external_systems_raw, list) else []
     if not endpoint_id:
         return jsonify({"error": "invalid_payload", "message": "endpoint_id is required"}), 400
     if endpoint_id not in _control_plane.endpoints:
@@ -1036,11 +1176,85 @@ def control_plane_scan():
         _control_plane.as_dict(_control_plane.generate_patch_proposal(finding.finding_id, actor="dashboard_scanner"))
         for finding in findings
     ]
+    global_report = _control_plane.analyze_global_attack_surface(external_systems if include_global_analysis else [])
     return jsonify(
         {
             "endpoint_id": endpoint_id,
             "findings": [_control_plane.as_dict(f) for f in findings],
             "proposals": proposals,
+            "global_weakness_report": global_report,
+        }
+    )
+
+
+@app.post("/api/control-plane/approve-latest")
+def control_plane_approve_latest():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    approver = str(payload.get("approver", "dashboard-operator")).strip() or "dashboard-operator"
+    proposals = list(_control_plane.patch_proposals.values())
+    if not proposals:
+        return jsonify({"error": "not_found", "message": "no patch proposals available"}), 404
+
+    latest = proposals[-1]
+    if latest.status == "deployed_canary":
+        return jsonify(
+            {
+                "proposal_id": latest.proposal_id,
+                "status": latest.status,
+                "approvals_required": latest.approvals_required,
+                "approvals_received": len(latest.approvals_received),
+                "message": "already_applied",
+            }
+        )
+
+    latest = _control_plane.approve_patch(latest.proposal_id, approver)
+    return jsonify(
+        {
+            "proposal_id": latest.proposal_id,
+            "status": latest.status,
+            "approvals_required": latest.approvals_required,
+            "approvals_received": len(latest.approvals_received),
+            "approver": approver,
+        }
+    )
+
+
+@app.post("/api/control-plane/approve-apply-latest")
+def control_plane_approve_apply_latest():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    autonomous = bool(payload.get("autonomous", True))
+    proposals = list(_control_plane.patch_proposals.values())
+    if not proposals:
+        return jsonify({"error": "not_found", "message": "no patch proposals available"}), 404
+
+    latest = proposals[-1]
+    if latest.status not in {"approved", "deployed_canary"}:
+        _control_plane.approve_patch(latest.proposal_id, "admin-1")
+    latest = _control_plane.patch_proposals[latest.proposal_id]
+    if autonomous and latest.status not in {"approved", "deployed_canary"}:
+        _control_plane.approve_patch(latest.proposal_id, "admin-2")
+    latest = _control_plane.patch_proposals[latest.proposal_id]
+
+    if latest.status == "approved":
+        latest = _control_plane.apply_patch(latest.proposal_id, actor="dashboard-autonomous")
+
+    return jsonify(
+        {
+            "proposal_id": latest.proposal_id,
+            "status": latest.status,
+            "approvals_required": latest.approvals_required,
+            "approvals_received": len(latest.approvals_received),
+            "autonomous": autonomous,
         }
     )
 
