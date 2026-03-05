@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import secrets
+import socket
 import socketserver
 import ssl
 import threading
@@ -42,6 +43,7 @@ from sentinel_containment.security import (
     HumanConfirmationVerifier,
     MeshCheckpointLedger,
     PeerVerificationMesh,
+    PeerMeshNode,
     TPMQuoteVerifier,
     SecurityDistributorEngine,
 )
@@ -271,6 +273,8 @@ class SentinelRuntime:
         self.discovery_engine = NetworkDiscoveryEngine(self.control_plane)
         self.notification_history: deque[dict[str, Any]] = deque(maxlen=200)
         self._last_notified_by_host: dict[str, float] = {}
+        self.notification_cfg = settings.get("notifications", {})
+        self.peer_advertisement_cfg = settings.get("peer_mesh_advertisement", {})
 
         self.fast_lane_server: FastLaneServer | None = None
         self.fast_lane_status: dict[str, Any] = {"enabled": bool(settings.get("fast_lane", {}).get("enabled", False)), "active": False, "missing_tls_files": []}
@@ -1274,12 +1278,93 @@ class SentinelRuntime:
                     now = time.time()
                     if severity >= 80 and now - self._last_notified_by_host.get(host, 0) >= 600:
                         event = {"severity": severity, "host": host, "summary": "High severity alert", "ts": now}
+                        event["dispatch"] = self._dispatch_notifications(event)
                         self.notification_history.append(event)
                         self._last_notified_by_host[host] = now
                         self.audit.append("notification.sent", event)
             except Exception:
                 pass
             self._stop.wait(5)
+
+    def _dispatch_webhook_notification(self, event: dict[str, Any]) -> bool:
+        import urllib.request
+
+        url = str(self.notification_cfg.get("webhook_url", "")).strip()
+        if not url:
+            return False
+        body = json.dumps(event, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5):
+            return True
+
+    def _dispatch_smtp_notification(self, event: dict[str, Any]) -> bool:
+        import smtplib
+
+        host = str(self.notification_cfg.get("smtp_host", "")).strip()
+        port = int(self.notification_cfg.get("smtp_port", 587))
+        sender = str(self.notification_cfg.get("smtp_from", "")).strip()
+        recipient = str(self.notification_cfg.get("smtp_to", "")).strip()
+        if not host or not sender or not recipient:
+            return False
+
+        subject = f"[Hegemon] Severity {event.get('severity', 'unknown')} on {event.get('host', 'unknown')}"
+        msg = (
+            f"From: {sender}\r\n"
+            f"To: {recipient}\r\n"
+            f"Subject: {subject}\r\n"
+            "Content-Type: application/json\r\n\r\n"
+            f"{json.dumps(event, indent=2)}"
+        )
+
+        use_tls = bool(self.notification_cfg.get("smtp_starttls", True))
+        username = str(self.notification_cfg.get("smtp_username", "")).strip()
+        password = str(self.notification_cfg.get("smtp_password", "")).strip()
+        with smtplib.SMTP(host, port, timeout=10) as smtp:
+            smtp.ehlo()
+            if use_tls:
+                smtp.starttls()
+                smtp.ehlo()
+            if username:
+                smtp.login(username, password)
+            smtp.sendmail(sender, [recipient], msg)
+        return True
+
+    def _dispatch_notifications(self, event: dict[str, Any]) -> dict[str, bool]:
+        outcomes = {"webhook": False, "smtp": False}
+        try:
+            outcomes["webhook"] = self._dispatch_webhook_notification(event)
+        except Exception as exc:
+            self.audit.append("notification.webhook_failed", {"error": str(exc), "event": event})
+        try:
+            outcomes["smtp"] = self._dispatch_smtp_notification(event)
+        except Exception as exc:
+            self.audit.append("notification.smtp_failed", {"error": str(exc), "event": event})
+        return outcomes
+
+    def _advertise_peer_mesh(self) -> dict[str, Any]:
+        import urllib.request
+
+        if not bool(self.peer_advertisement_cfg.get("enabled", True)):
+            return {"enabled": False, "sent": 0, "targets": []}
+
+        instance_id = str(self.peer_advertisement_cfg.get("instance_id", socket.gethostname())).strip() or "hegemon-node"
+        local_url = str(self.peer_advertisement_cfg.get("local_url", "http://127.0.0.1:5000")).strip()
+        private = ed25519.Ed25519PrivateKey.generate()
+        node = PeerMeshNode(instance_id, local_url, private)
+        payload = node.advertise_payload()
+        targets = [str(t).rstrip("/") for t in self.peer_advertisement_cfg.get("peer_urls", []) if str(t).strip()]
+        sent = 0
+        for target in targets:
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(f"{target}/api/peer/advertise", data=body, headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=3):
+                    sent += 1
+            except Exception:
+                continue
+        if sent:
+            self.audit.append("peer_mesh_advertisement.sent", {"sent": sent, "targets": targets})
+        return {"enabled": True, "sent": sent, "targets": targets}
 
     def run_once(self) -> dict:
         state = run_cycle(
@@ -1302,6 +1387,7 @@ class SentinelRuntime:
         state["fast_lane_status"] = dict(self.fast_lane_status)
         state["readiness"] = self.get_readiness_status()
         state["p2p_checkpoint"] = self._checkpoint_critical_state(state)
+        state["peer_advertisement"] = self._advertise_peer_mesh()
         state["distributor"] = self.distributor.current_snapshot()
         state["automation_overview"] = {
             "discovered_hosts": len(self.discovery_engine.last_hosts),
