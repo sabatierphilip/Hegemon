@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import secrets
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -117,11 +116,43 @@ class HegemonControlPlane:
         self._record("friend.added", {"actor": actor, "friend": asdict(friend), "ledger_preview": {"added_by": actor}})
         return friend
 
+    def approve_friend(self, friend_id: str, approver: str) -> Friend:
+        friend = self.friends[friend_id]
+        if approver not in friend.approvals_received:
+            friend.approvals_received.append(approver)
+        if len(friend.approvals_received) >= friend.approvals_required:
+            friend.status = "active"
+        self._record(
+            "friend.approved",
+            {
+                "friend_id": friend_id,
+                "approver": approver,
+                "status": friend.status,
+                "approvals_received": list(friend.approvals_received),
+            },
+        )
+        return friend
+
     def disable_friend(self, friend_id: str, actor: str) -> Friend:
         friend = self.friends[friend_id]
         friend.status = "disabled"
-        self._record("friend.revoked", {"actor": actor, "friend_id": friend_id})
+        flagged_approvals = self._pending_patch_approvals(friend_id)
+        self._record(
+            "friend.revoked",
+            {
+                "actor": actor,
+                "friend_id": friend_id,
+                "flagged_pending_patch_approvals": flagged_approvals,
+            },
+        )
         return friend
+
+    def _pending_patch_approvals(self, friend_id: str) -> list[str]:
+        flagged: list[str] = []
+        for proposal in self.patch_proposals.values():
+            if proposal.status != "deployed_canary" and friend_id in proposal.approvals_received:
+                flagged.append(proposal.proposal_id)
+        return flagged
 
     def add_endpoint(self, payload: dict[str, Any], actor: str) -> Endpoint:
         endpoint_id = payload.get("endpoint_id") or f"ep-{secrets.token_hex(4)}"
@@ -139,6 +170,8 @@ class HegemonControlPlane:
             protection_mode=payload.get("protection_mode", "observe-only"),
             release_ring=payload.get("release_ring", "canary"),
         )
+        if endpoint.protection_mode not in {"observe-only", "canary", "enforce"}:
+            raise ValueError("invalid protection_mode; expected one of observe-only|canary|enforce")
         if endpoint.endpoint_type == "app-store-package" and not endpoint.publisher_signature:
             raise ValueError("app-store-package endpoints require publisher_signature")
         self.endpoints[endpoint.endpoint_id] = endpoint

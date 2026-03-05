@@ -28,6 +28,14 @@ def test_friend_endpoint_vulnerability_and_patch_flow(tmp_path: Path):
     assert friend_payload["status"] == "pending"
     assert friend_payload["approvals_required"] == 2
 
+    approve_friend_1 = client.post(f"/friends/{friend_payload['friend_id']}/approve", json={"approver": "admin-2"})
+    assert approve_friend_1.status_code == 200
+    assert approve_friend_1.get_json()["status"] == "pending"
+
+    approve_friend_2 = client.post(f"/friends/{friend_payload['friend_id']}/approve", json={"approver": "admin-3"})
+    assert approve_friend_2.status_code == 200
+    assert approve_friend_2.get_json()["status"] == "active"
+
     endpoint = client.post(
         "/endpoints",
         json={
@@ -85,6 +93,10 @@ def test_friend_endpoint_vulnerability_and_patch_flow(tmp_path: Path):
     assert apply_after.status_code == 200
     assert apply_after.get_json()["status"] == "deployed_canary"
 
+    preview = client.get("/ui/control-plane")
+    assert preview.status_code == 200
+    assert "Hegemon Control Plane Preview" in preview.get_data(as_text=True)
+
     graph = client.get("/entity-graph")
     assert graph.status_code == 200
     graph_payload = graph.get_json()
@@ -94,6 +106,59 @@ def test_friend_endpoint_vulnerability_and_patch_flow(tmp_path: Path):
     audit = client.get("/audit/ledger")
     assert audit.status_code == 200
     assert audit.get_json()["health"]["chain_valid"] is True
+
+
+def test_disable_friend_flags_prior_patch_approvals(tmp_path: Path):
+    client = _client(tmp_path)
+    friend = client.post(
+        "/friends",
+        json={
+            "actor": "admin-1",
+            "name": "Patch Approver",
+            "identity_type": "user",
+            "identity_method": "public_key_upload",
+            "capabilities": ["approve_patches"],
+            "expiry": "2030-01-01T00:00:00Z",
+        },
+    )
+    friend_id = friend.get_json()["friend_id"]
+
+    endpoint = client.post(
+        "/endpoints",
+        json={
+            "actor": "ops-1",
+            "host_name": "prod-app-2",
+            "endpoint_type": "on-prem",
+            "os": "ubuntu",
+            "kernel": "6.8",
+            "sbom_status": "valid",
+            "enrollment_method": "mdm",
+        },
+    )
+    endpoint_id = endpoint.get_json()["endpoint_id"]
+    finding = client.post(
+        "/vulnerabilities",
+        json={
+            "actor": "scanner",
+            "endpoint_id": endpoint_id,
+            "cve": "CVE-2026-0002",
+            "cvss": 8.8,
+            "exploit_availability": 7.0,
+            "topological_impact": 6.5,
+            "asset_value": 8.2,
+            "trust_level": 6.0,
+        },
+    )
+    proposal = client.post("/patch-proposals/generate", json={"finding_id": finding.get_json()["finding_id"], "actor": "mtre"}).get_json()
+    client.post(f"/patch-proposals/{proposal['proposal_id']}/approve", json={"approver": friend_id})
+
+    disabled = client.post(f"/friends/{friend_id}/disable", json={"actor": "admin-1"})
+    assert disabled.status_code == 200
+
+    audit = client.get("/audit/ledger").get_json()["entries"]
+    revoke_entries = [e for e in audit if e.get("event_type") == "friend.revoked"]
+    assert revoke_entries
+    assert proposal["proposal_id"] in revoke_entries[-1]["payload"]["flagged_pending_patch_approvals"]
 
 
 def test_app_store_endpoint_requires_signature(tmp_path: Path):

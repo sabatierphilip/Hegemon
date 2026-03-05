@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template_string, request
 from nacl import encoding, signing
 
 from hegemon_agent import build_order_digest, sign_payload, verify_signature
@@ -23,6 +23,51 @@ SETTINGS: Dict[str, Any] = {"autonomous_containment_enabled": True}
 TRANSPARENCY_LOG: List[Dict[str, Any]] = []
 CONTROL_SIGNERS: List[signing.SigningKey] = [signing.SigningKey.generate() for _ in range(3)]
 CONTROL_PLANE = HegemonControlPlane()
+
+CONTROL_PLANE_UI = """
+<!doctype html>
+<html>
+<head>
+  <meta charset=\"utf-8\" />
+  <title>Hegemon Control Plane Preview</title>
+  <style>
+    body { font-family: Inter, Arial, sans-serif; margin: 0; background: #0b1020; color: #d8e2ff; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .card, .panel { background:#131a2e; border:1px solid #2f3e66; border-radius:10px; padding: 12px; }
+    .panel { margin-top: 12px; }
+    .kpi { font-size: 26px; font-weight: 700; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { border-bottom:1px solid #27365f; text-align:left; padding:6px; }
+    .small { color:#a7b6df; font-size:12px; }
+    code { color:#8de1ff; }
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <h1>🛡️ Hegemon Control Plane Preview</h1>
+    <div class=\"grid\">
+      <div class=\"card\"><div class=\"small\">Friends</div><div class=\"kpi\">{{friends|length}}</div></div>
+      <div class=\"card\"><div class=\"small\">Endpoints</div><div class=\"kpi\">{{endpoints|length}}</div></div>
+      <div class=\"card\"><div class=\"small\">Vulnerabilities</div><div class=\"kpi\">{{findings|length}}</div></div>
+      <div class=\"card\"><div class=\"small\">Patch Proposals</div><div class=\"kpi\">{{proposals|length}}</div></div>
+    </div>
+    <div class=\"panel\">
+      <h3>Friends & Identity Management</h3>
+      <table><thead><tr><th>Name</th><th>Status</th><th>Capabilities</th><th>Approvals</th></tr></thead><tbody>
+      {% for f in friends %}<tr><td>{{f.name}}</td><td>{{f.status}}</td><td>{{f.capabilities|join(', ')}}</td><td>{{f.approvals_received|length}} / {{f.approvals_required}}</td></tr>{% endfor %}
+      </tbody></table>
+    </div>
+    <div class=\"panel\">
+      <h3>Patch Proposals & Graph Path</h3>
+      <table><thead><tr><th>ID</th><th>Summary</th><th>Status</th><th>Graph Path Before</th><th>Graph Path After</th></tr></thead><tbody>
+      {% for p in proposals %}<tr><td><code>{{p.proposal_id}}</code></td><td>{{p.summary}}</td><td>{{p.status}}</td><td>{{p.graph_path_before|join(' → ')}}</td><td>{{p.graph_path_after|join(' → ')}}</td></tr>{% endfor %}
+      </tbody></table>
+    </div>
+  </div>
+</body>
+</html>
+"""
 
 
 @app.post("/telemetry")
@@ -163,6 +208,16 @@ def disable_friend(friend_id: str):
     return jsonify(CONTROL_PLANE.as_dict(friend))
 
 
+@app.post("/friends/<friend_id>/approve")
+def approve_friend(friend_id: str):
+    body = request.get_json(force=True, silent=False)
+    approver = body.get("approver", "operator-unknown")
+    if friend_id not in CONTROL_PLANE.friends:
+        return jsonify({"error": "not_found"}), 404
+    friend = CONTROL_PLANE.approve_friend(friend_id, approver)
+    return jsonify(CONTROL_PLANE.as_dict(friend))
+
+
 @app.get("/endpoints")
 def list_endpoints():
     return jsonify([CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.endpoints.values()])
@@ -242,6 +297,17 @@ def entity_graph():
 @app.get("/audit/ledger")
 def audit_ledger():
     return jsonify({"health": CONTROL_PLANE.ledger_health(), "entries": CONTROL_PLANE.audit_log()})
+
+
+@app.get("/ui/control-plane")
+def control_plane_preview():
+    return render_template_string(
+        CONTROL_PLANE_UI,
+        friends=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.friends.values()],
+        endpoints=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.endpoints.values()],
+        findings=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.findings.values()],
+        proposals=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.patch_proposals.values()],
+    )
 
 def main() -> int:
     parser = argparse.ArgumentParser()
