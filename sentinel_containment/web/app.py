@@ -13,10 +13,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, g, jsonify, render_template_string, request
+from flask import Flask, g, jsonify, make_response, render_template_string, request
 
 from sentinel_containment.config import Settings
-from sentinel_containment.controlplane import HegemonControlPlane
+from sentinel_containment.controlplane import HEGEMON_SELF_ENDPOINT_ID, HegemonControlPlane
 from sentinel_containment.runtime import SentinelRuntime
 
 app = Flask(__name__)
@@ -790,7 +790,10 @@ def _is_authenticated() -> bool:
     provided = request.headers.get("Authorization", "")
     if provided.lower().startswith("bearer "):
         provided = provided[7:].strip()
-    return bool(provided) and hmac.compare_digest(provided, token)
+    if bool(provided) and hmac.compare_digest(provided, token):
+        return True
+    session_token = request.cookies.get("hegemon_session", "")
+    return bool(session_token) and hmac.compare_digest(session_token, token)
 
 
 def _require_auth():
@@ -884,7 +887,7 @@ def dashboard():
     if unauthorized:
         return unauthorized
     state = _load_latest_state()
-    return render_template_string(
+    response = make_response(render_template_string(
         HTML,
         events_processed=state.get("events_processed", 0),
         alerts_count=len(state.get("severity_alerts", state.get("alerts", []))),
@@ -903,7 +906,16 @@ def dashboard():
         severity_class=_severity_class,
         readiness=_readiness_payload(),
         csp_nonce=getattr(g, "csp_nonce", ""),
+    ))
+    response.set_cookie(
+        "hegemon_session",
+        _api_token(),
+        httponly=True,
+        secure=request.is_secure,
+        samesite="Strict",
+        max_age=8 * 60 * 60,
     )
+    return response
 
 
 @app.get("/graph")
@@ -1175,7 +1187,7 @@ def control_plane_demo_seed():
                 "network_exposure": "internet",
                 "asset_value": 9.4,
                 "trust_level": 6.0,
-                "installed_packages": {"openssl": "3.0.2", "glibc": "2.37", "openssh": "9.3"},
+                "installed_packages": {"openssl": "3.0.2", "glibc": "2.37", "openssh": "9.3", "anthropic": "0.34.2"},
             },
             actor="dashboard",
         )
@@ -1225,6 +1237,45 @@ def control_plane_scan():
         }
     )
 
+
+
+
+@app.post("/api/control-plane/discover-issue")
+def control_plane_discover_issue():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+
+    endpoint_id = str(payload.get("endpoint_id", HEGEMON_SELF_ENDPOINT_ID)).strip() or HEGEMON_SELF_ENDPOINT_ID
+    include_external_intel = bool(payload.get("include_external_intel", False))
+
+    if endpoint_id not in _control_plane.endpoints:
+        return jsonify({"error": "not_found", "message": "endpoint not found"}), 404
+
+    newly_discovered = _control_plane.discover_new_issues(
+        endpoint_id,
+        actor="dashboard_autonomous_scanner",
+        include_external_intel=include_external_intel,
+    )
+
+    if not newly_discovered:
+        return jsonify({
+            "endpoint_id": endpoint_id,
+            "new_issues_discovered": 0,
+            "issue": None,
+            "message": "no_new_issues",
+        })
+
+    highest_risk = sorted(newly_discovered, key=lambda finding: finding.risk_score, reverse=True)[0]
+    return jsonify({
+        "endpoint_id": endpoint_id,
+        "new_issues_discovered": len(newly_discovered),
+        "issue": _control_plane.as_dict(highest_risk),
+        "message": "autonomous_issue_discovered",
+    })
 
 @app.post("/api/control-plane/approve-latest")
 def control_plane_approve_latest():

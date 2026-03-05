@@ -488,6 +488,18 @@ def test_dashboard_renders_tabbed_control_plane_view(auth_headers):
     assert "kernel-telemetry-mode-toggle" in body
 
 
+def test_dashboard_sets_session_cookie_for_follow_on_api_calls(auth_headers):
+    client = app.test_client()
+
+    dashboard = client.get("/", headers=auth_headers)
+    assert dashboard.status_code == 200
+    cookies = dashboard.headers.getlist("Set-Cookie")
+    assert any(cookie.startswith("hegemon_session=") for cookie in cookies)
+
+    overview = client.get("/api/control-plane/overview")
+    assert overview.status_code == 200
+
+
 def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
     client = app.test_client()
 
@@ -497,7 +509,7 @@ def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
             "published": "2026-01-10T00:00:00Z",
             "severity": [{"score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/9.8"}],
             "affected": [{"ranges": [{"events": [{"introduced": "0"}, {"fixed": "3.0.18"}]}]}],
-        }] if package == "openssl" else []
+        }] if package in {"openssl", "anthropic"} else []
 
     monkeypatch.setattr("sentinel_containment.web.app._control_plane._query_osv", _fake_osv)
     seed = client.post("/api/control-plane/demo-seed", json={"seed": True}, headers=auth_headers)
@@ -507,6 +519,7 @@ def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
     assert scan.status_code == 200
     payload = scan.get_json()
     assert payload["findings"]
+    assert any(any(e.get("package") == "anthropic" for e in f.get("evidence", [])) for f in payload["findings"])
     assert payload["proposals"]
     assert "global_weakness_report" in payload
     assert payload["global_weakness_report"]["systems_analyzed"] >= 1
@@ -520,6 +533,55 @@ def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
     assert overview_payload["proposals"]
 
 
+
+
+
+def test_demo_seed_autodiscovers_anthropic_sdk_as_friendly_app(auth_headers):
+    client = app.test_client()
+    seed = client.post('/api/control-plane/demo-seed', json={'seed': True}, headers=auth_headers)
+    assert seed.status_code == 200
+
+    overview = client.get('/api/control-plane/overview', headers=auth_headers)
+    assert overview.status_code == 200
+    apps = overview.get_json().get('apps', [])
+    assert any(a.get('name') == 'Anthropic SDK' for a in apps)
+
+
+
+def test_control_plane_can_autonomously_discover_new_issue(auth_headers):
+    client = app.test_client()
+
+    add_endpoint = client.post(
+        '/api/control-plane/add-endpoint',
+        json={
+            'host_name': 'autonomous-discovery-target',
+            'endpoint_type': 'on-prem',
+            'os': 'ubuntu',
+            'kernel': '6.8',
+            'sbom_status': 'unknown',
+            'enrollment_method': 'manual',
+            'network_exposure': 'internet',
+            'asset_value': 9.1,
+            'trust_level': 5.1,
+            'installed_packages': {'custom-agent': '1.0.0'},
+            'telemetry_events': ['recon', 'initial_access', 'execution', 'lateral_movement'],
+        },
+        headers=auth_headers,
+    )
+    assert add_endpoint.status_code == 201
+    endpoint_id = add_endpoint.get_json()['endpoint_id']
+
+    discover = client.post(
+        '/api/control-plane/discover-issue',
+        json={'endpoint_id': endpoint_id, 'include_external_intel': False},
+        headers=auth_headers,
+    )
+    assert discover.status_code == 200
+    payload = discover.get_json()
+    assert payload['message'] == 'autonomous_issue_discovered'
+    assert payload['new_issues_discovered'] >= 1
+    assert payload['issue'] is not None
+    assert payload['issue']['cve']
 
 def test_control_plane_can_approve_latest_patch(auth_headers, monkeypatch):
     client = app.test_client()
