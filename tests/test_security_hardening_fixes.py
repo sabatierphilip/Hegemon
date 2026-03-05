@@ -1,7 +1,10 @@
 import json
+import hashlib
+import threading
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 
 from sentinel_containment.containment.executors import ContainmentActionExecutor
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
@@ -174,3 +177,162 @@ def test_autohardware_default_does_not_persist_private_key_or_bypass(tmp_path: P
     notice = runtime.get_hardware_key_setup_notice()
     assert "operator_signature_required" in notice["details"]
     runtime.ingestion_service.stop()
+
+
+
+def test_web_local_request_rejects_spoofed_xff_without_trusted_proxy(monkeypatch):
+    from sentinel_containment.web import app as web_app
+
+    monkeypatch.setattr(web_app, "_TRUSTED_REVERSE_PROXIES", set())
+    with web_app.app.test_request_context("/", environ_overrides={"REMOTE_ADDR": "203.0.113.10"}, headers={"X-Forwarded-For": "127.0.0.1"}):
+        assert web_app._is_local_request() is False
+
+
+def test_web_local_request_allows_trusted_proxy_with_loopback_xff(monkeypatch):
+    from sentinel_containment.web import app as web_app
+
+    monkeypatch.setattr(web_app, "_TRUSTED_REVERSE_PROXIES", {"203.0.113.5"})
+    with web_app.app.test_request_context("/", environ_overrides={"REMOTE_ADDR": "203.0.113.5"}, headers={"X-Forwarded-For": "127.0.0.1"}):
+        assert web_app._is_local_request() is True
+
+
+def test_runtime_uses_single_containment_engine(tmp_path: Path):
+    from sentinel_containment.config import Settings
+    from sentinel_containment.runtime import SentinelRuntime
+
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+
+    assert runtime.fast_lane_containment is runtime.containment
+    runtime.ingestion_service.stop()
+
+
+def test_peer_mesh_advertisement_uses_stable_key(tmp_path: Path):
+    from sentinel_containment.config import Settings
+    from sentinel_containment.runtime import SentinelRuntime
+
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "peer_advertisement": {"enabled": True, "peer_urls": []},
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+
+    runtime._advertise_peer_mesh()
+    first_payload = runtime._peer_advertisement_private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    runtime._advertise_peer_mesh()
+    second_payload = runtime._peer_advertisement_private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+    assert first_payload == second_payload
+    runtime.ingestion_service.stop()
+
+
+def test_ssh_containment_defaults_to_strict_host_key_checking():
+    executor = ContainmentActionExecutor(active_mode=False)
+    result = executor.execute(
+        host="host-a",
+        action="execute_remote_ssh_containment",
+        context={"remote_host": "example.internal", "containment_commands": ["snapshot"]},
+    )
+
+    assert result.status == "simulated"
+    assert "StrictHostKeyChecking=yes" in result.details["command"]
+    assert "UserKnownHostsFile=" in result.details["command"]
+
+
+def test_runtime_writes_latest_state_atomically(tmp_path: Path):
+    from sentinel_containment.config import Settings
+    from sentinel_containment.runtime import SentinelRuntime
+
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+
+    runtime._write_latest_state({"candidate_severity": 90, "alerts": []})
+
+    assert json.loads(runtime.latest_state_path.read_text(encoding="utf-8"))["candidate_severity"] == 90
+    assert list(runtime.latest_state_path.parent.glob("*.tmp")) == []
+    runtime.ingestion_service.stop()
+
+
+def test_immutable_log_hash_chain_survives_concurrent_appends(tmp_path: Path):
+    primary = tmp_path / "audit.log"
+    log = ImmutableAuditLog(primary)
+
+    def _worker(idx: int) -> None:
+        for n in range(20):
+            log.append("event", {"worker": idx, "n": n})
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    entries = [json.loads(line) for line in primary.read_text(encoding="utf-8").splitlines() if line]
+    assert len(entries) == 80
+    prev = "GENESIS"
+    for entry in entries:
+        assert entry["prev_hash"] == prev
+        raw = {
+            "timestamp": entry["timestamp"],
+            "event_type": entry["event_type"],
+            "payload": entry["payload"],
+            "prev_hash": entry["prev_hash"],
+        }
+        expected = hashlib.sha256(json.dumps(raw, sort_keys=True).encode("utf-8")).hexdigest()
+        assert entry["entry_hash"] == expected
+        prev = entry["entry_hash"]

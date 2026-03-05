@@ -369,6 +369,12 @@ class ContainmentActionExecutor:
 
         remote = f"{remote_user}@{remote_host}"
         joined_commands = " && ".join(allowed[name] for name in requested)
+        known_hosts_path = self._state_file(payload, "ssh_known_hosts_path", "containment_ssh/known_hosts")
+        strict_host_key_checking = str(payload.get("ssh_strict_host_key_checking", "yes")).strip() or "yes"
+        allow_insecure_tofu = bool(payload.get("allow_insecure_tofu", False))
+        if allow_insecure_tofu:
+            strict_host_key_checking = "accept-new"
+
         ssh_cmd = [
             ssh_binary,
             "-i",
@@ -378,7 +384,9 @@ class ContainmentActionExecutor:
             "-o",
             "BatchMode=yes",
             "-o",
-            "StrictHostKeyChecking=accept-new",
+            f"UserKnownHostsFile={known_hosts_path}",
+            "-o",
+            f"StrictHostKeyChecking={strict_host_key_checking}",
             "-o",
             f"ConnectTimeout={connect_timeout}",
             remote,
