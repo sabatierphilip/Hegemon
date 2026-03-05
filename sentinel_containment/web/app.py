@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, g, jsonify, render_template_string, request
+from flask import Flask, g, jsonify, make_response, render_template_string, request
 
 from sentinel_containment.config import Settings
 from sentinel_containment.controlplane import HegemonControlPlane
@@ -790,7 +790,10 @@ def _is_authenticated() -> bool:
     provided = request.headers.get("Authorization", "")
     if provided.lower().startswith("bearer "):
         provided = provided[7:].strip()
-    return bool(provided) and hmac.compare_digest(provided, token)
+    if bool(provided) and hmac.compare_digest(provided, token):
+        return True
+    session_token = request.cookies.get("hegemon_session", "")
+    return bool(session_token) and hmac.compare_digest(session_token, token)
 
 
 def _require_auth():
@@ -884,7 +887,7 @@ def dashboard():
     if unauthorized:
         return unauthorized
     state = _load_latest_state()
-    return render_template_string(
+    response = make_response(render_template_string(
         HTML,
         events_processed=state.get("events_processed", 0),
         alerts_count=len(state.get("severity_alerts", state.get("alerts", []))),
@@ -903,7 +906,16 @@ def dashboard():
         severity_class=_severity_class,
         readiness=_readiness_payload(),
         csp_nonce=getattr(g, "csp_nonce", ""),
+    ))
+    response.set_cookie(
+        "hegemon_session",
+        _api_token(),
+        httponly=True,
+        secure=request.is_secure,
+        samesite="Strict",
+        max_age=8 * 60 * 60,
     )
+    return response
 
 
 @app.get("/graph")

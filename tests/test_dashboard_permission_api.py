@@ -488,6 +488,18 @@ def test_dashboard_renders_tabbed_control_plane_view(auth_headers):
     assert "kernel-telemetry-mode-toggle" in body
 
 
+def test_dashboard_sets_session_cookie_for_follow_on_api_calls(auth_headers):
+    client = app.test_client()
+
+    dashboard = client.get("/", headers=auth_headers)
+    assert dashboard.status_code == 200
+    cookies = dashboard.headers.getlist("Set-Cookie")
+    assert any(cookie.startswith("hegemon_session=") for cookie in cookies)
+
+    overview = client.get("/api/control-plane/overview")
+    assert overview.status_code == 200
+
+
 def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
     client = app.test_client()
 
