@@ -344,8 +344,7 @@ HTML = """
         <input id="cp-scan-endpoint-input" list="cp-endpoint-suggestions" placeholder="endpoint id for scan" style="padding:8px;border-radius:8px;border:1px solid #35508f;background:#0f1528;color:#d8e2ff;" />
         <datalist id="cp-endpoint-suggestions"></datalist>
         <button id="cp-seed-btn" style="padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;">Seed Demo Endpoint</button>
-        <button id="cp-scan-btn" style="padding:8px 12px;background:#4a2b6a;color:#e7d7ff;border:1px solid #6b3f96;border-radius:8px;cursor:pointer;">Run Sophisticated Scan</button>
-      </div>
+              </div>
       <div class="cp-subtabs">
         <div class="cp-subtab">
           <h4>Friends <span><button class="cp-icon-btn" id="cp-add-friend-btn">＋</button><span class="cp-arrow" data-target="cp-friends-list">▾</span></span></h4>
@@ -356,7 +355,7 @@ HTML = """
           <div id="cp-endpoints-list" class="small"></div>
         </div>
       </div>
-      <div class="small" id="cp-status" style="margin-top:8px;">Control-plane data loading...</div>
+      <div class="small" id="cp-status" style="margin-top:8px;">Control-plane data loading. Autonomous scans are active.</div>
     </div>
     <div class="grid">
       <div class="card"><div class="muted">Friends</div><div class="kpi" id="cp-friends">0</div></div>
@@ -556,19 +555,19 @@ async function loadControlPlane(){
   }
 }
 
+async function runAutonomousScan(){
+  const endpointInput=document.getElementById('cp-scan-endpoint-input');
+  const endpointId=(endpointInput && endpointInput.value.trim()) || 'ep-default-linux';
+  const resp=await fetch('/api/control-plane/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint_id:endpointId})});
+  const data=await resp.json();
+  document.getElementById('cp-status').textContent=`Autonomous scan cycle complete. findings=${(data.findings||[]).length}`;
+  await loadControlPlane();
+}
+
 document.getElementById('cp-seed-btn')?.addEventListener('click', async()=>{
   const resp=await fetch('/api/control-plane/demo-seed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seed:true})});
   const data=await resp.json();
   document.getElementById('cp-status').textContent=data.message||'Seed complete';
-  await loadControlPlane();
-});
-
-document.getElementById('cp-scan-btn')?.addEventListener('click', async()=>{
-  const endpointInput=document.getElementById('cp-scan-endpoint-input');
-  const endpointId=(endpointInput && endpointInput.value.trim()) || 'ep-dashboard-demo';
-  const resp=await fetch('/api/control-plane/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint_id:endpointId})});
-  const data=await resp.json();
-  document.getElementById('cp-status').textContent=`Scan complete. findings=${(data.findings||[]).length}`;
   await loadControlPlane();
 });
 
@@ -612,7 +611,7 @@ document.getElementById("containment-live-toggle")?.addEventListener("change",(e
   const target=event.target;
   updateContainmentLiveMode(Boolean(target && target.checked));
 });
-window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadControlPlane();});
+window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadControlPlane(); runAutonomousScan(); window.setInterval(runAutonomousScan, 60000);});
 </script>
 </body>
 </html>

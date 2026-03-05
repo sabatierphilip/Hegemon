@@ -476,7 +476,7 @@ def test_dashboard_renders_tabbed_control_plane_view(auth_headers):
     assert resp.status_code == 200
     body = resp.get_data(as_text=True)
     assert 'data-tab="control-plane"' in body
-    assert "Run Sophisticated Scan" in body
+    assert "Autonomous scans are active" in body
     assert "cp-add-friend-btn" in body
     assert "cp-add-endpoint-btn" in body
     assert "cp-autocomplete-enabled" in body

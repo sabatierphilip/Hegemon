@@ -211,3 +211,13 @@ def test_friendly_store_and_app_management_defaults_and_add(tmp_path: Path):
     apps = client.get('/friendly-apps')
     assert apps.status_code == 200
     assert any(a['app_id'] == 'app-observability-agent' for a in apps.get_json())
+
+
+def test_control_plane_bootstrap_defaults_and_autodiscovery(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+    assert 'ep-default-windows' in cp.endpoints
+    assert 'ep-default-linux' in cp.endpoints
+    # autodiscovered from seeded endpoints/packages
+    names = {a.name for a in cp.friendly_apps.values()}
+    assert 'Nginx' in names
+    assert 'Microsoft Edge' in names

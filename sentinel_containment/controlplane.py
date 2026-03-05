@@ -38,6 +38,40 @@ DEFAULT_FRIENDLY_STORES: list[dict[str, str]] = [
 ]
 
 
+DEFAULT_FRIENDLY_ENDPOINTS: list[dict[str, Any]] = [
+    {
+        "endpoint_id": "ep-default-windows",
+        "host_name": "win-secure-01",
+        "endpoint_type": "on-prem",
+        "os": "windows",
+        "kernel": "nt",
+        "sbom_status": "valid",
+        "enrollment_method": "mdm",
+        "network_exposure": "internal",
+        "installed_packages": {"defender": "4.18.24010", "edge": "123.0.0"},
+    },
+    {
+        "endpoint_id": "ep-default-linux",
+        "host_name": "linux-secure-01",
+        "endpoint_type": "on-prem",
+        "os": "ubuntu",
+        "kernel": "6.8",
+        "sbom_status": "valid",
+        "enrollment_method": "mdm",
+        "network_exposure": "internet",
+        "installed_packages": {"openssl": "3.0.2", "nginx": "1.25.5", "steamcmd": "1.0.0"},
+        "telemetry_events": ["recon", "initial_access", "execution"],
+    },
+]
+
+PACKAGE_TO_FRIENDLY_APP: dict[str, dict[str, str]] = {
+    "edge": {"name": "Microsoft Edge", "icon": "🌐", "store_id": "store-windows", "publisher": "Microsoft"},
+    "defender": {"name": "Microsoft Defender", "icon": "🛡️", "store_id": "store-windows", "publisher": "Microsoft"},
+    "nginx": {"name": "Nginx", "icon": "🌐", "store_id": "store-linux", "publisher": "NGINX Inc."},
+    "steamcmd": {"name": "SteamCMD", "icon": "🎮", "store_id": "store-steam", "publisher": "Valve"},
+}
+
+
 @dataclass
 class Friend:
     friend_id: str
@@ -148,6 +182,7 @@ class HegemonControlPlane:
             row["store_id"]: FriendlyStore(**row) for row in DEFAULT_FRIENDLY_STORES
         }
         self.friendly_apps: dict[str, FriendlyApp] = {}
+        self._seed_default_friendly_entities()
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         entry = self.ledger.append(event_type, payload)
@@ -209,6 +244,29 @@ class HegemonControlPlane:
         self._record("friendly_store.added", {"actor": actor, "store": asdict(store)})
         return store
 
+    def _seed_default_friendly_entities(self) -> None:
+        for endpoint_payload in DEFAULT_FRIENDLY_ENDPOINTS:
+            self.add_endpoint(dict(endpoint_payload), actor="bootstrap")
+
+    def _autodiscover_friendly_apps_from_endpoint(self, endpoint: Endpoint, actor: str) -> None:
+        for package, version in endpoint.installed_packages.items():
+            spec = PACKAGE_TO_FRIENDLY_APP.get(package)
+            if not spec:
+                continue
+            existing = next((a for a in self.friendly_apps.values() if a.name == spec["name"] and a.store_id == spec["store_id"]), None)
+            if existing:
+                continue
+            self.add_friendly_app(
+                {
+                    "name": spec["name"],
+                    "icon": spec["icon"],
+                    "store_id": spec["store_id"],
+                    "publisher": spec["publisher"],
+                    "version": version,
+                },
+                actor=actor,
+            )
+
     def add_friendly_app(self, payload: dict[str, Any], actor: str) -> FriendlyApp:
         store_id = payload["store_id"]
         if store_id not in self.friendly_stores:
@@ -254,6 +312,7 @@ class HegemonControlPlane:
             raise ValueError("app-store-package endpoints require publisher_signature")
         self.endpoints[endpoint.endpoint_id] = endpoint
         self._record("endpoint.added", {"actor": actor, "endpoint": asdict(endpoint)})
+        self._autodiscover_friendly_apps_from_endpoint(endpoint, actor=f"{actor}:autodiscovery")
         return endpoint
 
     @staticmethod
