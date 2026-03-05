@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
 import secrets
+from collections import defaultdict
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -146,6 +148,7 @@ class Endpoint:
     trust_level: float = 6.0
     installed_packages: dict[str, str] = field(default_factory=dict)
     telemetry_events: list[str] = field(default_factory=list)
+    program_root: str | None = None
     last_heartbeat: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -303,6 +306,7 @@ class HegemonControlPlane:
                     "python3": "3.11.0",
                 },
                 "telemetry_events": ["recon", "execution", "persistence", "defense_evasion"],
+                "program_root": ".",
             },
             actor="bootstrap:self",
         )
@@ -364,6 +368,7 @@ class HegemonControlPlane:
             trust_level=float(payload.get("trust_level", 6.0)),
             installed_packages=dict(payload.get("installed_packages", {})),
             telemetry_events=list(payload.get("telemetry_events", [])),
+            program_root=(str(payload.get("program_root")) if payload.get("program_root") else None),
         )
         if endpoint.protection_mode not in {"observe-only", "canary", "enforce"}:
             raise ValueError("invalid protection_mode; expected one of observe-only|canary|enforce")
@@ -553,16 +558,109 @@ class HegemonControlPlane:
         self._record("vulnerability.detected", {"actor": actor, "finding": asdict(finding)})
         return finding
 
-    def _structural_risk_fingerprint(self, endpoint: Endpoint, package: str, version: str, chain_risk: float) -> dict[str, Any]:
-        package_score = 0.58 if package.startswith("hegemon") else 0.46
+    @staticmethod
+    def _safe_relpath(path: Path, base: Path) -> str:
+        try:
+            return str(path.relative_to(base))
+        except ValueError:
+            return str(path)
+
+    def _analyze_program_structure(self, program_root: str | None) -> dict[str, Any]:
+        if not program_root:
+            return {"files_scanned": 0, "issues": [], "ast_confidence": 0.0, "graph_alignment": 0.0, "markov_kill_chain": 0.0}
+
+        root = Path(program_root).resolve()
+        if not root.exists() or not root.is_dir():
+            return {"files_scanned": 0, "issues": [], "ast_confidence": 0.0, "graph_alignment": 0.0, "markov_kill_chain": 0.0}
+
+        skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache"}
+        py_files: list[Path] = []
+        for candidate in root.rglob("*.py"):
+            if any(part in skip_dirs for part in candidate.parts):
+                continue
+            py_files.append(candidate)
+            if len(py_files) >= 300:
+                break
+
+        imports_graph: dict[str, set[str]] = defaultdict(set)
+        issues: list[dict[str, Any]] = []
+
+        def add_issue(issue_id: str, severity: str, stage: str, file_path: Path, line: int, confidence: float, reason: str, patch: str) -> None:
+            issues.append(
+                {
+                    "issue_id": issue_id,
+                    "severity": severity,
+                    "kill_chain_stage": stage,
+                    "file": self._safe_relpath(file_path, root),
+                    "line": line,
+                    "confidence": confidence,
+                    "reasoning": reason,
+                    "patch_hint": patch,
+                }
+            )
+
+        for py_file in py_files:
+            try:
+                source = py_file.read_text(encoding="utf-8")
+                tree = ast.parse(source)
+            except (OSError, UnicodeDecodeError, SyntaxError):
+                continue
+
+            module_name = self._safe_relpath(py_file, root)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports_graph[module_name].add(alias.name.split(".")[0])
+                if isinstance(node, ast.ImportFrom):
+                    imports_graph[module_name].add((node.module or "").split(".")[0])
+                if isinstance(node, ast.Call):
+                    func_name = ""
+                    if isinstance(node.func, ast.Name):
+                        func_name = node.func.id
+                    elif isinstance(node.func, ast.Attribute):
+                        parent = node.func.value.id if isinstance(node.func.value, ast.Name) else ""
+                        func_name = f"{parent}.{node.func.attr}" if parent else node.func.attr
+
+                    line = getattr(node, "lineno", 1)
+                    if func_name in {"eval", "exec"}:
+                        add_issue("dynamic-exec", "high", "execution", py_file, line, 0.9, "Dynamic code execution enables payload execution.", "Replace eval/exec with strict parser or whitelisted dispatch.")
+                    if func_name.endswith("subprocess.run") or func_name.endswith("subprocess.Popen"):
+                        for kw in node.keywords:
+                            if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                                add_issue("shell-true", "high", "execution", py_file, line, 0.86, "subprocess call with shell=True can allow command injection.", "Use argument array and shell=False; validate inputs.")
+                    if func_name in {"pickle.loads", "loads"}:
+                        add_issue("pickle-loads", "high", "initial_access", py_file, line, 0.84, "Untrusted pickle deserialization may lead to RCE.", "Switch to JSON/msgpack and enforce schema validation.")
+                    if func_name == "yaml.load":
+                        safe_loader = any(kw.arg == "Loader" and isinstance(kw.value, ast.Attribute) and kw.value.attr == "SafeLoader" for kw in node.keywords)
+                        if not safe_loader:
+                            add_issue("yaml-unsafe-load", "medium", "initial_access", py_file, line, 0.72, "yaml.load without SafeLoader can execute arbitrary objects.", "Use yaml.safe_load or Loader=yaml.SafeLoader.")
+                    if func_name in {"hashlib.md5", "hashlib.sha1", "md5", "sha1"}:
+                        add_issue("weak-hash", "medium", "defense_evasion", py_file, line, 0.65, "Weak hash primitive detected for integrity/security-sensitive operation.", "Use SHA-256/512 or BLAKE2 variants.")
+
+        issue_conf = [float(i["confidence"]) for i in issues] or [0.0]
+        ast_confidence = round(min(0.99, sum(issue_conf) / len(issue_conf) + (0.12 if issues else 0.0)), 3)
+        degree_values = [len(v) for v in imports_graph.values()] or [0]
+        graph_alignment = round(min(0.99, (sum(degree_values) / max(1, len(degree_values))) / 6.0), 3)
+        stages = [str(i["kill_chain_stage"]) for i in issues]
+        _markov, markov_score = self._kill_chain_transition_markov(stages)
+        return {
+            "files_scanned": len(py_files),
+            "issues": issues,
+            "ast_confidence": ast_confidence,
+            "graph_alignment": graph_alignment,
+            "markov_kill_chain": round(markov_score, 3),
+        }
+
+    def _structural_risk_fingerprint(self, endpoint: Endpoint, package: str, version: str, chain_risk: float, structural_report: dict[str, Any]) -> dict[str, Any]:
+        base_score = 0.58 if package.startswith("hegemon") else 0.46
         if endpoint.network_exposure == "internet":
-            package_score += 0.08
+            base_score += 0.08
         if endpoint.sbom_status != "valid":
-            package_score += 0.07
-        ast_confidence = min(0.99, round(package_score + min(0.2, chain_risk * 0.35), 3))
-        graph_alignment = min(0.99, round(0.42 + (chain_risk * 0.5) + (0.08 if endpoint.trust_level <= 6.0 else 0), 3))
-        markov_kill_chain = min(0.99, round(chain_risk + 0.22, 3))
-        confirmations = len({"ast", "graph"}.intersection({"ast" if ast_confidence >= 0.55 else "", "graph" if graph_alignment >= 0.55 else ""}))
+            base_score += 0.07
+        ast_confidence = min(0.99, round(max(base_score, float(structural_report.get("ast_confidence", 0.0))) + min(0.2, chain_risk * 0.30), 3))
+        graph_alignment = min(0.99, round(max(float(structural_report.get("graph_alignment", 0.0)), 0.42 + (chain_risk * 0.45)), 3))
+        markov_kill_chain = min(0.99, round(max(float(structural_report.get("markov_kill_chain", 0.0)), chain_risk + 0.18), 3))
+        confirmations = int(ast_confidence >= 0.55) + int(graph_alignment >= 0.55) + int(markov_kill_chain >= 0.35)
         return {
             "ast_confidence": ast_confidence,
             "graph_alignment": graph_alignment,
@@ -578,6 +676,7 @@ class HegemonControlPlane:
         endpoint = self.endpoints[endpoint_id]
         discovered: list[VulnerabilityFinding] = []
         markov, chain_risk = self._kill_chain_transition_markov(endpoint.telemetry_events)
+        structural_report = self._analyze_program_structure(endpoint.program_root)
         for package, version in endpoint.installed_packages.items():
             candidates: dict[str, dict[str, Any]] = {}
             osv_results = self._query_osv(package, version, endpoint.os) if include_external_intel else []
@@ -630,7 +729,7 @@ class HegemonControlPlane:
                     }
 
             for candidate in candidates.values():
-                structural = self._structural_risk_fingerprint(endpoint, package, version, chain_risk)
+                structural = self._structural_risk_fingerprint(endpoint, package, version, chain_risk, structural_report)
                 double_checks = len(set(candidate.get("sources", []))) + int(structural["confirmations"])
                 if double_checks < 2:
                     continue
@@ -650,6 +749,8 @@ class HegemonControlPlane:
                         "graph_alignment": structural["graph_alignment"],
                         "markov_kill_chain": structural["markov_kill_chain"],
                         "double_checks": double_checks,
+                        "files_scanned": structural_report.get("files_scanned", 0),
+                        "issues_detected": len(structural_report.get("issues", [])),
                     }
                 )
                 finding = self.create_finding(
@@ -669,6 +770,38 @@ class HegemonControlPlane:
                     actor,
                 )
                 discovered.append(finding)
+
+
+        for issue in structural_report.get("issues", []):
+            confidence = float(issue.get("confidence", 0.6))
+            cvss = round(min(9.8, 5.0 + confidence * 4.5), 2)
+            local_structural = self.create_finding(
+                {
+                    "endpoint_id": endpoint_id,
+                    "cve": f"HEGEMON-AST-{str(issue.get('issue_id', 'CHECK')).upper()}",
+                    "cvss": cvss,
+                    "exploit_availability": round(min(9.9, 4.2 + confidence * 4.0), 2),
+                    "topological_impact": round(5.5 + chain_risk + (0.8 if issue.get("severity") == "high" else 0.3), 3),
+                    "asset_value": endpoint.asset_value,
+                    "trust_level": endpoint.trust_level,
+                    "evidence": [
+                        {"type": "ast_issue", **issue},
+                        {"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk},
+                    ],
+                    "suggested_remediations": [
+                        str(issue.get("patch_hint", "apply hardened coding remediation")),
+                        "add regression test for vulnerable code path",
+                        "enforce secure coding lint rules in CI",
+                    ],
+                    "graph_path": self._build_attack_path(endpoint, f"HEGEMON-AST-{str(issue.get('issue_id', 'CHECK')).upper()}", chain_risk),
+                    "reasoning": (
+                        f"AST finding in {issue.get('file')}:{issue.get('line')} with confidence={confidence:.2f}; "
+                        f"kill_chain_stage={issue.get('kill_chain_stage')}"
+                    ),
+                },
+                actor,
+            )
+            discovered.append(local_structural)
 
         local_exposure_findings: list[dict[str, Any]] = []
         if endpoint.network_exposure == "internet" and endpoint.trust_level <= 6.5:
@@ -791,6 +924,8 @@ class HegemonControlPlane:
                 "endpoint_id": endpoint_id,
                 "findings": [f.finding_id for f in discovered],
                 "osv_live": include_external_intel,
+                "structural_files_scanned": structural_report.get("files_scanned", 0),
+                "structural_issues": len(structural_report.get("issues", [])),
             },
         )
         return discovered
@@ -885,6 +1020,22 @@ class HegemonControlPlane:
         }
 
     def _diff_for_finding(self, finding: VulnerabilityFinding, endpoint: Endpoint) -> tuple[str, str]:
+        if finding.cve.startswith("HEGEMON-AST-"):
+            ast_ev = next((e for e in finding.evidence if e.get("type") == "ast_issue"), {})
+            issue_file = str(ast_ev.get("file", "program.py"))
+            issue_line = int(ast_ev.get("line", 1))
+            patch_hint = finding.suggested_remediations[0] if finding.suggested_remediations else "replace unsafe construct"
+            diff = (
+                f"--- a/{issue_file}\n"
+                f"+++ b/{issue_file}\n"
+                f"@@ -{issue_line},1 +{issue_line},2 @@\n"
+                f"- # vulnerable operation at line {issue_line}\n"
+                f"+ # remediated operation at line {issue_line}\n"
+                f"+ # patch_hint: {patch_hint}\n"
+            )
+            explanation = f"Hardens {issue_file}:{issue_line} using AST-driven remediation guidance: {patch_hint}."
+            return diff, explanation
+
         upgrade = finding.suggested_remediations[0] if finding.suggested_remediations else "upgrade vulnerable package"
         parts = upgrade.split()
         pkg = parts[1] if len(parts) > 1 else "security-control"

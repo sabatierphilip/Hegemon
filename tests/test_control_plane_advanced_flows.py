@@ -310,3 +310,47 @@ def test_autonomous_self_scan_generates_and_applies_patch(tmp_path: Path):
     out = cp.run_autonomous_self_patch()
     assert out['applied'] >= 1
     assert cp.patch_proposals[proposal.proposal_id].status == 'deployed_canary'
+
+
+
+def test_structural_scan_detects_real_program_issues(tmp_path: Path, monkeypatch):
+    program = tmp_path / 'program'
+    program.mkdir()
+    (program / 'app.py').write_text(
+        """import subprocess
+import hashlib
+
+
+def run(user_input):
+    subprocess.run(f"echo {user_input}", shell=True)
+    return hashlib.md5(user_input.encode()).hexdigest()
+"""
+    )
+
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+    endpoint = cp.add_endpoint(
+        {
+            'host_name': 'real-program',
+            'endpoint_type': 'on-prem',
+            'os': 'ubuntu',
+            'kernel': '6.8',
+            'sbom_status': 'valid',
+            'enrollment_method': 'agent',
+            'installed_packages': {'custom-runtime': '1.0.0'},
+            'telemetry_events': ['recon', 'execution'],
+            'program_root': str(program),
+        },
+        actor='tester',
+    )
+
+    monkeypatch.setattr(cp, '_query_osv', lambda package, version, endpoint_os: [])
+    monkeypatch.setattr(cp, '_query_nvd', lambda package, version, endpoint_os: [])
+
+    findings = cp.run_vulnerability_scan(endpoint.endpoint_id, actor='tester', include_external_intel=False)
+    cves = {f.cve for f in findings}
+    assert 'HEGEMON-AST-SHELL-TRUE' in cves
+    assert 'HEGEMON-AST-WEAK-HASH' in cves
+
+    shell_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-SHELL-TRUE')
+    proposal = cp.generate_patch_proposal(shell_finding.finding_id, actor='tester')
+    assert 'patch_hint' in proposal.code_diff
