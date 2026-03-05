@@ -374,3 +374,38 @@ def run(user_input):
     sql_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-TAINTED-SQL-QUERY')
     sql_proposal = cp.generate_patch_proposal(sql_finding.finding_id, actor='tester')
     assert 'parameterized query' in sql_proposal.change_plan[0]
+
+
+
+def test_hardcoded_secret_tuning_reduces_metadata_false_positives(tmp_path: Path, monkeypatch):
+    program = tmp_path / 'program-meta'
+    program.mkdir()
+    (program / 'meta.py').write_text(
+        '__author__ = "very-long-author-identifier-string"\n'
+        '__version__ = "2026.11.9999"\n'
+        'API_TOKEN = "REAL_SUPER_SECRET_TOKEN_987654321"\n'
+    )
+
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+    endpoint = cp.add_endpoint(
+        {
+            'host_name': 'meta-program',
+            'endpoint_type': 'on-prem',
+            'os': 'ubuntu',
+            'kernel': '6.8',
+            'sbom_status': 'valid',
+            'enrollment_method': 'agent',
+            'installed_packages': {'custom-runtime': '1.0.0'},
+            'telemetry_events': ['recon', 'credential_access'],
+            'program_root': str(program),
+        },
+        actor='tester',
+    )
+    monkeypatch.setattr(cp, '_query_osv', lambda package, version, endpoint_os: [])
+    monkeypatch.setattr(cp, '_query_nvd', lambda package, version, endpoint_os: [])
+
+    findings = cp.run_vulnerability_scan(endpoint.endpoint_id, actor='tester', include_external_intel=False)
+    secret_findings = [f for f in findings if f.cve == 'HEGEMON-AST-HARDCODED-SECRET']
+    assert len(secret_findings) == 1
+    issue = next(e for e in secret_findings[0].evidence if e.get('type') == 'ast_issue')
+    assert 'dynamic-tuned' in issue.get('tags', [])

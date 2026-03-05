@@ -640,6 +640,59 @@ class HegemonControlPlane:
                 return tainted_from_expr(expr.value, tainted_vars, tainted_calls)
             return False
 
+        def _normalized_name_tokens(var_name: str) -> set[str]:
+            normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in var_name)
+            return {tok for tok in normalized.split("_") if tok}
+
+        def _literal_entropy_score(value: str) -> float:
+            if not value:
+                return 0.0
+            charset = len(set(value))
+            return min(1.0, (charset / max(1, len(value))) * 3.2)
+
+        def _hardcoded_secret_signal(var_name: str, literal_value: str) -> tuple[bool, list[str], float]:
+            tokens = _normalized_name_tokens(var_name)
+            safe_name_allowlist = {"author", "copyright", "license", "version", "description", "homepage"}
+            if tokens.intersection(safe_name_allowlist):
+                return False, ["identifier appears metadata-oriented"], 0.0
+
+            secret_markers = {
+                "secret", "token", "password", "passwd", "apikey", "api", "key", "bearer", "private", "credential", "session",
+            }
+            explicit_combo = (
+                ("api" in tokens and "key" in tokens)
+                or ("auth" in tokens and "token" in tokens)
+                or ("client" in tokens and "secret" in tokens)
+                or ("access" in tokens and "key" in tokens)
+            )
+            name_has_signal = bool(tokens.intersection(secret_markers) or explicit_combo)
+
+            lower_value = literal_value.lower()
+            placeholder_markers = {"example", "changeme", "dummy", "sample", "localhost", "test", "placeholder"}
+            if any(marker in lower_value for marker in placeholder_markers):
+                return False, ["literal appears placeholder/test data"], 0.0
+
+            if literal_value.startswith(("http://", "https://")):
+                return False, ["literal appears URL-like"], 0.0
+
+            looks_key_like = (
+                len(literal_value) >= 20
+                and any(ch.isdigit() for ch in literal_value)
+                and (any(ch.isupper() for ch in literal_value) or any(ch in "-_" for ch in literal_value))
+                and " " not in literal_value
+            )
+            entropy = _literal_entropy_score(literal_value)
+            high_entropy = entropy >= 0.38
+
+            triggered = name_has_signal and (looks_key_like or high_entropy)
+            details = [
+                f"name_signal={name_has_signal}",
+                f"looks_key_like={looks_key_like}",
+                f"entropy={entropy:.2f}",
+            ]
+            confidence = min(0.99, 0.72 + (0.14 if looks_key_like else 0.0) + (0.12 if high_entropy else 0.0)) if triggered else 0.0
+            return triggered, details, confidence
+
         def add_issue(
             issue_id: str,
             severity: str,
@@ -700,20 +753,21 @@ class HegemonControlPlane:
                 if isinstance(top, ast.Assign) and isinstance(top.value, ast.Constant) and isinstance(top.value.value, str) and len(top.value.value) >= 18:
                     for target in top.targets:
                         if isinstance(target, ast.Name):
-                            var_name = target.id.lower()
-                            if any(k in var_name for k in ("secret", "token", "password", "api_key", "auth")):
+                            var_name = target.id
+                            secret_hit, tuning_details, tuned_confidence = _hardcoded_secret_signal(var_name, top.value.value)
+                            if secret_hit:
                                 add_issue(
                                     "hardcoded-secret",
                                     "critical",
                                     "credential_access",
                                     root / module_name,
                                     getattr(top, "lineno", 1),
-                                    0.97,
+                                    tuned_confidence,
                                     "Credential-like literal appears hardcoded in module scope and can be exfiltrated.",
                                     "Move secret to vault/env provider, rotate immediately, and block secret literals in CI.",
-                                    details=["Module-level secret constant detected.", "Literal entropy/length suggests authentication material."],
-                                    tags=["zero-day-like", "credential-exposure"],
-                                    dataflow_path=["module_constant", var_name, "credential_usage"],
+                                    details=["Module-level secret constant detected.", *tuning_details],
+                                    tags=["zero-day-like", "credential-exposure", "dynamic-tuned"],
+                                    dataflow_path=["module_constant", var_name.lower(), "credential_usage"],
                                     call_path=[f"{module_name}:<module>"],
                                 )
 
@@ -738,21 +792,22 @@ class HegemonControlPlane:
                                 if tainted_from_expr(value, tainted_vars, local_calls_tainted):
                                     tainted_vars.add(target.id)
                                 if isinstance(value, ast.Constant) and isinstance(value.value, str) and len(value.value) >= 18:
-                                    if any(k in var_name for k in ("secret", "token", "password", "api_key", "auth")):
+                                    secret_hit, tuning_details, tuned_confidence = _hardcoded_secret_signal(target.id, value.value)
+                                    if secret_hit:
                                         add_issue(
                                             "hardcoded-secret",
                                             "critical",
                                             "credential_access",
                                             root / module_name,
                                             getattr(child, "lineno", 1),
-                                            0.97,
+                                            tuned_confidence,
                                             "Credential-like literal appears hardcoded in source and can be exfiltrated.",
                                             "Move secret to vault/env provider, rotate immediately, and block secret literals in CI.",
                                             details=[
                                                 "Variable naming indicates credential context.",
-                                                "Literal entropy/length suggests authentication material.",
+                                                *tuning_details,
                                             ],
-                                            tags=["zero-day-like", "credential-exposure"],
+                                            tags=["zero-day-like", "credential-exposure", "dynamic-tuned"],
                                             dataflow_path=["constant_literal", var_name, "credential_usage"],
                                             call_path=[fn_qname],
                                         )
