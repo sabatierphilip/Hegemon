@@ -284,3 +284,29 @@ def test_scan_can_use_nvd_as_additional_intel_source(tmp_path: Path, monkeypatch
     assert any(f.cve == 'CVE-2026-4242' for f in findings)
     cve = next(f for f in findings if f.cve == 'CVE-2026-4242')
     assert any(e.get('type') == 'nvd_live_query' for e in cve.evidence)
+    assert any(e.get('type') == 'ast_graph_double_check' for e in cve.evidence)
+
+
+def test_autonomous_self_scan_generates_and_applies_patch(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+
+    finding = cp.create_finding(
+        {
+            'endpoint_id': 'ep-hegemon-self',
+            'cve': 'HEGEMON-SELF-CHECK-001',
+            'cvss': 5.1,
+            'exploit_availability': 4.1,
+            'topological_impact': 4.2,
+            'asset_value': 10.0,
+            'trust_level': 8.8,
+            'evidence': [{'type': 'ast_graph_double_check', 'double_checks': 2}],
+            'suggested_remediations': ['upgrade hegemon-core to 0.9.1'],
+        },
+        actor='tester',
+    )
+    proposal = cp.generate_patch_proposal(finding.finding_id, actor='tester')
+    assert proposal.status == 'pending_review'
+
+    out = cp.run_autonomous_self_patch()
+    assert out['applied'] >= 1
+    assert cp.patch_proposals[proposal.proposal_id].status == 'deployed_canary'

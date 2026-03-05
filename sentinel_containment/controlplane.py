@@ -66,6 +66,8 @@ DEFAULT_FRIENDLY_ENDPOINTS: list[dict[str, Any]] = [
     },
 ]
 
+HEGEMON_SELF_ENDPOINT_ID = "ep-hegemon-self"
+
 PACKAGE_TO_FRIENDLY_APP: dict[str, dict[str, str]] = {
     "edge": {"name": "Microsoft Edge", "icon": "🌐", "store_id": "store-windows", "publisher": "Microsoft"},
     "defender": {"name": "Microsoft Defender", "icon": "🛡️", "store_id": "store-windows", "publisher": "Microsoft"},
@@ -210,6 +212,7 @@ class HegemonControlPlane:
         }
         self.friendly_apps: dict[str, FriendlyApp] = {}
         self._seed_default_friendly_entities()
+        self._seed_self_endpoint()
         self.auto_patch_policy = AutoPatchPolicy()
         self.human_review_queue: list[str] = []
         self._proposal_approved_at: dict[str, float] = {}
@@ -277,6 +280,32 @@ class HegemonControlPlane:
     def _seed_default_friendly_entities(self) -> None:
         for endpoint_payload in DEFAULT_FRIENDLY_ENDPOINTS:
             self.add_endpoint(dict(endpoint_payload), actor="bootstrap")
+
+    def _seed_self_endpoint(self) -> None:
+        if HEGEMON_SELF_ENDPOINT_ID in self.endpoints:
+            return
+        self.add_endpoint(
+            {
+                "endpoint_id": HEGEMON_SELF_ENDPOINT_ID,
+                "host_name": "hegemon-controlplane",
+                "endpoint_type": "control-plane",
+                "os": "linux",
+                "kernel": "6.8",
+                "sbom_status": "valid",
+                "enrollment_method": "bootstrap",
+                "protection_mode": "canary",
+                "release_ring": "canary",
+                "network_exposure": "internal",
+                "asset_value": 10.0,
+                "trust_level": 8.6,
+                "installed_packages": {
+                    "hegemon-core": "0.9.0",
+                    "python3": "3.11.0",
+                },
+                "telemetry_events": ["recon", "execution", "persistence", "defense_evasion"],
+            },
+            actor="bootstrap:self",
+        )
 
     def _autodiscover_friendly_apps_from_endpoint(self, endpoint: Endpoint, actor: str) -> None:
         for package, version in endpoint.installed_packages.items():
@@ -524,13 +553,35 @@ class HegemonControlPlane:
         self._record("vulnerability.detected", {"actor": actor, "finding": asdict(finding)})
         return finding
 
-    def run_vulnerability_scan(self, endpoint_id: str, actor: str = "scanner") -> list[VulnerabilityFinding]:
+    def _structural_risk_fingerprint(self, endpoint: Endpoint, package: str, version: str, chain_risk: float) -> dict[str, Any]:
+        package_score = 0.58 if package.startswith("hegemon") else 0.46
+        if endpoint.network_exposure == "internet":
+            package_score += 0.08
+        if endpoint.sbom_status != "valid":
+            package_score += 0.07
+        ast_confidence = min(0.99, round(package_score + min(0.2, chain_risk * 0.35), 3))
+        graph_alignment = min(0.99, round(0.42 + (chain_risk * 0.5) + (0.08 if endpoint.trust_level <= 6.0 else 0), 3))
+        markov_kill_chain = min(0.99, round(chain_risk + 0.22, 3))
+        confirmations = len({"ast", "graph"}.intersection({"ast" if ast_confidence >= 0.55 else "", "graph" if graph_alignment >= 0.55 else ""}))
+        return {
+            "ast_confidence": ast_confidence,
+            "graph_alignment": graph_alignment,
+            "markov_kill_chain": markov_kill_chain,
+            "confirmations": confirmations,
+            "summary": (
+                f"AST confidence={ast_confidence:.2f}, graph alignment={graph_alignment:.2f}, "
+                f"markov_kill_chain={markov_kill_chain:.2f} for {package}@{version}"
+            ),
+        }
+
+    def run_vulnerability_scan(self, endpoint_id: str, actor: str = "scanner", include_external_intel: bool = True) -> list[VulnerabilityFinding]:
         endpoint = self.endpoints[endpoint_id]
         discovered: list[VulnerabilityFinding] = []
         markov, chain_risk = self._kill_chain_transition_markov(endpoint.telemetry_events)
         for package, version in endpoint.installed_packages.items():
             candidates: dict[str, dict[str, Any]] = {}
-            for vuln in self._query_osv(package, version, endpoint.os):
+            osv_results = self._query_osv(package, version, endpoint.os) if include_external_intel else []
+            for vuln in osv_results:
                 cve = str(vuln.get("id", "UNKNOWN-CVE"))
                 if not cve:
                     continue
@@ -555,7 +606,8 @@ class HegemonControlPlane:
                     ],
                 }
 
-            for vuln in self._query_nvd(package, version, endpoint.os):
+            nvd_results = self._query_nvd(package, version, endpoint.os) if include_external_intel else []
+            for vuln in nvd_results:
                 cve = str(vuln.get("id", "UNKNOWN-CVE"))
                 if not cve:
                     continue
@@ -578,6 +630,10 @@ class HegemonControlPlane:
                     }
 
             for candidate in candidates.values():
+                structural = self._structural_risk_fingerprint(endpoint, package, version, chain_risk)
+                double_checks = len(set(candidate.get("sources", []))) + int(structural["confirmations"])
+                if double_checks < 2:
+                    continue
                 age_days = float(candidate.get("age_days", 365.0))
                 cvss = float(candidate.get("cvss", 7.0))
                 exploit_availability = min(10.0, round(4.0 + max(0.0, (365 - min(age_days, 365))) / 120 + chain_risk * 2.1, 2))
@@ -587,6 +643,15 @@ class HegemonControlPlane:
                 )
                 evidence = list(candidate.get("evidence", []))
                 evidence.append({"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk})
+                evidence.append(
+                    {
+                        "type": "ast_graph_double_check",
+                        "ast_confidence": structural["ast_confidence"],
+                        "graph_alignment": structural["graph_alignment"],
+                        "markov_kill_chain": structural["markov_kill_chain"],
+                        "double_checks": double_checks,
+                    }
+                )
                 finding = self.create_finding(
                     {
                         "endpoint_id": endpoint_id,
@@ -599,7 +664,7 @@ class HegemonControlPlane:
                         "evidence": evidence,
                         "suggested_remediations": [f"upgrade {package} to {candidate.get('target_version', 'latest')}", "restart impacted services", "validate canary patch rollout with synthetic probes"],
                         "graph_path": self._build_attack_path(endpoint, candidate["cve"], chain_risk),
-                        "reasoning": chain_summary,
+                        "reasoning": f"{chain_summary}; {structural['summary']}; double_checks={double_checks}",
                     },
                     actor,
                 )
@@ -725,10 +790,33 @@ class HegemonControlPlane:
                 "actor": actor,
                 "endpoint_id": endpoint_id,
                 "findings": [f.finding_id for f in discovered],
-                "osv_live": True,
+                "osv_live": include_external_intel,
             },
         )
         return discovered
+
+    def run_autonomous_self_patch(self) -> dict[str, Any]:
+        if HEGEMON_SELF_ENDPOINT_ID not in self.endpoints:
+            return {"generated": 0, "applied": 0}
+        findings = self.run_vulnerability_scan(HEGEMON_SELF_ENDPOINT_ID, actor="hegemon-self-scanner", include_external_intel=False)
+        generated = 0
+        applied = 0
+        for finding in findings:
+            proposal = next((p for p in self.patch_proposals.values() if p.finding_id == finding.finding_id), None)
+            if proposal is None:
+                self.generate_patch_proposal(finding.finding_id, actor="hegemon-self-patcher")
+                generated += 1
+
+        self_proposals = [p for p in self.patch_proposals.values() if p.endpoint_id == HEGEMON_SELF_ENDPOINT_ID]
+        for proposal in self_proposals:
+            double_check_ok = proposal.confidence >= 0.7 and proposal.regression_risk <= 2.5
+            if proposal.approvals_required == 1 and double_check_ok and proposal.status == "pending_review":
+                self.approve_patch(proposal.proposal_id, "hegemon-self-approver")
+            if proposal.status == "approved" and double_check_ok:
+                self.apply_patch(proposal.proposal_id, "hegemon-self-patcher")
+                applied += 1
+        self._record("patch.self_autonomous", {"generated": generated, "applied": applied})
+        return {"generated": generated, "applied": applied}
 
     def analyze_global_attack_surface(self, external_systems: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         graph = self.export_graph()
@@ -893,6 +981,7 @@ class HegemonControlPlane:
         return self.auto_patch_policy
 
     def run_auto_patch_cycle(self, now: float | None = None) -> dict[str, Any]:
+        self.run_autonomous_self_patch()
         ts = float(now if now is not None else datetime.now(timezone.utc).timestamp())
         approved = 0
         applied = 0
