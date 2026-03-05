@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import time
+import ipaddress
 
 import hmac
 from collections import defaultdict, deque
@@ -101,16 +102,35 @@ def _build_request_guard() -> EventTriggeredBurstGuard:
 _request_guard = _build_request_guard()
 
 
+def _trusted_reverse_proxies() -> set[str]:
+    settings = Settings.load()
+    configured = settings.get("web_trusted_reverse_proxies", [])
+    if isinstance(configured, str):
+        configured = [token.strip() for token in configured.split(",") if token.strip()]
+    return {str(proxy).strip() for proxy in configured if str(proxy).strip()}
+
+
+_TRUSTED_REVERSE_PROXIES = _trusted_reverse_proxies()
+
+
 def _is_loopback(addr: str | None) -> bool:
     if not addr:
         return False
-    return addr in {"127.0.0.1", "::1", "localhost"}
+    normalized = addr.strip().lower()
+    if normalized in {"localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def _is_local_request() -> bool:
     remote = request.remote_addr or ""
-    forwarded = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip())
-    local_remote = _is_loopback(remote) or (forwarded and _is_loopback(forwarded))
+    local_remote = _is_loopback(remote)
+    if not local_remote and remote in _TRUSTED_REVERSE_PROXIES:
+        forwarded = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip())
+        local_remote = bool(forwarded and _is_loopback(forwarded))
     if not local_remote:
         return False
     origin = request.headers.get("Origin", "").strip()

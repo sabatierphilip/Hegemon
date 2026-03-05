@@ -12,6 +12,7 @@ import socketserver
 import ssl
 import threading
 import time
+import tempfile
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -199,23 +200,7 @@ class SentinelRuntime:
             action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
             distributor_engine=self.distributor,
         )
-        self.fast_lane_containment = ContainmentEngine(
-            self.audit,
-            identity_store=settings.get("approval_identity_store", {}),
-            required_approvals=int(settings.get("approval_quorum", 1)),
-            hardware_key_verifier=HardwareKeyVerifier(
-                settings.get("trusted_hardware_public_keys", {}),
-                fail_closed=bool(settings.get("hardware_key_fail_closed", True)),
-            ),
-            human_confirmation_verifier=HumanConfirmationVerifier(
-                shared_secret=str(settings.get("human_confirmation_shared_secret", "")),
-                prompt_count=int(settings.get("human_confirmation_prompt_count", 2)),
-                question_salt=str(settings.get("human_confirmation_question_salt", "human-presence-gate")),
-                fail_closed=bool(settings.get("human_confirmation_fail_closed", True)),
-            ),
-            action_executor=ContainmentActionExecutor(active_mode=bool(settings.get("containment_live_mode", True))),
-            distributor_engine=self.distributor,
-        )
+        self.fast_lane_containment = self.containment
 
         extra_sources = {
             "host_kernel": Path(ingest_cfg.get("kernel_events_file", "data/kernel_events.jsonl")),
@@ -333,6 +318,7 @@ class SentinelRuntime:
         )
         self._peer_verification_interval = float(p2p_cfg.get("interval_seconds", 5.0))
         self._next_peer_verification_due = 0.0
+        self._peer_advertisement_private_key = ed25519.Ed25519PrivateKey.generate()
         self._p2p_signer_ids = [str(pid).strip() for pid in p2p_cfg.get("checkpoint_signers", configured_peer_ids) if str(pid).strip()]
         self._p2p_replication_targets = [str(x).strip() for x in p2p_cfg.get("replication_targets", configured_peer_ids) if str(x).strip()]
         self._p2p_attestation_cache: dict[str, dict[str, dict[str, Any]]] = {}
@@ -1265,23 +1251,48 @@ class SentinelRuntime:
             self.control_plane.run_auto_patch_cycle()
             self._stop.wait(300)
 
+    def _read_latest_state(self) -> dict[str, Any] | None:
+        if not self.latest_state_path.exists():
+            return None
+        try:
+            return json.loads(self.latest_state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+
+    def _write_latest_state(self, state: dict[str, Any]) -> None:
+        self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(state, indent=2)
+        fd, tmp_path_raw = tempfile.mkstemp(prefix=f"{self.latest_state_path.name}.", suffix=".tmp", dir=str(self.latest_state_path.parent))
+        tmp_path = Path(tmp_path_raw)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.latest_state_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+
     def _notification_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                if self.latest_state_path.exists():
-                    state = json.loads(self.latest_state_path.read_text(encoding="utf-8"))
-                    severity = int(state.get("candidate_severity", 0) or 0)
-                    host = "unknown"
-                    alerts = state.get("alerts") or []
-                    if alerts:
-                        host = str((alerts[0] or {}).get("event", {}).get("host", "unknown"))
-                    now = time.time()
-                    if severity >= 80 and now - self._last_notified_by_host.get(host, 0) >= 600:
-                        event = {"severity": severity, "host": host, "summary": "High severity alert", "ts": now}
-                        event["dispatch"] = self._dispatch_notifications(event)
-                        self.notification_history.append(event)
-                        self._last_notified_by_host[host] = now
-                        self.audit.append("notification.sent", event)
+                state = self._read_latest_state()
+                if state is None:
+                    self._stop.wait(5)
+                    continue
+                severity = int(state.get("candidate_severity", 0) or 0)
+                host = "unknown"
+                alerts = state.get("alerts") or []
+                if alerts:
+                    host = str((alerts[0] or {}).get("event", {}).get("host", "unknown"))
+                now = time.time()
+                if severity >= 80 and now - self._last_notified_by_host.get(host, 0) >= 600:
+                    event = {"severity": severity, "host": host, "summary": "High severity alert", "ts": now}
+                    event["dispatch"] = self._dispatch_notifications(event)
+                    self.notification_history.append(event)
+                    self._last_notified_by_host[host] = now
+                    self.audit.append("notification.sent", event)
             except Exception:
                 pass
             self._stop.wait(5)
@@ -1349,8 +1360,7 @@ class SentinelRuntime:
 
         instance_id = str(self.peer_advertisement_cfg.get("instance_id", socket.gethostname())).strip() or "hegemon-node"
         local_url = str(self.peer_advertisement_cfg.get("local_url", "http://127.0.0.1:5000")).strip()
-        private = ed25519.Ed25519PrivateKey.generate()
-        node = PeerMeshNode(instance_id, local_url, private)
+        node = PeerMeshNode(instance_id, local_url, self._peer_advertisement_private_key)
         payload = node.advertise_payload()
         targets = [str(t).rstrip("/") for t in self.peer_advertisement_cfg.get("peer_urls", []) if str(t).strip()]
         sent = 0
@@ -1396,8 +1406,7 @@ class SentinelRuntime:
             "active_peers": len(self.peer_mesh.process_ids),
             "notifications_sent": len(self.notification_history),
         }
-        self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self._write_latest_state(state)
         return state
 
     def _cycle_loop(self) -> None:
