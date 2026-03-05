@@ -1,0 +1,12 @@
+[Unit]
+Description=Hegemon Endpoint Agent
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/hegemon/hegemon_endpoint_agent.py --hegemon-url ${HEGEMON_URL} --token ${HEGEMON_TOKEN}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

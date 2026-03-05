@@ -71,6 +71,20 @@ PACKAGE_TO_FRIENDLY_APP: dict[str, dict[str, str]] = {
     "defender": {"name": "Microsoft Defender", "icon": "🛡️", "store_id": "store-windows", "publisher": "Microsoft"},
     "nginx": {"name": "Nginx", "icon": "🌐", "store_id": "store-linux", "publisher": "NGINX Inc."},
     "steamcmd": {"name": "SteamCMD", "icon": "🎮", "store_id": "store-steam", "publisher": "Valve"},
+    "openssl": {"name": "OpenSSL", "icon": "🔐", "store_id": "store-linux", "publisher": "OpenSSL"},
+    "curl": {"name": "curl", "icon": "🌐", "store_id": "store-linux", "publisher": "curl"},
+    "wget": {"name": "wget", "icon": "📥", "store_id": "store-linux", "publisher": "GNU"},
+    "python3": {"name": "Python 3", "icon": "🐍", "store_id": "store-linux", "publisher": "Python Software Foundation"},
+    "nodejs": {"name": "Node.js", "icon": "🟢", "store_id": "store-linux", "publisher": "OpenJS"},
+    "docker": {"name": "Docker", "icon": "🐳", "store_id": "store-linux", "publisher": "Docker"},
+    "containerd": {"name": "containerd", "icon": "📦", "store_id": "store-linux", "publisher": "CNCF"},
+    "kubelet": {"name": "Kubelet", "icon": "☸️", "store_id": "store-linux", "publisher": "Kubernetes"},
+    "postgres": {"name": "PostgreSQL", "icon": "🐘", "store_id": "store-linux", "publisher": "PostgreSQL"},
+    "mysql": {"name": "MySQL", "icon": "🛢️", "store_id": "store-linux", "publisher": "Oracle"},
+    "redis": {"name": "Redis", "icon": "🟥", "store_id": "store-linux", "publisher": "Redis"},
+    "apache2": {"name": "Apache HTTP Server", "icon": "🪶", "store_id": "store-linux", "publisher": "Apache"},
+    "sshd": {"name": "OpenSSH Server", "icon": "🔑", "store_id": "store-linux", "publisher": "OpenSSH"},
+    "git": {"name": "Git", "icon": "🧬", "store_id": "store-linux", "publisher": "Git"},
 }
 
 
@@ -150,6 +164,17 @@ class VulnerabilityFinding:
     reasoning: str = ""
 
 
+
+
+@dataclass
+class AutoPatchPolicy:
+    max_auto_cvss: float = 6.0
+    max_auto_risk_score: float = 5.5
+    require_human_above_cvss: float = 8.0
+    auto_apply_delay_seconds: int = 300
+    excluded_endpoints: list[str] = field(default_factory=list)
+    excluded_cves: list[str] = field(default_factory=list)
+
 @dataclass
 class PatchProposal:
     proposal_id: str
@@ -185,6 +210,9 @@ class HegemonControlPlane:
         }
         self.friendly_apps: dict[str, FriendlyApp] = {}
         self._seed_default_friendly_entities()
+        self.auto_patch_policy = AutoPatchPolicy()
+        self.human_review_queue: list[str] = []
+        self._proposal_approved_at: dict[str, float] = {}
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         entry = self.ledger.append(event_type, payload)
@@ -847,6 +875,55 @@ class HegemonControlPlane:
         proposal.status = "deployed_canary"
         self._record("patch.applied", {"proposal_id": proposal_id, "actor": actor, "status": proposal.status})
         return proposal
+
+    def get_auto_patch_policy(self) -> AutoPatchPolicy:
+        return self.auto_patch_policy
+
+    def update_auto_patch_policy(self, payload: dict[str, Any]) -> AutoPatchPolicy:
+        for key in {"max_auto_cvss", "max_auto_risk_score", "require_human_above_cvss"}:
+            if key in payload:
+                setattr(self.auto_patch_policy, key, float(payload[key]))
+        if "auto_apply_delay_seconds" in payload:
+            self.auto_patch_policy.auto_apply_delay_seconds = int(payload["auto_apply_delay_seconds"])
+        if "excluded_endpoints" in payload:
+            self.auto_patch_policy.excluded_endpoints = [str(x) for x in payload.get("excluded_endpoints", [])]
+        if "excluded_cves" in payload:
+            self.auto_patch_policy.excluded_cves = [str(x) for x in payload.get("excluded_cves", [])]
+        self._record("patch.auto_policy_updated", asdict(self.auto_patch_policy))
+        return self.auto_patch_policy
+
+    def run_auto_patch_cycle(self, now: float | None = None) -> dict[str, Any]:
+        ts = float(now if now is not None else datetime.now(timezone.utc).timestamp())
+        approved = 0
+        applied = 0
+        queued = 0
+        policy = self.auto_patch_policy
+        for proposal in self.patch_proposals.values():
+            finding = self.findings.get(proposal.finding_id)
+            if finding is None:
+                continue
+            if proposal.status == "pending_review":
+                excluded = proposal.endpoint_id in policy.excluded_endpoints or finding.cve in policy.excluded_cves
+                if finding.cvss >= policy.require_human_above_cvss:
+                    if proposal.proposal_id not in self.human_review_queue:
+                        self.human_review_queue.append(proposal.proposal_id)
+                        queued += 1
+                    self._record("patch.human_review_urgent", {"proposal_id": proposal.proposal_id, "cvss": finding.cvss})
+                    continue
+                if excluded:
+                    continue
+                if finding.cvss <= policy.max_auto_cvss and finding.risk_score <= policy.max_auto_risk_score:
+                    self.approve_patch(proposal.proposal_id, "hegemon-autopatch")
+                    self._proposal_approved_at[proposal.proposal_id] = ts
+                    approved += 1
+                    self._record("patch.auto_approved", {"proposal_id": proposal.proposal_id, "reason": "low_risk_threshold"})
+            if proposal.status == "approved":
+                approved_at = self._proposal_approved_at.get(proposal.proposal_id, ts)
+                if ts - approved_at >= policy.auto_apply_delay_seconds:
+                    self.apply_patch(proposal.proposal_id, "hegemon-autopatch")
+                    applied += 1
+                    self._record("patch.auto_applied", {"proposal_id": proposal.proposal_id, "delay_seconds": int(ts - approved_at)})
+        return {"approved": approved, "applied": applied, "queued": queued}
 
     def as_dict(self, obj: Any) -> dict[str, Any]:
         if hasattr(obj, "__dataclass_fields__"):

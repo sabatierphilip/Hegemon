@@ -512,3 +512,61 @@ class FriendlyPeerRegistry:
 
     def patrol_targets(self) -> list[dict[str, Any]]:
         return [dict(v) for v in self._friendlies.values()]
+
+
+@dataclass
+class PeerRecord:
+    instance_id: str
+    url: str
+    public_key: str
+    last_seen: float
+
+
+class PeerMeshNode:
+    """Lightweight real peer mesh helper for runtime HTTP quorum checks."""
+
+    def __init__(self, instance_id: str, local_url: str, signing_key: ed25519.Ed25519PrivateKey):
+        self.instance_id = instance_id
+        self.local_url = local_url.rstrip("/")
+        self.signing_key = signing_key
+        self.registry: dict[str, PeerRecord] = {}
+
+    def advertise_payload(self) -> dict[str, Any]:
+        pub = self.signing_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        return {
+            "instance_id": self.instance_id,
+            "url": self.local_url,
+            "public_key": base64.b64encode(pub).decode("ascii"),
+            "ts": int(time.time()),
+        }
+
+    def register_peer(self, payload: dict[str, Any]) -> None:
+        peer_id = str(payload.get("instance_id", "")).strip()
+        url = str(payload.get("url", "")).strip()
+        public_key = str(payload.get("public_key", "")).strip()
+        if not peer_id or not url or not public_key or peer_id == self.instance_id:
+            return
+        self.registry[peer_id] = PeerRecord(peer_id, url, public_key, time.time())
+
+    def p2p_verify_hunter_directives(self, directive_payload: dict[str, Any], quorum: int = 1) -> dict[str, Any]:
+        import urllib.request
+
+        canonical = json.dumps(directive_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        signature = base64.b64encode(self.signing_key.sign(canonical)).decode("ascii")
+        attested = 0
+        responders: list[str] = []
+        for peer in list(self.registry.values()):
+            body = json.dumps({"directive": directive_payload, "signature": signature, "from": self.instance_id}).encode("utf-8")
+            req = urllib.request.Request(f"{peer.url}/api/peer/verify", data=body, headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                if bool(payload.get("valid", False)):
+                    attested += 1
+                    responders.append(peer.instance_id)
+            except Exception:
+                continue
+        return {"quorum_met": attested >= quorum, "attested": attested, "responders": responders}

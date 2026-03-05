@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,15 @@ SETTINGS: Dict[str, Any] = {"autonomous_containment_enabled": True}
 TRANSPARENCY_LOG: List[Dict[str, Any]] = []
 CONTROL_SIGNERS: List[signing.SigningKey] = [signing.SigningKey.generate() for _ in range(3)]
 CONTROL_PLANE = HegemonControlPlane()
+
+
+
+def _require_auth() -> Any:
+    token = os.environ.get("HEGEMON_API_TOKEN", "dev-token")
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {token}":
+        return jsonify({"error": "unauthorized"}), 401
+    return None
 
 CONTROL_PLANE_UI = """
 <!doctype html>
@@ -331,6 +341,55 @@ def entity_graph():
 def audit_ledger():
     return jsonify({"health": CONTROL_PLANE.ledger_health(), "entries": CONTROL_PLANE.audit_log()})
 
+
+
+
+@app.post("/api/endpoints/enroll")
+def api_endpoint_enroll():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    body = request.get_json(force=True, silent=False)
+    body.setdefault("enrollment_method", "agent")
+    try:
+        endpoint = CONTROL_PLANE.add_endpoint(body, actor="endpoint-agent")
+    except (KeyError, ValueError) as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    CONTROL_PLANE.ledger.append("endpoint.enrolled", {"endpoint_id": endpoint.endpoint_id})
+    return jsonify(CONTROL_PLANE.as_dict(endpoint)), 201
+
+
+@app.post("/api/endpoints/heartbeat/<endpoint_id>")
+def api_endpoint_heartbeat(endpoint_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if endpoint_id not in CONTROL_PLANE.endpoints:
+        return jsonify({"error": "not_found"}), 404
+    body = request.get_json(force=True, silent=False)
+    endpoint = CONTROL_PLANE.endpoints[endpoint_id]
+    endpoint.last_heartbeat = datetime.now(timezone.utc).isoformat()
+    endpoint.installed_packages = dict(body.get("installed_packages", endpoint.installed_packages))
+    endpoint.telemetry_events.extend(list(body.get("telemetry_events", [])))
+    CONTROL_PLANE.ledger.append("endpoint.heartbeat", {"endpoint_id": endpoint_id, "telemetry_count": len(body.get("telemetry_events", []))})
+    return jsonify({"status": "ok", "endpoint_id": endpoint_id, "last_heartbeat": endpoint.last_heartbeat})
+
+
+@app.get("/api/control-plane/auto-patch-policy")
+def get_auto_patch_policy():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify(CONTROL_PLANE.as_dict(CONTROL_PLANE.get_auto_patch_policy()))
+
+
+@app.post("/api/control-plane/auto-patch-policy")
+def set_auto_patch_policy():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    body = request.get_json(force=True, silent=False)
+    return jsonify(CONTROL_PLANE.as_dict(CONTROL_PLANE.update_auto_patch_policy(body)))
 
 @app.get("/ui/control-plane")
 def control_plane_preview():

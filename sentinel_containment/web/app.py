@@ -1323,3 +1323,61 @@ def control_plane_add_endpoint():
         actor="dashboard",
     )
     return jsonify(_control_plane.as_dict(endpoint)), 201
+
+
+@app.get("/api/discovery/status")
+def discovery_status():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if _runtime is None:
+        return jsonify({"running": False, "message": "runtime_not_initialized"}), 503
+    return jsonify(_runtime.discovery_engine.status())
+
+
+@app.get("/api/discovery/hosts")
+def discovery_hosts():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if _runtime is None:
+        return jsonify({"hosts": [], "message": "runtime_not_initialized"}), 503
+    return jsonify({"hosts": _runtime.discovery_engine.last_hosts})
+
+
+@app.get("/api/notifications/history")
+def notifications_history():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if _runtime is None:
+        return jsonify({"history": [], "message": "runtime_not_initialized"}), 503
+    return jsonify({"history": list(_runtime.notification_history)})
+
+
+@app.get("/api/peer/ping")
+def peer_ping():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify({"status": "ok"})
+
+
+@app.get("/api/peer/registry")
+def peer_registry():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    peers = _runtime.peer_mesh.process_ids if _runtime is not None else []
+    return jsonify({"peers": peers})
+
+
+@app.post("/api/peer/verify")
+def peer_verify():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    return jsonify({"valid": bool(payload.get("directive")), "attestor": "local"})
