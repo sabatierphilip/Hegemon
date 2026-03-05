@@ -468,3 +468,32 @@ def test_containment_live_mode_toggle_api_defaults_on_and_can_disable(tmp_path: 
     assert runtime.fast_lane_containment.action_executor.active_mode is False
 
     runtime.ingestion_service.stop()
+
+
+def test_dashboard_renders_tabbed_control_plane_view(auth_headers):
+    client = app.test_client()
+    resp = client.get("/", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert 'data-tab="control-plane"' in body
+    assert "Run Sophisticated Scan" in body
+
+
+def test_control_plane_scan_api_seed_and_scan(auth_headers):
+    client = app.test_client()
+    seed = client.post("/api/control-plane/demo-seed", json={"seed": True}, headers=auth_headers)
+    assert seed.status_code == 200
+
+    scan = client.post("/api/control-plane/scan", json={"endpoint_id": "ep-dashboard-demo"}, headers=auth_headers)
+    assert scan.status_code == 200
+    payload = scan.get_json()
+    assert payload["findings"]
+    assert payload["proposals"]
+    latest = payload["proposals"][-1]
+    assert "code_diff" in latest
+    assert "diff_explanation" in latest
+
+    overview = client.get("/api/control-plane/overview", headers=auth_headers)
+    assert overview.status_code == 200
+    overview_payload = overview.get_json()
+    assert overview_payload["proposals"]

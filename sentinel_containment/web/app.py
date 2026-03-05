@@ -14,12 +14,14 @@ from urllib.parse import urlparse
 from flask import Flask, g, jsonify, render_template_string, request
 
 from sentinel_containment.config import Settings
+from sentinel_containment.controlplane import HegemonControlPlane
 from sentinel_containment.runtime import SentinelRuntime
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 _runtime: SentinelRuntime | None = None
 _auth_warning_emitted = False
+_control_plane = HegemonControlPlane()
 
 
 @dataclass
@@ -106,7 +108,9 @@ def _is_loopback(addr: str | None) -> bool:
 
 def _is_local_request() -> bool:
     remote = request.remote_addr or ""
-    if not _is_loopback(remote):
+    forwarded = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip())
+    local_remote = _is_loopback(remote) or (forwarded and _is_loopback(forwarded))
+    if not local_remote:
         return False
     origin = request.headers.get("Origin", "").strip()
     if origin:
@@ -184,6 +188,11 @@ HTML = """
     .pill { font-size: 11px; border-radius: 999px; padding: 2px 8px; background: #2a3a68; margin-right: 5px; }
     .small { font-size: 12px; }
     .json { max-height: 280px; overflow: auto; background: #0f1528; border: 1px solid #283354; border-radius: 8px; padding: 8px; }
+    .tabs { display:flex; gap:8px; margin: 12px 0 16px; }
+    .tab-btn { background:#1a2340; border:1px solid #2f4383; color:#cfe0ff; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    .tab-btn.active { background:#274079; border-color:#5d7fcd; }
+    .tab-panel { display:none; }
+    .tab-panel.active { display:block; }
   </style>
 </head>
 <body>
@@ -197,6 +206,12 @@ HTML = """
     </div>
   </div>
 
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="overview">Overview</button>
+    <button class="tab-btn" data-tab="control-plane">Control Plane</button>
+  </div>
+
+  <div id="tab-overview" class="tab-panel active">
   {% if readiness.startup_warning %}
   <div class="panel" style="border-color:#8b2f45;background:#2b1520;">
     <h3 style="color:#ffdce5;">Containment Pre-flight Warning</h3>
@@ -309,6 +324,31 @@ HTML = """
         <h3>Topology</h3>
         <div class=\"json\"><pre>{{ topology }}</pre></div>
       </div>
+    </div>
+  </div>
+</div>
+
+  <div id="tab-control-plane" class="tab-panel">
+    <div class="panel">
+      <h3>Control Plane (Friends / Endpoints / Scanning / Patch Review)</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button id="cp-seed-btn" style="padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;">Seed Demo Endpoint</button>
+        <button id="cp-scan-btn" style="padding:8px 12px;background:#4a2b6a;color:#e7d7ff;border:1px solid #6b3f96;border-radius:8px;cursor:pointer;">Run Sophisticated Scan</button>
+      </div>
+      <div class="small" id="cp-status" style="margin-top:8px;">Control-plane data loading...</div>
+    </div>
+    <div class="grid">
+      <div class="card"><div class="muted">Friends</div><div class="kpi" id="cp-friends">0</div></div>
+      <div class="card"><div class="muted">Endpoints</div><div class="kpi" id="cp-endpoints">0</div></div>
+      <div class="card"><div class="muted">Findings</div><div class="kpi" id="cp-findings">0</div></div>
+      <div class="card"><div class="muted">Patch Proposals</div><div class="kpi" id="cp-proposals">0</div></div>
+    </div>
+    <div class="panel">
+      <h3>Latest Patch Path Before / After + Diff</h3>
+      <div class="small" id="cp-path-before">Before: -</div>
+      <div class="small" id="cp-path-after">After: -</div>
+      <div class="small" id="cp-diff-expl">Diff explanation: -</div>
+      <div class="json" style="margin-top:8px;"><pre id="cp-code-diff">No patch diff generated yet.</pre></div>
     </div>
   </div>
 </div>
@@ -432,6 +472,55 @@ async function updateHumanGate(required){
   }
 }
 
+
+const tabButtons=[...document.querySelectorAll('.tab-btn')];
+const tabPanels={overview:document.getElementById('tab-overview'),'control-plane':document.getElementById('tab-control-plane')};
+for(const btn of tabButtons){
+  btn.addEventListener('click',()=>{
+    for(const b of tabButtons){b.classList.remove('active');}
+    btn.classList.add('active');
+    for(const [name,panel] of Object.entries(tabPanels)){ if(panel){panel.classList.toggle('active',name===btn.dataset.tab);} }
+  });
+}
+
+async function loadControlPlane(){
+  try{
+    const resp=await fetch('/api/control-plane/overview');
+    if(!resp.ok){throw new Error('overview failed');}
+    const data=await resp.json();
+    document.getElementById('cp-friends').textContent=String(data.friends.length);
+    document.getElementById('cp-endpoints').textContent=String(data.endpoints.length);
+    document.getElementById('cp-findings').textContent=String(data.findings.length);
+    document.getElementById('cp-proposals').textContent=String(data.proposals.length);
+    const latest=data.proposals[data.proposals.length-1];
+    if(latest){
+      const before=(latest.graph_path_before||[]).map((n)=>n.node||n).join(' → ');
+      const after=(latest.graph_path_after||[]).map((n)=>n.node||n).join(' → ');
+      document.getElementById('cp-path-before').textContent='Before: '+before;
+      document.getElementById('cp-path-after').textContent='After: '+after;
+      document.getElementById('cp-diff-expl').textContent='Diff explanation: '+(latest.diff_explanation||'-');
+      document.getElementById('cp-code-diff').textContent=latest.code_diff||'No code diff';
+    }
+    document.getElementById('cp-status').textContent='Control-plane synchronized.';
+  }catch(_err){
+    document.getElementById('cp-status').textContent='Control-plane data unavailable.';
+  }
+}
+
+document.getElementById('cp-seed-btn')?.addEventListener('click', async()=>{
+  const resp=await fetch('/api/control-plane/demo-seed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seed:true})});
+  const data=await resp.json();
+  document.getElementById('cp-status').textContent=data.message||'Seed complete';
+  await loadControlPlane();
+});
+
+document.getElementById('cp-scan-btn')?.addEventListener('click', async()=>{
+  const resp=await fetch('/api/control-plane/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint_id:'ep-dashboard-demo'})});
+  const data=await resp.json();
+  document.getElementById('cp-status').textContent=`Scan complete. findings=${(data.findings||[]).length}`;
+  await loadControlPlane();
+});
+
 document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
 document.getElementById("drill-btn")?.addEventListener("click",runIncidentDrill);
 document.getElementById("containment-yes")?.addEventListener("click",()=>decideContainment(true));
@@ -444,7 +533,7 @@ document.getElementById("containment-live-toggle")?.addEventListener("change",(e
   const target=event.target;
   updateContainmentLiveMode(Boolean(target && target.checked));
 });
-window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap();});
+window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadControlPlane();});
 </script>
 </body>
 </html>
@@ -778,3 +867,87 @@ def containment_decision_apply():
     if _runtime is None:
         return jsonify({"pending": False, "executed": False, "message": "runtime_not_initialized"}), 503
     return jsonify(_runtime.apply_containment_decision(execute))
+
+
+@app.get("/api/control-plane/overview")
+def control_plane_overview():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify(
+        {
+            "friends": [_control_plane.as_dict(v) for v in _control_plane.friends.values()],
+            "endpoints": [_control_plane.as_dict(v) for v in _control_plane.endpoints.values()],
+            "findings": [_control_plane.as_dict(v) for v in _control_plane.findings.values()],
+            "proposals": [_control_plane.as_dict(v) for v in _control_plane.patch_proposals.values()],
+            "ledger_health": _control_plane.ledger_health(),
+        }
+    )
+
+
+@app.post("/api/control-plane/demo-seed")
+def control_plane_demo_seed():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    if "fr-dashboard-admin" not in _control_plane.friends:
+        _control_plane.add_friend(
+            {
+                "friend_id": "fr-dashboard-admin",
+                "name": "Dashboard Admin",
+                "identity_type": "user",
+                "identity_method": "sso",
+                "capabilities": ["approve_firmware"],
+                "expiry": "2030-01-01T00:00:00Z",
+            },
+            actor="dashboard",
+        )
+        _control_plane.approve_friend("fr-dashboard-admin", "admin-2")
+        _control_plane.approve_friend("fr-dashboard-admin", "admin-3")
+    if "ep-dashboard-demo" not in _control_plane.endpoints:
+        _control_plane.add_endpoint(
+            {
+                "endpoint_id": "ep-dashboard-demo",
+                "host_name": "prod-api-1",
+                "endpoint_type": "on-prem",
+                "os": "ubuntu",
+                "kernel": "6.8",
+                "hypervisor": "kvm",
+                "firmware_baseline": "1.0.4",
+                "sbom_status": "valid",
+                "enrollment_method": "mdm",
+                "network_exposure": "internet",
+                "asset_value": 9.4,
+                "trust_level": 6.0,
+                "installed_packages": {"openssl": "3.0.2", "glibc": "2.37", "openssh": "9.3"},
+            },
+            actor="dashboard",
+        )
+    return jsonify({"message": "demo control-plane objects seeded"})
+
+
+@app.post("/api/control-plane/scan")
+def control_plane_scan():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    endpoint_id = str(payload.get("endpoint_id", "")).strip()
+    if not endpoint_id:
+        return jsonify({"error": "invalid_payload", "message": "endpoint_id is required"}), 400
+    if endpoint_id not in _control_plane.endpoints:
+        return jsonify({"error": "not_found", "message": "endpoint not found"}), 404
+    findings = _control_plane.run_vulnerability_scan(endpoint_id, actor="dashboard_scanner")
+    proposals = [
+        _control_plane.as_dict(_control_plane.generate_patch_proposal(finding.finding_id, actor="dashboard_scanner"))
+        for finding in findings
+    ]
+    return jsonify(
+        {
+            "endpoint_id": endpoint_id,
+            "findings": [_control_plane.as_dict(f) for f in findings],
+            "proposals": proposals,
+        }
+    )

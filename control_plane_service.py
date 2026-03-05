@@ -61,7 +61,7 @@ CONTROL_PLANE_UI = """
     <div class=\"panel\">
       <h3>Patch Proposals & Graph Path</h3>
       <table><thead><tr><th>ID</th><th>Summary</th><th>Status</th><th>Graph Path Before</th><th>Graph Path After</th></tr></thead><tbody>
-      {% for p in proposals %}<tr><td><code>{{p.proposal_id}}</code></td><td>{{p.summary}}</td><td>{{p.status}}</td><td>{{p.graph_path_before|join(' → ')}}</td><td>{{p.graph_path_after|join(' → ')}}</td></tr>{% endfor %}
+      {% for p in proposals %}<tr><td><code>{{p.proposal_id}}</code></td><td>{{p.summary}}</td><td>{{p.status}}</td><td>{{ p.graph_path_before|map(attribute='node')|join(' → ') }}</td><td>{{ p.graph_path_after|map(attribute='node')|join(' → ') }}</td></tr>{% endfor %}
       </tbody></table>
     </div>
   </div>
