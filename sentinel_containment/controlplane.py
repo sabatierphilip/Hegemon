@@ -167,6 +167,9 @@ class VulnerabilityFinding:
     risk_score: float
     graph_path: list[dict[str, Any]] = field(default_factory=list)
     reasoning: str = ""
+    poc_attack_map: dict[str, Any] = field(default_factory=dict)
+    remediation_plan: list[dict[str, Any]] = field(default_factory=list)
+    vulnerability_explanation: str = ""
 
 
 
@@ -528,6 +531,87 @@ class HegemonControlPlane:
             {"node": cve, "weight": round(2.1 + chain_risk * 0.4, 3)},
         ]
 
+    def _build_poc_attack_map(
+        self,
+        endpoint: Endpoint,
+        cve: str,
+        evidence: list[dict[str, Any]],
+        risk: float,
+        graph_path: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        kill_chain_projection = [
+            {"stage": "recon", "probability": round(min(0.99, 0.30 + risk * 0.04), 3)},
+            {"stage": "initial_access", "probability": round(min(0.99, 0.35 + risk * 0.05), 3)},
+            {"stage": "execution", "probability": round(min(0.99, 0.32 + risk * 0.05), 3)},
+            {"stage": "lateral_movement", "probability": round(min(0.99, 0.20 + risk * 0.04), 3)},
+            {"stage": "impact", "probability": round(min(0.99, 0.28 + risk * 0.05), 3)},
+        ]
+        pivot_assets = [
+            {
+                "asset": endpoint.host_name,
+                "role": "primary_target",
+                "risk_weight": round(min(10.0, risk + 0.4), 2),
+            }
+        ]
+        if endpoint.network_exposure == "internet":
+            pivot_assets.append({"asset": "public_ingress", "role": "entry_pivot", "risk_weight": 8.4})
+        if evidence:
+            pivot_assets.append(
+                {
+                    "asset": f"evidence:{evidence[0].get('type', 'telemetry')}",
+                    "role": "observable_signal",
+                    "risk_weight": round(min(10.0, 5.0 + risk * 0.45), 2),
+                }
+            )
+        return {
+            "version": "poc-map-v1",
+            "attack_story": f"Attacker path to exploit {cve} against {endpoint.host_name}",
+            "graph_nodes": graph_path,
+            "kill_chain_projection": kill_chain_projection,
+            "pivot_assets": pivot_assets,
+            "blast_radius_estimate": {
+                "hosts_at_risk": 1 + (2 if endpoint.network_exposure == "internet" else 1),
+                "identity_scope": "service-account" if endpoint.endpoint_type in {"cloud", "k8s"} else "local-system",
+                "data_sensitivity": "high" if endpoint.asset_value >= 8 else "medium",
+            },
+        }
+
+    def _build_remediation_plan(self, endpoint: Endpoint, finding_payload: dict[str, Any], risk: float) -> list[dict[str, Any]]:
+        remediations = [str(step) for step in finding_payload.get("suggested_remediations", []) if str(step).strip()]
+        if not remediations:
+            remediations = [f"Upgrade vulnerable component for {finding_payload['cve']}"]
+        return [
+            {"phase": "contain", "priority": "p0", "action": f"Apply temporary network isolation policy for {endpoint.host_name}."},
+            {"phase": "eradicate", "priority": "p0", "action": remediations[0]},
+            {"phase": "validate", "priority": "p1", "action": "Run exploit replay tests and regression suite against canary ring."},
+            {
+                "phase": "recover",
+                "priority": "p1",
+                "action": (
+                    "Promote staged patch through release rings with telemetry guardrails "
+                    f"(risk_score={risk}, endpoint={endpoint.endpoint_id})."
+                ),
+            },
+        ]
+
+    def _build_vulnerability_explanation(
+        self,
+        endpoint: Endpoint,
+        cve: str,
+        risk: float,
+        evidence: list[dict[str, Any]],
+        topological_impact: float,
+    ) -> str:
+        evidence_types = ", ".join(sorted({str(item.get("type", "telemetry")) for item in evidence})) if evidence else "runtime telemetry"
+        criticality = "critical" if risk >= 8 else ("high" if risk >= 6 else "moderate")
+        return (
+            f"{cve} on {endpoint.host_name} is assessed as {criticality} risk ({risk}). "
+            f"The endpoint exposure profile ({endpoint.network_exposure}) and topological impact ({topological_impact}) "
+            f"indicate exploitable traversal potential. Evidence sources: {evidence_types}. "
+            "The generated PoC map models likely attacker progression and the remediation plan prioritizes "
+            "containment-first controls before staged permanent fixes."
+        )
+
     def create_finding(self, payload: dict[str, Any], actor: str) -> VulnerabilityFinding:
         finding_id = payload.get("finding_id") or f"vuln-{secrets.token_hex(4)}"
         endpoint = self.endpoints[payload["endpoint_id"]]
@@ -553,6 +637,15 @@ class HegemonControlPlane:
             risk_score=risk,
             graph_path=list(payload.get("graph_path", self._build_attack_path(endpoint, payload["cve"], 0.6))),
             reasoning=str(payload.get("reasoning", "")),
+        )
+        finding.poc_attack_map = self._build_poc_attack_map(endpoint, finding.cve, finding.evidence, finding.risk_score, finding.graph_path)
+        finding.remediation_plan = self._build_remediation_plan(endpoint, payload, finding.risk_score)
+        finding.vulnerability_explanation = self._build_vulnerability_explanation(
+            endpoint,
+            finding.cve,
+            finding.risk_score,
+            finding.evidence,
+            finding.topological_impact,
         )
         self.findings[finding.finding_id] = finding
         self._record("vulnerability.detected", {"actor": actor, "finding": asdict(finding)})

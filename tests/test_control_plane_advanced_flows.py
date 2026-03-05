@@ -71,6 +71,9 @@ def test_friend_endpoint_vulnerability_and_patch_flow(tmp_path: Path):
     assert finding.status_code == 201
     finding_payload = finding.get_json()
     assert finding_payload["risk_score"] > 0
+    assert finding_payload["poc_attack_map"]["version"] == "poc-map-v1"
+    assert finding_payload["remediation_plan"]
+    assert "assessed as" in finding_payload["vulnerability_explanation"]
 
     proposal_resp = client.post("/patch-proposals/generate", json={"finding_id": finding_payload["finding_id"], "actor": "mtre"})
     assert proposal_resp.status_code == 201
@@ -160,6 +163,40 @@ def test_disable_friend_flags_prior_patch_approvals(tmp_path: Path):
     revoke_entries = [e for e in audit if e.get("event_type") == "friend.revoked"]
     assert revoke_entries
     assert proposal["proposal_id"] in revoke_entries[-1]["payload"]["flagged_pending_patch_approvals"]
+
+
+def test_poc_map_tracks_graph_nodes_and_blast_radius(tmp_path: Path):
+    client = _client(tmp_path)
+    endpoint = client.post(
+        "/endpoints",
+        json={
+            "actor": "ops-1",
+            "host_name": "internet-db-1",
+            "endpoint_type": "on-prem",
+            "os": "ubuntu",
+            "kernel": "6.8",
+            "sbom_status": "valid",
+            "network_exposure": "internet",
+            "enrollment_method": "mdm",
+        },
+    )
+    endpoint_id = endpoint.get_json()["endpoint_id"]
+
+    finding = client.post(
+        "/vulnerabilities",
+        json={
+            "actor": "scanner",
+            "endpoint_id": endpoint_id,
+            "cve": "CVE-2026-POC",
+            "cvss": 8.9,
+            "exploit_availability": 8.2,
+            "evidence": [{"type": "runtime_trace", "ioc": "suspicious syscall chain"}],
+        },
+    )
+    payload = finding.get_json()
+    assert payload["poc_attack_map"]["graph_nodes"][-1]["node"] == "CVE-2026-POC"
+    assert payload["poc_attack_map"]["blast_radius_estimate"]["hosts_at_risk"] >= 2
+    assert payload["remediation_plan"][0]["phase"] == "contain"
 
 
 def test_app_store_endpoint_requires_signature(tmp_path: Path):
