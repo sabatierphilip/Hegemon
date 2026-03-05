@@ -579,13 +579,48 @@ class HegemonControlPlane:
             if any(part in skip_dirs for part in candidate.parts):
                 continue
             py_files.append(candidate)
-            if len(py_files) >= 300:
+            if len(py_files) >= 350:
                 break
 
         imports_graph: dict[str, set[str]] = defaultdict(set)
         issues: list[dict[str, Any]] = []
 
-        def add_issue(issue_id: str, severity: str, stage: str, file_path: Path, line: int, confidence: float, reason: str, patch: str) -> None:
+        def node_name(node: ast.AST) -> str:
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                base = node_name(node.value)
+                return f"{base}.{node.attr}" if base else node.attr
+            return ""
+
+        def tainted_from_expr(expr: ast.AST, tainted_vars: set[str]) -> bool:
+            if isinstance(expr, ast.Name):
+                return expr.id in tainted_vars
+            if isinstance(expr, ast.JoinedStr):
+                return any(tainted_from_expr(v.value, tainted_vars) for v in expr.values if isinstance(v, ast.FormattedValue))
+            if isinstance(expr, ast.BinOp):
+                return tainted_from_expr(expr.left, tainted_vars) or tainted_from_expr(expr.right, tainted_vars)
+            if isinstance(expr, ast.Call):
+                name = node_name(expr.func)
+                if name in {"input", "request.args.get", "request.form.get", "request.get_json"}:
+                    return True
+                return any(tainted_from_expr(a, tainted_vars) for a in expr.args)
+            if isinstance(expr, ast.Attribute):
+                return tainted_from_expr(expr.value, tainted_vars)
+            return False
+
+        def add_issue(
+            issue_id: str,
+            severity: str,
+            stage: str,
+            file_path: Path,
+            line: int,
+            confidence: float,
+            reason: str,
+            patch: str,
+            details: list[str] | None = None,
+            tags: list[str] | None = None,
+        ) -> None:
             issues.append(
                 {
                     "issue_id": issue_id,
@@ -595,9 +630,13 @@ class HegemonControlPlane:
                     "line": line,
                     "confidence": confidence,
                     "reasoning": reason,
+                    "reasoning_details": details or [],
+                    "tags": tags or [],
                     "patch_hint": patch,
                 }
             )
+
+        severity_weight = {"low": 0.25, "medium": 0.55, "high": 0.82, "critical": 1.0}
 
         for py_file in py_files:
             try:
@@ -607,40 +646,183 @@ class HegemonControlPlane:
                 continue
 
             module_name = self._safe_relpath(py_file, root)
+            tainted_vars: set[str] = set()
+
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
                         imports_graph[module_name].add(alias.name.split(".")[0])
-                if isinstance(node, ast.ImportFrom):
+                elif isinstance(node, ast.ImportFrom):
                     imports_graph[module_name].add((node.module or "").split(".")[0])
-                if isinstance(node, ast.Call):
-                    func_name = ""
-                    if isinstance(node.func, ast.Name):
-                        func_name = node.func.id
-                    elif isinstance(node.func, ast.Attribute):
-                        parent = node.func.value.id if isinstance(node.func.value, ast.Name) else ""
-                        func_name = f"{parent}.{node.func.attr}" if parent else node.func.attr
-
+                elif isinstance(node, ast.FunctionDef):
+                    for arg in node.args.args:
+                        tainted_vars.add(arg.arg)
+                elif isinstance(node, ast.Assign):
+                    value = node.value
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            var_name = target.id.lower()
+                            if tainted_from_expr(value, tainted_vars):
+                                tainted_vars.add(target.id)
+                            if isinstance(value, ast.Constant) and isinstance(value.value, str) and len(value.value) >= 12:
+                                if any(k in var_name for k in ("secret", "token", "password", "api_key", "auth")):
+                                    add_issue(
+                                        "hardcoded-secret",
+                                        "critical",
+                                        "credential_access",
+                                        py_file,
+                                        getattr(node, "lineno", 1),
+                                        0.97,
+                                        "High-entropy credential-like literal embedded in source can leak and enable account takeover.",
+                                        "Move secret to secret manager/env vault, rotate credential, and add leak scanning gate.",
+                                        details=[
+                                            "Secret-like variable naming pattern matched.",
+                                            "Literal length suggests credential/token material.",
+                                        ],
+                                        tags=["zero-day-like", "credential-exposure"],
+                                    )
+                elif isinstance(node, ast.Call):
+                    func_name = node_name(node.func)
                     line = getattr(node, "lineno", 1)
+
                     if func_name in {"eval", "exec"}:
-                        add_issue("dynamic-exec", "high", "execution", py_file, line, 0.9, "Dynamic code execution enables payload execution.", "Replace eval/exec with strict parser or whitelisted dispatch.")
-                    if func_name.endswith("subprocess.run") or func_name.endswith("subprocess.Popen"):
+                        add_issue(
+                            "dynamic-exec",
+                            "high",
+                            "execution",
+                            py_file,
+                            line,
+                            0.9,
+                            "Dynamic code execution enables payload execution and bypasses static trust boundaries.",
+                            "Replace eval/exec with explicit parser + whitelisted command map.",
+                            details=["Runtime code path cannot be fully constrained at compile time."],
+                            tags=["rce-surface"],
+                        )
+
+                    if func_name.endswith("subprocess.run") or func_name.endswith("subprocess.Popen") or func_name == "os.system":
+                        shell_true = func_name == "os.system"
                         for kw in node.keywords:
                             if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
-                                add_issue("shell-true", "high", "execution", py_file, line, 0.86, "subprocess call with shell=True can allow command injection.", "Use argument array and shell=False; validate inputs.")
+                                shell_true = True
+                        arg0 = node.args[0] if node.args else ast.Constant(value="")
+                        tainted_cmd = tainted_from_expr(arg0, tainted_vars)
+                        if shell_true and tainted_cmd:
+                            add_issue(
+                                "tainted-cmd-exec",
+                                "critical",
+                                "execution",
+                                py_file,
+                                line,
+                                0.98,
+                                "Potential zero-day command injection path: untrusted data reaches shell command sink.",
+                                "Replace shell invocation with allowlisted argv, strict input canonicalization, and policy guardrail tests.",
+                                details=[
+                                    "Dataflow: untrusted source/parameter propagated into command sink.",
+                                    "Shell interpreter enabled, allowing metacharacter expansion.",
+                                ],
+                                tags=["zero-day-like", "command-injection"],
+                            )
+                        elif shell_true:
+                            add_issue(
+                                "shell-true",
+                                "high",
+                                "execution",
+                                py_file,
+                                line,
+                                0.86,
+                                "subprocess call with shell=True can allow command injection.",
+                                "Use argument array and shell=False; validate inputs.",
+                                details=["Shell parsing broadens attack surface even if current input looks controlled."],
+                                tags=["command-injection"],
+                            )
+
                     if func_name in {"pickle.loads", "loads"}:
-                        add_issue("pickle-loads", "high", "initial_access", py_file, line, 0.84, "Untrusted pickle deserialization may lead to RCE.", "Switch to JSON/msgpack and enforce schema validation.")
+                        add_issue(
+                            "pickle-loads",
+                            "high",
+                            "initial_access",
+                            py_file,
+                            line,
+                            0.84,
+                            "Untrusted pickle deserialization may lead to RCE.",
+                            "Switch to JSON/msgpack and enforce schema validation.",
+                            details=["Pickle opcodes can instantiate attacker-controlled objects."],
+                            tags=["deserialization"],
+                        )
+
                     if func_name == "yaml.load":
                         safe_loader = any(kw.arg == "Loader" and isinstance(kw.value, ast.Attribute) and kw.value.attr == "SafeLoader" for kw in node.keywords)
                         if not safe_loader:
-                            add_issue("yaml-unsafe-load", "medium", "initial_access", py_file, line, 0.72, "yaml.load without SafeLoader can execute arbitrary objects.", "Use yaml.safe_load or Loader=yaml.SafeLoader.")
-                    if func_name in {"hashlib.md5", "hashlib.sha1", "md5", "sha1"}:
-                        add_issue("weak-hash", "medium", "defense_evasion", py_file, line, 0.65, "Weak hash primitive detected for integrity/security-sensitive operation.", "Use SHA-256/512 or BLAKE2 variants.")
+                            add_issue(
+                                "yaml-unsafe-load",
+                                "high",
+                                "initial_access",
+                                py_file,
+                                line,
+                                0.79,
+                                "yaml.load without SafeLoader can execute arbitrary objects.",
+                                "Use yaml.safe_load or Loader=yaml.SafeLoader.",
+                                details=["Unsafe object construction path present."],
+                                tags=["deserialization"],
+                            )
 
-        issue_conf = [float(i["confidence"]) for i in issues] or [0.0]
-        ast_confidence = round(min(0.99, sum(issue_conf) / len(issue_conf) + (0.12 if issues else 0.0)), 3)
+                    if func_name in {"hashlib.md5", "hashlib.sha1", "md5", "sha1"}:
+                        add_issue(
+                            "weak-hash",
+                            "medium",
+                            "defense_evasion",
+                            py_file,
+                            line,
+                            0.65,
+                            "Weak hash primitive detected for integrity/security-sensitive operation.",
+                            "Use SHA-256/512 or BLAKE2 variants.",
+                            details=["Collision resistance insufficient for modern security boundaries."],
+                            tags=["crypto"],
+                        )
+
+                    if (func_name.endswith(".execute") or func_name == "execute") and node.args:
+                        query_expr = node.args[0]
+                        if isinstance(query_expr, (ast.JoinedStr, ast.BinOp)) and tainted_from_expr(query_expr, tainted_vars):
+                            add_issue(
+                                "tainted-sql-query",
+                                "critical",
+                                "credential_access",
+                                py_file,
+                                line,
+                                0.96,
+                                "Potential SQL injection: tainted input interpolated into query string.",
+                                "Use parameterized queries with bound variables and strict query templates.",
+                                details=[
+                                    "Dataflow: user-controlled variable reached SQL text expression.",
+                                    "String interpolation/concatenation bypasses DB driver escaping guarantees.",
+                                ],
+                                tags=["zero-day-like", "sql-injection"],
+                            )
+
+                    if func_name in {"random.random", "random.randint", "random.choice"}:
+                        parent_assign_name = ""
+                        for parent in ast.walk(tree):
+                            if isinstance(parent, ast.Assign) and parent.value is node and parent.targets and isinstance(parent.targets[0], ast.Name):
+                                parent_assign_name = parent.targets[0].id.lower()
+                                break
+                        if any(k in parent_assign_name for k in {"token", "session", "nonce", "password"}):
+                            add_issue(
+                                "weak-rng-auth",
+                                "high",
+                                "credential_access",
+                                py_file,
+                                line,
+                                0.83,
+                                "Non-cryptographic RNG appears to generate auth/session material.",
+                                "Use secrets.token_urlsafe / secrets.randbelow and rotate invalid tokens.",
+                                details=["Predictable RNG may enable token prediction attacks."],
+                                tags=["auth", "crypto"],
+                            )
+
+        issue_conf = [float(i["confidence"]) * severity_weight.get(str(i["severity"]), 0.55) for i in issues] or [0.0]
+        ast_confidence = round(min(0.99, sum(issue_conf) / len(issue_conf) + (0.10 if issues else 0.0)), 3)
         degree_values = [len(v) for v in imports_graph.values()] or [0]
-        graph_alignment = round(min(0.99, (sum(degree_values) / max(1, len(degree_values))) / 6.0), 3)
+        graph_alignment = round(min(0.99, (sum(degree_values) / max(1, len(degree_values))) / 5.0), 3)
         stages = [str(i["kill_chain_stage"]) for i in issues]
         _markov, markov_score = self._kill_chain_transition_markov(stages)
         return {
@@ -772,32 +954,39 @@ class HegemonControlPlane:
                 discovered.append(finding)
 
 
+        severity_boost = {"low": 0.2, "medium": 0.6, "high": 1.0, "critical": 1.6}
         for issue in structural_report.get("issues", []):
             confidence = float(issue.get("confidence", 0.6))
-            cvss = round(min(9.8, 5.0 + confidence * 4.5), 2)
+            sev = str(issue.get("severity", "medium"))
+            cvss = round(min(9.9, 5.0 + confidence * 4.1 + severity_boost.get(sev, 0.6)), 2)
+            cve_id = f"HEGEMON-AST-{str(issue.get('issue_id', 'CHECK')).upper()}"
+            reasoning_details = issue.get("reasoning_details", [])
+            reasoning = (
+                f"AST deep scan detected {issue.get('issue_id')} in {issue.get('file')}:{issue.get('line')}; "
+                f"severity={sev}; confidence={confidence:.2f}; kill_chain_stage={issue.get('kill_chain_stage')}; "
+                f"details={' | '.join(str(v) for v in reasoning_details)}"
+            )
             local_structural = self.create_finding(
                 {
                     "endpoint_id": endpoint_id,
-                    "cve": f"HEGEMON-AST-{str(issue.get('issue_id', 'CHECK')).upper()}",
+                    "cve": cve_id,
                     "cvss": cvss,
-                    "exploit_availability": round(min(9.9, 4.2 + confidence * 4.0), 2),
-                    "topological_impact": round(5.5 + chain_risk + (0.8 if issue.get("severity") == "high" else 0.3), 3),
+                    "exploit_availability": round(min(9.95, 4.0 + confidence * 4.0 + (0.8 if sev in {"high", "critical"} else 0.2)), 2),
+                    "topological_impact": round(5.2 + chain_risk + severity_boost.get(sev, 0.6), 3),
                     "asset_value": endpoint.asset_value,
                     "trust_level": endpoint.trust_level,
                     "evidence": [
                         {"type": "ast_issue", **issue},
                         {"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk},
+                        {"type": "review_priority", "priority": "p0" if sev == "critical" else "p1"},
                     ],
                     "suggested_remediations": [
                         str(issue.get("patch_hint", "apply hardened coding remediation")),
-                        "add regression test for vulnerable code path",
-                        "enforce secure coding lint rules in CI",
+                        "add exploit-reproduction test and regression guard for this exact sink/source path",
+                        "run canary with runtime policy deny-list and roll back on anomaly",
                     ],
-                    "graph_path": self._build_attack_path(endpoint, f"HEGEMON-AST-{str(issue.get('issue_id', 'CHECK')).upper()}", chain_risk),
-                    "reasoning": (
-                        f"AST finding in {issue.get('file')}:{issue.get('line')} with confidence={confidence:.2f}; "
-                        f"kill_chain_stage={issue.get('kill_chain_stage')}"
-                    ),
+                    "graph_path": self._build_attack_path(endpoint, cve_id, chain_risk),
+                    "reasoning": reasoning,
                 },
                 actor,
             )
@@ -1022,18 +1211,34 @@ class HegemonControlPlane:
     def _diff_for_finding(self, finding: VulnerabilityFinding, endpoint: Endpoint) -> tuple[str, str]:
         if finding.cve.startswith("HEGEMON-AST-"):
             ast_ev = next((e for e in finding.evidence if e.get("type") == "ast_issue"), {})
+            issue_id = str(ast_ev.get("issue_id", "generic"))
             issue_file = str(ast_ev.get("file", "program.py"))
             issue_line = int(ast_ev.get("line", 1))
             patch_hint = finding.suggested_remediations[0] if finding.suggested_remediations else "replace unsafe construct"
+            patch_snippet = "# apply secure replacement"
+            if issue_id == "tainted-cmd-exec":
+                patch_snippet = "cmd = [\"/usr/bin/safe-tool\", validated_arg]\nsubprocess.run(cmd, shell=False, check=True)"
+            elif issue_id in {"shell-true", "dynamic-exec"}:
+                patch_snippet = "allowed_ops = {\"status\": status_handler}\nallowed_ops[user_action]()"
+            elif issue_id == "tainted-sql-query":
+                patch_snippet = "cursor.execute(\"SELECT * FROM users WHERE id = ?\", (user_id,))"
+            elif issue_id == "hardcoded-secret":
+                patch_snippet = "api_token = os.environ[\"SERVICE_API_TOKEN\"]"
+            elif issue_id == "weak-rng-auth":
+                patch_snippet = "session_token = secrets.token_urlsafe(32)"
             diff = (
                 f"--- a/{issue_file}\n"
                 f"+++ b/{issue_file}\n"
-                f"@@ -{issue_line},1 +{issue_line},2 @@\n"
+                f"@@ -{issue_line},1 +{issue_line},4 @@\n"
                 f"- # vulnerable operation at line {issue_line}\n"
                 f"+ # remediated operation at line {issue_line}\n"
+                f"+ {patch_snippet}\n"
                 f"+ # patch_hint: {patch_hint}\n"
+                "+ # verify with exploit-replay + regression tests before rollout\n"
             )
-            explanation = f"Hardens {issue_file}:{issue_line} using AST-driven remediation guidance: {patch_hint}."
+            explanation = (
+                f"Hardens {issue_file}:{issue_line} for {issue_id} with sink/source-aware remediation and mandatory exploit-replay validation."
+            )
             return diff, explanation
 
         upgrade = finding.suggested_remediations[0] if finding.suggested_remediations else "upgrade vulnerable package"

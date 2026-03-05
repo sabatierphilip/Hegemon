@@ -317,13 +317,22 @@ def test_structural_scan_detects_real_program_issues(tmp_path: Path, monkeypatch
     program = tmp_path / 'program'
     program.mkdir()
     (program / 'app.py').write_text(
-        """import subprocess
+        """import os
+import random
+import subprocess
+import sqlite3
 import hashlib
+
+API_TOKEN = "SUPERSECRET_TOKEN_12345"
 
 
 def run(user_input):
     subprocess.run(f"echo {user_input}", shell=True)
-    return hashlib.md5(user_input.encode()).hexdigest()
+    os.system(user_input)
+    conn = sqlite3.connect(":memory:")
+    conn.cursor().execute(f"SELECT * FROM users WHERE id = {user_input}")
+    session_token = random.randint(1000, 9999)
+    return hashlib.md5((user_input + str(session_token)).encode()).hexdigest()
 """
     )
 
@@ -348,9 +357,16 @@ def run(user_input):
 
     findings = cp.run_vulnerability_scan(endpoint.endpoint_id, actor='tester', include_external_intel=False)
     cves = {f.cve for f in findings}
-    assert 'HEGEMON-AST-SHELL-TRUE' in cves
     assert 'HEGEMON-AST-WEAK-HASH' in cves
+    assert 'HEGEMON-AST-TAINTED-CMD-EXEC' in cves
+    assert 'HEGEMON-AST-TAINTED-SQL-QUERY' in cves
+    assert 'HEGEMON-AST-HARDCODED-SECRET' in cves
 
-    shell_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-SHELL-TRUE')
-    proposal = cp.generate_patch_proposal(shell_finding.finding_id, actor='tester')
-    assert 'patch_hint' in proposal.code_diff
+    cmd_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-TAINTED-CMD-EXEC')
+    assert 'Dataflow' in cmd_finding.reasoning
+    proposal = cp.generate_patch_proposal(cmd_finding.finding_id, actor='tester')
+    assert 'shell=False' in proposal.code_diff
+
+    sql_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-TAINTED-SQL-QUERY')
+    sql_proposal = cp.generate_patch_proposal(sql_finding.finding_id, actor='tester')
+    assert 'parameterized queries' in sql_proposal.change_plan[0]
