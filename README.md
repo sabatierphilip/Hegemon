@@ -161,6 +161,14 @@ Rules now support structured matching that goes beyond simple equality/threshold
 python control_plane_service.py --port 9443
 ```
 
+### Advanced vulnerability PoC intelligence (new)
+
+Each vulnerability created via `/vulnerabilities` now includes:
+- `poc_attack_map`: attack graph nodes, kill-chain progression probabilities, pivot assets, and blast-radius estimate.
+- `remediation_plan`: phased contain/eradicate/validate/recover execution steps.
+- `vulnerability_explanation`: concise narrative that explains why the vulnerability is risky in-context.
+
+
 ### Toggle autonomous containment (dashboard API)
 
 ```bash
