@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import http.server
 import json
@@ -21,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from sentinel_containment.asset_mapper.discovery import AssetMapper
 from sentinel_containment.cloud.provider import CloudProviderAdapter
 from sentinel_containment.config import Settings
+from sentinel_containment.controlplane import HegemonControlPlane
 from sentinel_containment.containment.engine import ContainmentEngine
 from sentinel_containment.containment.executors import ContainmentActionExecutor
 from sentinel_containment.detection.attack_sequence import AttackSequenceModel
@@ -30,6 +32,7 @@ from sentinel_containment.detection.graph_anomaly import GraphAnomalyDetector
 from sentinel_containment.detection.honeypot import HoneypotDetector
 from sentinel_containment.detection.mirror_clone import MirrorCloneDetector
 from sentinel_containment.detection.rule_engine import RuleEngine
+from sentinel_containment.discovery import NetworkDiscoveryEngine
 from sentinel_containment.logging_layer.immutable_log import ImmutableAuditLog
 from sentinel_containment.main import run_cycle
 from sentinel_containment.security import (
@@ -51,6 +54,7 @@ from sentinel_containment.telemetry.sources import (
 )
 
 from kernel_telemetry import KernelTelemetryConfig, KernelTelemetryManager
+from sentinel_containment.endpoint_inventory import collect_host_facts
 
 
 logger = logging.getLogger(__name__)
@@ -263,6 +267,10 @@ class SentinelRuntime:
         self._auto_hardware_private_key: ed25519.Ed25519PrivateKey | None = None
         self._auto_hardware_key_id: str | None = None
         self._startup_warning_banner = ""
+        self.control_plane = HegemonControlPlane()
+        self.discovery_engine = NetworkDiscoveryEngine(self.control_plane)
+        self.notification_history: deque[dict[str, Any]] = deque(maxlen=200)
+        self._last_notified_by_host: dict[str, float] = {}
 
         self.fast_lane_server: FastLaneServer | None = None
         self.fast_lane_status: dict[str, Any] = {"enabled": bool(settings.get("fast_lane", {}).get("enabled", False)), "active": False, "missing_tls_files": []}
@@ -1220,6 +1228,59 @@ class SentinelRuntime:
         self.audit.append("friendly_enrollment", payload)
         return payload
 
+    def _bootstrap_local_endpoint(self) -> None:
+        facts = collect_host_facts()
+        payload = {
+            "endpoint_id": "local-hegemon-host",
+            "host_name": facts.get("host_name", "local"),
+            "os": facts.get("os", "unknown"),
+            "kernel": facts.get("kernel", "unknown"),
+            "network_exposure": facts.get("network_exposure", "unknown"),
+            "enrollment_method": "local_bootstrap",
+            "installed_packages": facts.get("installed_packages", {}),
+            "sbom_status": "unknown",
+        }
+        self.control_plane.add_endpoint(payload, actor="runtime-bootstrap")
+        self.control_plane.ledger.append("endpoint.bootstrap_local", payload)
+
+    def _local_endpoint_refresh_loop(self) -> None:
+        while not self._stop.is_set():
+            self._bootstrap_local_endpoint()
+            self._stop.wait(600)
+
+    def _discovery_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                asyncio.run(self.discovery_engine.sweep_once())
+            except Exception:
+                pass
+            self._stop.wait(1800)
+
+    def _auto_patch_loop(self) -> None:
+        while not self._stop.is_set():
+            self.control_plane.run_auto_patch_cycle()
+            self._stop.wait(300)
+
+    def _notification_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.latest_state_path.exists():
+                    state = json.loads(self.latest_state_path.read_text(encoding="utf-8"))
+                    severity = int(state.get("candidate_severity", 0) or 0)
+                    host = "unknown"
+                    alerts = state.get("alerts") or []
+                    if alerts:
+                        host = str((alerts[0] or {}).get("event", {}).get("host", "unknown"))
+                    now = time.time()
+                    if severity >= 80 and now - self._last_notified_by_host.get(host, 0) >= 600:
+                        event = {"severity": severity, "host": host, "summary": "High severity alert", "ts": now}
+                        self.notification_history.append(event)
+                        self._last_notified_by_host[host] = now
+                        self.audit.append("notification.sent", event)
+            except Exception:
+                pass
+            self._stop.wait(5)
+
     def run_once(self) -> dict:
         state = run_cycle(
             self.settings,
@@ -1242,6 +1303,13 @@ class SentinelRuntime:
         state["readiness"] = self.get_readiness_status()
         state["p2p_checkpoint"] = self._checkpoint_critical_state(state)
         state["distributor"] = self.distributor.current_snapshot()
+        state["automation_overview"] = {
+            "discovered_hosts": len(self.discovery_engine.last_hosts),
+            "agent_connected_endpoints": sum(1 for ep in self.control_plane.endpoints.values() if ep.enrollment_method in {"agent", "local_bootstrap"}),
+            "auto_patched_today": sum(1 for p in self.control_plane.patch_proposals.values() if p.status == "deployed_canary"),
+            "active_peers": len(self.peer_mesh.process_ids),
+            "notifications_sent": len(self.notification_history),
+        }
         self.latest_state_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return state
@@ -1261,6 +1329,11 @@ class SentinelRuntime:
 
     def start(self) -> None:
         self.ingestion_service.start()
+        self._bootstrap_local_endpoint()
+        for target in (self._local_endpoint_refresh_loop, self._discovery_loop, self._auto_patch_loop, self._notification_loop):
+            t = threading.Thread(target=target, daemon=True)
+            t.start()
+            self._dynamic_threads.append(t)
         if self.fast_lane_server is not None:
             fast_lane_thread = threading.Thread(target=self.fast_lane_server.serve_forever, daemon=True)
             fast_lane_thread.start()
@@ -1275,5 +1348,5 @@ class SentinelRuntime:
         if self.fast_lane_server is not None:
             self.fast_lane_server.shutdown()
             self.fast_lane_server.server_close()
-        for t in self._threads:
+        for t in self._threads + self._dynamic_threads:
             t.join(timeout=2)
