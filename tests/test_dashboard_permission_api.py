@@ -480,6 +480,12 @@ def test_dashboard_renders_tabbed_control_plane_view(auth_headers):
     assert "cp-add-friend-btn" in body
     assert "cp-add-endpoint-btn" in body
     assert "cp-autocomplete-enabled" in body
+    assert "cp-scan-terminal" in body
+    assert "cp-approve-latest-btn" in body
+    assert "cp-approve-apply-btn" in body
+    assert "cp-patch-terminal" in body
+    assert 'data-tab="kernel-telemetry"' in body
+    assert "kernel-telemetry-mode-toggle" in body
 
 
 def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
@@ -502,6 +508,8 @@ def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
     payload = scan.get_json()
     assert payload["findings"]
     assert payload["proposals"]
+    assert "global_weakness_report" in payload
+    assert payload["global_weakness_report"]["systems_analyzed"] >= 1
     latest = payload["proposals"][-1]
     assert "code_diff" in latest
     assert "diff_explanation" in latest
@@ -510,6 +518,54 @@ def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
     assert overview.status_code == 200
     overview_payload = overview.get_json()
     assert overview_payload["proposals"]
+
+
+
+def test_control_plane_can_approve_latest_patch(auth_headers, monkeypatch):
+    client = app.test_client()
+
+    def _fake_osv(package: str, version: str, endpoint_os: str):
+        return [{
+            "id": "CVE-2026-0001",
+            "published": "2026-01-10T00:00:00Z",
+            "severity": [{"score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/9.8"}],
+            "affected": [{"ranges": [{"events": [{"introduced": "0"}, {"fixed": "3.0.18"}]}]}],
+        }] if package == "openssl" else []
+
+    monkeypatch.setattr("sentinel_containment.web.app._control_plane._query_osv", _fake_osv)
+    seed = client.post("/api/control-plane/demo-seed", json={"seed": True}, headers=auth_headers)
+    assert seed.status_code == 200
+    scan = client.post("/api/control-plane/scan", json={"endpoint_id": "ep-dashboard-demo"}, headers=auth_headers)
+    assert scan.status_code == 200
+
+    approve = client.post("/api/control-plane/approve-latest", json={"approver": "admin-1"}, headers=auth_headers)
+    assert approve.status_code == 200
+    payload = approve.get_json()
+    assert payload["status"] in {"pending_review", "approved"}
+    assert payload["approvals_received"] >= 1
+
+def test_control_plane_can_approve_and_apply_latest_patch(auth_headers, monkeypatch):
+    client = app.test_client()
+
+    def _fake_osv(package: str, version: str, endpoint_os: str):
+        return [{
+            "id": "CVE-2026-0001",
+            "published": "2026-01-10T00:00:00Z",
+            "severity": [{"score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/9.8"}],
+            "affected": [{"ranges": [{"events": [{"introduced": "0"}, {"fixed": "3.0.18"}]}]}],
+        }] if package == "openssl" else []
+
+    monkeypatch.setattr("sentinel_containment.web.app._control_plane._query_osv", _fake_osv)
+    seed = client.post("/api/control-plane/demo-seed", json={"seed": True}, headers=auth_headers)
+    assert seed.status_code == 200
+    scan = client.post("/api/control-plane/scan", json={"endpoint_id": "ep-dashboard-demo"}, headers=auth_headers)
+    assert scan.status_code == 200
+
+    approve_apply = client.post("/api/control-plane/approve-apply-latest", json={"autonomous": True}, headers=auth_headers)
+    assert approve_apply.status_code == 200
+    payload = approve_apply.get_json()
+    assert payload["status"] == "deployed_canary"
+    assert payload["approvals_received"] >= 1
 
 
 
@@ -527,3 +583,41 @@ def test_control_plane_autocomplete_and_adders(auth_headers):
     ac = client.get('/api/control-plane/autocomplete?kind=endpoints&q=edge', headers=auth_headers)
     assert ac.status_code == 200
     assert any('edge' in x for x in ac.get_json()['suggestions'])
+
+
+def test_kernel_telemetry_mode_api_defaults_autonomous_and_toggleable(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "dynamic_system_poll_seconds": 0.05,
+            "advanced_kernel_poll_seconds": 0.05,
+            "kernel_telemetry_poll_seconds": 0.05,
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+    runtime.apply_telemetry_permission(True)
+
+    client = app.test_client()
+    status = client.get('/api/kernel-telemetry/status', headers=auth_headers)
+    assert status.status_code == 200
+    assert status.get_json()['autonomous'] is True
+
+    toggled = client.post('/api/kernel-telemetry/mode', json={'autonomous': False}, headers=auth_headers)
+    assert toggled.status_code == 200
+    assert toggled.get_json()['autonomous'] is False
+
+    runtime.stop()

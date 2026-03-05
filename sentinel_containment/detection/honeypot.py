@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import re
+from urllib.parse import unquote
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any
@@ -104,6 +106,27 @@ class HoneypotDetector:
             if text and any(ch.isalpha() for ch in text):
                 chunks.append(text)
         return " ".join(chunks).lower()
+
+
+    def _decode_embedded_hex(self, blob: str) -> str:
+        chunks: list[str] = []
+        for token in re.findall(r"\b[0-9A-Fa-f]{16,}\b", blob):
+            if len(token) % 2 != 0:
+                continue
+            try:
+                decoded = bytes.fromhex(token)
+            except (ValueError, binascii.Error):
+                continue
+            text = decoded.decode("utf-8", errors="ignore")
+            if text and any(ch.isalpha() for ch in text):
+                chunks.append(text)
+        return " ".join(chunks).lower()
+
+    def _decode_url_encoded(self, blob: str) -> str:
+        decoded = blob
+        for _ in range(2):
+            decoded = unquote(decoded)
+        return decoded.lower()
 
     def _match_advanced_tactics(self, blob: str) -> list[str]:
         matches = []
@@ -242,7 +265,11 @@ class HoneypotDetector:
         metadata_blob_raw = self._metadata_blob(event, lowercase=False)
         metadata_blob = metadata_blob_raw.lower()
         normalized_blob = self._normalize_blob(metadata_blob)
-        decoded_blob = self._decode_embedded_base64(metadata_blob_raw)
+        decoded_blob = " ".join(filter(None, [
+            self._decode_embedded_base64(metadata_blob_raw),
+            self._decode_embedded_hex(metadata_blob_raw),
+            self._decode_url_encoded(metadata_blob_raw),
+        ]))
         normalized_decoded_blob = self._normalize_blob(decoded_blob)
         identifier_codes, identifier_ping = self._identifier_signals(event, metadata_blob)
         pinger_lines, pinger_ping = self._resource_pinger_signals(event, metadata_blob)

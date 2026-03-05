@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -384,6 +386,27 @@ class HegemonControlPlane:
         vulns = data.get("vulns", [])
         return vulns if isinstance(vulns, list) else []
 
+    def _query_nvd(self, package: str, version: str, endpoint_os: str) -> list[dict[str, Any]]:
+        params = {
+            "keywordSearch": f"{package} {version} {endpoint_os}",
+            "resultsPerPage": "8",
+        }
+        url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?{urllib.parse.urlencode(params)}"
+        headers = {"User-Agent": "hegemon-control-plane/1.0"}
+        api_key = os.getenv("NVD_API_KEY", "").strip()
+        if api_key:
+            headers["apiKey"] = api_key
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            return []
+        vulnerabilities = data.get("vulnerabilities", [])
+        if not isinstance(vulnerabilities, list):
+            return []
+        return [entry.get("cve", {}) for entry in vulnerabilities if isinstance(entry, dict)]
+
     @staticmethod
     def _cvss_from_vuln(vuln: dict[str, Any]) -> float:
         for sev in vuln.get("severity", []):
@@ -393,6 +416,20 @@ class HegemonControlPlane:
                     return float(score.split("/")[-1])
                 except (ValueError, TypeError):
                     continue
+        return 7.0
+
+    @staticmethod
+    def _cvss_from_nvd(vuln: dict[str, Any]) -> float:
+        metrics = vuln.get("metrics", {}) if isinstance(vuln, dict) else {}
+        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            values = metrics.get(key, [])
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                data = item.get("cvssData", {}) if isinstance(item, dict) else {}
+                score = data.get("baseScore")
+                if isinstance(score, (int, float)):
+                    return float(score)
         return 7.0
 
     @staticmethod
@@ -464,42 +501,196 @@ class HegemonControlPlane:
         discovered: list[VulnerabilityFinding] = []
         markov, chain_risk = self._kill_chain_transition_markov(endpoint.telemetry_events)
         for package, version in endpoint.installed_packages.items():
-            vulns = self._query_osv(package, version, endpoint.os)
-            for vuln in vulns:
+            candidates: dict[str, dict[str, Any]] = {}
+            for vuln in self._query_osv(package, version, endpoint.os):
                 cve = str(vuln.get("id", "UNKNOWN-CVE"))
+                if not cve:
+                    continue
                 age_days = self._published_age_days(vuln)
                 cvss = self._cvss_from_vuln(vuln)
-                exploit_availability = min(10.0, round(4.0 + max(0.0, (365 - min(age_days, 365))) / 120 + chain_risk * 2.1, 2))
-                fixed = []
+                fixed: list[str] = []
                 for aff in vuln.get("affected", []):
                     for rng in aff.get("ranges", []):
                         for event in rng.get("events", []):
                             if "fixed" in event:
                                 fixed.append(event["fixed"])
                 target_version = fixed[0] if fixed else "latest"
-                chain_summary = f"MTRE chain drift={chain_risk:.2f}; package={package}; age_days={age_days:.0f}"
-                evidence = [
-                    {"type": "osv_live_query", "package": package, "version": version, "cve": cve},
-                    {"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk},
-                    {"type": "vulnerability_age_days", "age_days": age_days},
-                ]
+                candidates[cve] = {
+                    "cve": cve,
+                    "cvss": cvss,
+                    "age_days": age_days,
+                    "target_version": target_version,
+                    "sources": ["osv"],
+                    "evidence": [
+                        {"type": "osv_live_query", "package": package, "version": version, "cve": cve},
+                        {"type": "vulnerability_age_days", "age_days": age_days},
+                    ],
+                }
+
+            for vuln in self._query_nvd(package, version, endpoint.os):
+                cve = str(vuln.get("id", "UNKNOWN-CVE"))
+                if not cve:
+                    continue
+                age_days = self._published_age_days(vuln)
+                cvss = self._cvss_from_nvd(vuln)
+                existing = candidates.get(cve)
+                if existing:
+                    existing["cvss"] = max(float(existing.get("cvss", 0.0)), cvss)
+                    existing["age_days"] = min(float(existing.get("age_days", age_days)), age_days)
+                    existing["sources"] = sorted(set(list(existing.get("sources", [])) + ["nvd"]))
+                    existing["evidence"].append({"type": "nvd_live_query", "package": package, "version": version, "cve": cve})
+                else:
+                    candidates[cve] = {
+                        "cve": cve,
+                        "cvss": cvss,
+                        "age_days": age_days,
+                        "target_version": "latest",
+                        "sources": ["nvd"],
+                        "evidence": [{"type": "nvd_live_query", "package": package, "version": version, "cve": cve}],
+                    }
+
+            for candidate in candidates.values():
+                age_days = float(candidate.get("age_days", 365.0))
+                cvss = float(candidate.get("cvss", 7.0))
+                exploit_availability = min(10.0, round(4.0 + max(0.0, (365 - min(age_days, 365))) / 120 + chain_risk * 2.1, 2))
+                chain_summary = (
+                    f"MTRE chain drift={chain_risk:.2f}; package={package}; age_days={age_days:.0f}; "
+                    f"intel_sources={','.join(candidate.get('sources', []))}"
+                )
+                evidence = list(candidate.get("evidence", []))
+                evidence.append({"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk})
                 finding = self.create_finding(
                     {
                         "endpoint_id": endpoint_id,
-                        "cve": cve,
+                        "cve": candidate["cve"],
                         "cvss": cvss,
                         "exploit_availability": exploit_availability,
                         "topological_impact": round(7.0 + chain_risk, 3),
                         "asset_value": endpoint.asset_value,
                         "trust_level": endpoint.trust_level,
                         "evidence": evidence,
-                        "suggested_remediations": [f"upgrade {package} to {target_version}", "restart impacted services"],
-                        "graph_path": self._build_attack_path(endpoint, cve, chain_risk),
+                        "suggested_remediations": [f"upgrade {package} to {candidate.get('target_version', 'latest')}", "restart impacted services", "validate canary patch rollout with synthetic probes"],
+                        "graph_path": self._build_attack_path(endpoint, candidate["cve"], chain_risk),
                         "reasoning": chain_summary,
                     },
                     actor,
                 )
                 discovered.append(finding)
+
+        local_exposure_findings: list[dict[str, Any]] = []
+        if endpoint.network_exposure == "internet" and endpoint.trust_level <= 6.5:
+            local_exposure_findings.append(
+                {
+                    "cve": "HEGEMON-EXPOSURE-INTERNET-TRUST",
+                    "cvss": 8.6,
+                    "exploit_availability": min(9.8, round(7.1 + chain_risk, 2)),
+                    "topological_impact": round(8.1 + chain_risk, 3),
+                    "reasoning": "Internet-exposed endpoint with degraded trust level increases lateral ingress likelihood.",
+                    "evidence": [
+                        {
+                            "type": "configuration_gap",
+                            "network_exposure": endpoint.network_exposure,
+                            "trust_level": endpoint.trust_level,
+                            "asset_value": endpoint.asset_value,
+                        },
+                        {"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk},
+                    ],
+                    "suggested_remediations": [
+                        "enforce network ACL segmentation and geo-fencing",
+                        "require mTLS between edge ingress and service workloads",
+                        "raise endpoint trust level via attestation + EDR hardening",
+                    ],
+                }
+            )
+
+        if endpoint.protection_mode == "observe-only":
+            local_exposure_findings.append(
+                {
+                    "cve": "HEGEMON-ENDPOINT-HARDENING-GAP",
+                    "cvss": 8.1,
+                    "exploit_availability": min(9.5, round(6.8 + chain_risk, 2)),
+                    "topological_impact": round(7.9 + chain_risk, 3),
+                    "reasoning": "Endpoint remains in observe-only protection mode, allowing exploit attempts without enforced response.",
+                    "evidence": [
+                        {"type": "protection_mode", "value": endpoint.protection_mode},
+                        {"type": "release_ring", "value": endpoint.release_ring},
+                        {"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk},
+                    ],
+                    "suggested_remediations": [
+                        "upgrade protection mode from observe-only to canary/enforce",
+                        "enable automatic containment hooks for high-severity detections",
+                        "bind endpoint to signed policy profile with tamper alerts",
+                    ],
+                }
+            )
+
+        try:
+            heartbeat_ts = datetime.fromisoformat(endpoint.last_heartbeat)
+        except ValueError:
+            heartbeat_ts = datetime.now(timezone.utc)
+        last_seen_age_seconds = max(
+            0.0,
+            (datetime.now(timezone.utc) - heartbeat_ts).total_seconds(),
+        )
+        if last_seen_age_seconds > 1800:
+            local_exposure_findings.append(
+                {
+                    "cve": "HEGEMON-TELEMETRY-LIVENESS-GAP",
+                    "cvss": 7.6,
+                    "exploit_availability": 7.2,
+                    "topological_impact": 7.0,
+                    "reasoning": "Telemetry heartbeat is stale; blind spots can conceal active compromise and patch regressions.",
+                    "evidence": [
+                        {"type": "last_heartbeat_age_seconds", "value": round(last_seen_age_seconds, 2)},
+                        {"type": "network_exposure", "value": endpoint.network_exposure},
+                    ],
+                    "suggested_remediations": [
+                        "restore endpoint telemetry channel and enforce heartbeat SLA",
+                        "trigger out-of-band health attestation for stale endpoint",
+                        "quarantine endpoint when heartbeat staleness crosses critical threshold",
+                    ],
+                }
+            )
+
+        if endpoint.sbom_status != "valid":
+            local_exposure_findings.append(
+                {
+                    "cve": "HEGEMON-SBOM-INTEGRITY-GAP",
+                    "cvss": 7.9,
+                    "exploit_availability": 7.4,
+                    "topological_impact": 7.3,
+                    "reasoning": "SBOM validation gap allows dependency drift and silent vulnerable package introduction.",
+                    "evidence": [
+                        {"type": "sbom_status", "value": endpoint.sbom_status},
+                        {"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk},
+                    ],
+                    "suggested_remediations": [
+                        "enable signed SBOM attestation at deploy time",
+                        "fail CI/CD promotion when reproducibility checks fail",
+                        "pin package digests and verify provenance",
+                    ],
+                }
+            )
+
+        for local_finding in local_exposure_findings:
+            finding = self.create_finding(
+                {
+                    "endpoint_id": endpoint_id,
+                    "cve": local_finding["cve"],
+                    "cvss": local_finding["cvss"],
+                    "exploit_availability": local_finding["exploit_availability"],
+                    "topological_impact": local_finding["topological_impact"],
+                    "asset_value": endpoint.asset_value,
+                    "trust_level": endpoint.trust_level,
+                    "evidence": local_finding["evidence"],
+                    "suggested_remediations": local_finding["suggested_remediations"],
+                    "graph_path": self._build_attack_path(endpoint, local_finding["cve"], chain_risk),
+                    "reasoning": local_finding["reasoning"],
+                },
+                actor,
+            )
+            discovered.append(finding)
+
         self._record(
             "scan.completed",
             {
@@ -511,10 +702,76 @@ class HegemonControlPlane:
         )
         return discovered
 
+    def analyze_global_attack_surface(self, external_systems: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        graph = self.export_graph()
+        degree: dict[str, int] = {}
+        for edge in graph.get("edges", []):
+            src = str(edge.get("source", ""))
+            dst = str(edge.get("target", ""))
+            if src:
+                degree[src] = degree.get(src, 0) + 1
+            if dst:
+                degree[dst] = degree.get(dst, 0) + 1
+
+        reports: list[dict[str, Any]] = []
+        for endpoint in self.endpoints.values():
+            _markov, chain_risk = self._kill_chain_transition_markov(endpoint.telemetry_events)
+            weaknesses: list[dict[str, Any]] = []
+            if endpoint.network_exposure == "internet":
+                weaknesses.append({"id": "internet_exposure", "severity": "high"})
+            if endpoint.sbom_status != "valid":
+                weaknesses.append({"id": "sbom_integrity_gap", "severity": "high"})
+            if endpoint.protection_mode == "observe-only":
+                weaknesses.append({"id": "observe_only_mode", "severity": "high"})
+            if endpoint.trust_level <= 6.0:
+                weaknesses.append({"id": "low_trust_level", "severity": "medium"})
+
+            reports.append(
+                {
+                    "system_id": endpoint.endpoint_id,
+                    "friendly": True,
+                    "host_name": endpoint.host_name,
+                    "kill_chain_markov_risk": round(chain_risk, 3),
+                    "graph_degree": degree.get(endpoint.endpoint_id, 0),
+                    "weaknesses": weaknesses,
+                    "patch_eligible": True,
+                }
+            )
+
+        for ext in external_systems or []:
+            name = str(ext.get("system_id") or ext.get("host_name") or "non-friendly")
+            exposure = str(ext.get("network_exposure", "unknown"))
+            telemetry_events = ext.get("telemetry_events", [])
+            events = telemetry_events if isinstance(telemetry_events, list) else []
+            _markov, chain_risk = self._kill_chain_transition_markov([str(v) for v in events])
+            weaknesses = []
+            if exposure == "internet":
+                weaknesses.append({"id": "internet_exposure", "severity": "high"})
+            if bool(ext.get("unknown_integrity", True)):
+                weaknesses.append({"id": "integrity_unknown", "severity": "high"})
+            reports.append(
+                {
+                    "system_id": name,
+                    "friendly": False,
+                    "host_name": str(ext.get("host_name", name)),
+                    "kill_chain_markov_risk": round(chain_risk, 3),
+                    "graph_degree": degree.get(name, 0),
+                    "weaknesses": weaknesses,
+                    "patch_eligible": False,
+                }
+            )
+
+        reports.sort(key=lambda item: (item["kill_chain_markov_risk"], len(item["weaknesses"])), reverse=True)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "systems_analyzed": len(reports),
+            "report": reports,
+        }
+
     def _diff_for_finding(self, finding: VulnerabilityFinding, endpoint: Endpoint) -> tuple[str, str]:
         upgrade = finding.suggested_remediations[0] if finding.suggested_remediations else "upgrade vulnerable package"
         parts = upgrade.split()
-        pkg = parts[1] if len(parts) > 1 else "package"
+        pkg = parts[1] if len(parts) > 1 else "security-control"
         target = parts[-1] if " to " in upgrade else "latest"
         old = endpoint.installed_packages.get(pkg, "unknown")
         diff = (

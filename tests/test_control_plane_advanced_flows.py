@@ -218,6 +218,69 @@ def test_control_plane_bootstrap_defaults_and_autodiscovery(tmp_path: Path):
     assert 'ep-default-windows' in cp.endpoints
     assert 'ep-default-linux' in cp.endpoints
     # autodiscovered from seeded endpoints/packages
+
+
+def test_autonomous_scan_adds_local_loophole_findings_when_osv_is_empty(tmp_path: Path, monkeypatch):
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+    endpoint = cp.add_endpoint(
+        {
+            'host_name': 'internet-facing-ml-api',
+            'endpoint_type': 'on-prem',
+            'os': 'ubuntu',
+            'kernel': '6.8',
+            'sbom_status': 'unknown',
+            'enrollment_method': 'manual',
+            'network_exposure': 'internet',
+            'asset_value': 9.0,
+            'trust_level': 5.2,
+            'installed_packages': {'custom-agent': '1.0.0'},
+            'telemetry_events': ['recon', 'initial_access', 'execution', 'lateral_movement'],
+        },
+        actor='tester',
+    )
+
+    monkeypatch.setattr(cp, '_query_osv', lambda package, version, endpoint_os: [])
+    cp.endpoints[endpoint.endpoint_id].last_heartbeat = '2020-01-01T00:00:00+00:00'
+    findings = cp.run_vulnerability_scan(endpoint.endpoint_id, actor='tester')
+    cves = {f.cve for f in findings}
+    assert 'HEGEMON-EXPOSURE-INTERNET-TRUST' in cves
+    assert 'HEGEMON-SBOM-INTEGRITY-GAP' in cves
+    assert 'HEGEMON-ENDPOINT-HARDENING-GAP' in cves
+    assert 'HEGEMON-TELEMETRY-LIVENESS-GAP' in cves
     names = {a.name for a in cp.friendly_apps.values()}
     assert 'Nginx' in names
     assert 'Microsoft Edge' in names
+
+
+def test_scan_can_use_nvd_as_additional_intel_source(tmp_path: Path, monkeypatch):
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+    endpoint = cp.add_endpoint(
+        {
+            'host_name': 'nvd-target',
+            'endpoint_type': 'on-prem',
+            'os': 'ubuntu',
+            'kernel': '6.8',
+            'sbom_status': 'valid',
+            'enrollment_method': 'mdm',
+            'installed_packages': {'custom-runtime': '1.2.3'},
+            'telemetry_events': ['recon', 'initial_access', 'execution'],
+        },
+        actor='tester',
+    )
+
+    monkeypatch.setattr(cp, '_query_osv', lambda package, version, endpoint_os: [])
+    monkeypatch.setattr(
+        cp,
+        '_query_nvd',
+        lambda package, version, endpoint_os: [
+            {
+                'id': 'CVE-2026-4242',
+                'published': '2026-01-01T00:00:00Z',
+                'metrics': {'cvssMetricV31': [{'cvssData': {'baseScore': 9.4}}]},
+            }
+        ],
+    )
+    findings = cp.run_vulnerability_scan(endpoint.endpoint_id, actor='tester')
+    assert any(f.cve == 'CVE-2026-4242' for f in findings)
+    cve = next(f for f in findings if f.cve == 'CVE-2026-4242')
+    assert any(e.get('type') == 'nvd_live_query' for e in cve.evidence)

@@ -77,3 +77,28 @@ def test_honeypot_detector_auto_contains_plain_proto_agi_hit_without_decoy_touch
     assert alerts[0].classification == "proto_agi_indicator_detected"
     assert alerts[0].kill_chain_recommended is True
     assert alerts[0].severity >= 85
+
+
+def test_honeypot_detector_catches_multiple_obfuscated_threat_variants():
+    detector = HoneypotDetector(["decoy://llm-admin"], ["policy evasion"])
+
+    variants = [
+        "p0l1cy-evas10n",
+        "policy%20evasion",
+        "706f6c6963792065766173696f6e",
+        "cG9saWN5IGV2YXNpb24=",
+        "p.o.l.i.c.y__e.v.a.s.i.o.n",
+    ]
+
+    for message in variants:
+        alerts = detector.evaluate(
+            {
+                "resource": "decoy://llm-admin",
+                "action": "touch",
+                "message": message,
+            }
+        )
+
+        assert alerts
+        assert alerts[0].classification == "proto_agi_honeypot_tripwire"
+        assert "policy evasion" in alerts[0].matched_indicators
