@@ -284,3 +284,133 @@ def test_scan_can_use_nvd_as_additional_intel_source(tmp_path: Path, monkeypatch
     assert any(f.cve == 'CVE-2026-4242' for f in findings)
     cve = next(f for f in findings if f.cve == 'CVE-2026-4242')
     assert any(e.get('type') == 'nvd_live_query' for e in cve.evidence)
+    structural = next(e for e in cve.evidence if e.get('type') == 'ast_graph_double_check')
+    assert 'program_graph' in structural
+    poc = next(e for e in cve.evidence if e.get('type') == 'poc_bundle')
+    assert poc.get('poc_graph', {}).get('nodes')
+
+
+def test_autonomous_self_scan_generates_and_applies_patch(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+
+    finding = cp.create_finding(
+        {
+            'endpoint_id': 'ep-hegemon-self',
+            'cve': 'HEGEMON-SELF-CHECK-001',
+            'cvss': 5.1,
+            'exploit_availability': 4.1,
+            'topological_impact': 4.2,
+            'asset_value': 10.0,
+            'trust_level': 8.8,
+            'evidence': [{'type': 'ast_graph_double_check', 'double_checks': 2}],
+            'suggested_remediations': ['upgrade hegemon-core to 0.9.1'],
+        },
+        actor='tester',
+    )
+    proposal = cp.generate_patch_proposal(finding.finding_id, actor='tester')
+    assert proposal.status == 'pending_review'
+
+    out = cp.run_autonomous_self_patch()
+    assert out['applied'] >= 1
+    assert cp.patch_proposals[proposal.proposal_id].status == 'deployed_canary'
+
+
+
+def test_structural_scan_detects_real_program_issues(tmp_path: Path, monkeypatch):
+    program = tmp_path / 'program'
+    program.mkdir()
+    (program / 'app.py').write_text(
+        """import os
+import random
+import subprocess
+import sqlite3
+import hashlib
+
+API_TOKEN = "SUPERSECRET_TOKEN_12345"
+
+
+def run(user_input):
+    subprocess.run(f"echo {user_input}", shell=True)
+    os.system(user_input)
+    conn = sqlite3.connect(":memory:")
+    conn.cursor().execute(f"SELECT * FROM users WHERE id = {user_input}")
+    session_token = random.randint(1000, 9999)
+    return hashlib.md5((user_input + str(session_token)).encode()).hexdigest()
+"""
+    )
+
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+    endpoint = cp.add_endpoint(
+        {
+            'host_name': 'real-program',
+            'endpoint_type': 'on-prem',
+            'os': 'ubuntu',
+            'kernel': '6.8',
+            'sbom_status': 'valid',
+            'enrollment_method': 'agent',
+            'installed_packages': {'custom-runtime': '1.0.0'},
+            'telemetry_events': ['recon', 'execution'],
+            'program_root': str(program),
+        },
+        actor='tester',
+    )
+
+    monkeypatch.setattr(cp, '_query_osv', lambda package, version, endpoint_os: [])
+    monkeypatch.setattr(cp, '_query_nvd', lambda package, version, endpoint_os: [])
+
+    findings = cp.run_vulnerability_scan(endpoint.endpoint_id, actor='tester', include_external_intel=False)
+    cves = {f.cve for f in findings}
+    assert 'HEGEMON-AST-WEAK-HASH' in cves
+    assert 'HEGEMON-AST-TAINTED-CMD-EXEC' in cves
+    assert 'HEGEMON-AST-TAINTED-SQL-QUERY' in cves
+    assert 'HEGEMON-AST-HARDCODED-SECRET' in cves
+
+    cmd_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-TAINTED-CMD-EXEC')
+    ast_issue = next(e for e in cmd_finding.evidence if e.get('type') == 'ast_issue')
+    assert ast_issue.get('reconstructed_kill_chain')
+    assert ast_issue.get('dataflow_path')
+    assert 'call_path=' in cmd_finding.reasoning
+    poc = next(e for e in cmd_finding.evidence if e.get('type') == 'poc_bundle')
+    assert poc.get('reconstructed_kill_chain')
+    proposal = cp.generate_patch_proposal(cmd_finding.finding_id, actor='tester')
+    assert 'shell=False' in proposal.code_diff
+    assert 'PoC map:' in proposal.reasoning
+
+    sql_finding = next(f for f in findings if f.cve == 'HEGEMON-AST-TAINTED-SQL-QUERY')
+    sql_proposal = cp.generate_patch_proposal(sql_finding.finding_id, actor='tester')
+    assert 'parameterized query' in sql_proposal.change_plan[0]
+
+
+
+def test_hardcoded_secret_tuning_reduces_metadata_false_positives(tmp_path: Path, monkeypatch):
+    program = tmp_path / 'program-meta'
+    program.mkdir()
+    (program / 'meta.py').write_text(
+        '__author__ = "very-long-author-identifier-string"\n'
+        '__version__ = "2026.11.9999"\n'
+        'API_TOKEN = "REAL_SUPER_SECRET_TOKEN_987654321"\n'
+    )
+
+    cp = HegemonControlPlane(ledger_path=tmp_path / 'ledger.jsonl')
+    endpoint = cp.add_endpoint(
+        {
+            'host_name': 'meta-program',
+            'endpoint_type': 'on-prem',
+            'os': 'ubuntu',
+            'kernel': '6.8',
+            'sbom_status': 'valid',
+            'enrollment_method': 'agent',
+            'installed_packages': {'custom-runtime': '1.0.0'},
+            'telemetry_events': ['recon', 'credential_access'],
+            'program_root': str(program),
+        },
+        actor='tester',
+    )
+    monkeypatch.setattr(cp, '_query_osv', lambda package, version, endpoint_os: [])
+    monkeypatch.setattr(cp, '_query_nvd', lambda package, version, endpoint_os: [])
+
+    findings = cp.run_vulnerability_scan(endpoint.endpoint_id, actor='tester', include_external_intel=False)
+    secret_findings = [f for f in findings if f.cve == 'HEGEMON-AST-HARDCODED-SECRET']
+    assert len(secret_findings) == 1
+    issue = next(e for e in secret_findings[0].evidence if e.get('type') == 'ast_issue')
+    assert 'dynamic-tuned' in issue.get('tags', [])
