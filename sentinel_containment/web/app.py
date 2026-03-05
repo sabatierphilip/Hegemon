@@ -193,6 +193,11 @@ HTML = """
     .tab-btn.active { background:#274079; border-color:#5d7fcd; }
     .tab-panel { display:none; }
     .tab-panel.active { display:block; }
+    .cp-subtabs{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;}
+    .cp-subtab{background:#1a2340;border:1px solid #35508f;border-radius:10px;padding:8px 10px;min-width:220px;}
+    .cp-subtab h4{margin:0;display:flex;align-items:center;justify-content:space-between;font-size:13px;}
+    .cp-icon-btn{border:1px solid #4b67a8;background:#223666;color:#d8e2ff;border-radius:8px;cursor:pointer;padding:1px 8px;font-weight:700;}
+    .cp-arrow{cursor:pointer;margin-left:6px;}
   </style>
 </head>
 <body>
@@ -331,9 +336,25 @@ HTML = """
   <div id="tab-control-plane" class="tab-panel">
     <div class="panel">
       <h3>Control Plane (Friends / Endpoints / Scanning / Patch Review)</h3>
+      <label class="small" style="display:flex;align-items:center;gap:8px;margin:6px 0;">
+        <input type="checkbox" id="cp-autocomplete-enabled" checked />
+        Enable autocomplete suggestions (optional)
+      </label>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input id="cp-scan-endpoint-input" list="cp-endpoint-suggestions" placeholder="endpoint id for scan" style="padding:8px;border-radius:8px;border:1px solid #35508f;background:#0f1528;color:#d8e2ff;" />
+        <datalist id="cp-endpoint-suggestions"></datalist>
         <button id="cp-seed-btn" style="padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;">Seed Demo Endpoint</button>
         <button id="cp-scan-btn" style="padding:8px 12px;background:#4a2b6a;color:#e7d7ff;border:1px solid #6b3f96;border-radius:8px;cursor:pointer;">Run Sophisticated Scan</button>
+      </div>
+      <div class="cp-subtabs">
+        <div class="cp-subtab">
+          <h4>Friends <span><button class="cp-icon-btn" id="cp-add-friend-btn">＋</button><span class="cp-arrow" data-target="cp-friends-list">▾</span></span></h4>
+          <div id="cp-friends-list" class="small"></div>
+        </div>
+        <div class="cp-subtab">
+          <h4>Endpoints <span><button class="cp-icon-btn" id="cp-add-endpoint-btn">＋</button><span class="cp-arrow" data-target="cp-endpoints-list">▾</span></span></h4>
+          <div id="cp-endpoints-list" class="small"></div>
+        </div>
       </div>
       <div class="small" id="cp-status" style="margin-top:8px;">Control-plane data loading...</div>
     </div>
@@ -348,6 +369,7 @@ HTML = """
       <div class="small" id="cp-path-before">Before: -</div>
       <div class="small" id="cp-path-after">After: -</div>
       <div class="small" id="cp-diff-expl">Diff explanation: -</div>
+      <div class="small" id="cp-reasoning">Agent reasoning: -</div>
       <div class="json" style="margin-top:8px;"><pre id="cp-code-diff">No patch diff generated yet.</pre></div>
     </div>
   </div>
@@ -483,6 +505,28 @@ for(const btn of tabButtons){
   });
 }
 
+
+function setCollapsed(el, collapsed){
+  if(!el) return;
+  el.style.display = collapsed ? 'none' : 'block';
+}
+
+function renderSimpleList(targetId, rows, formatter){
+  const node=document.getElementById(targetId);
+  if(!node) return;
+  if(!rows || !rows.length){ node.textContent='(empty)'; return; }
+  node.innerHTML = rows.slice(0,12).map(formatter).join('<br/>');
+}
+
+async function autocompleteTerms(kind, q){
+  const enabled=document.getElementById('cp-autocomplete-enabled');
+  if(enabled && !enabled.checked){ return []; }
+  const resp=await fetch(`/api/control-plane/autocomplete?kind=${encodeURIComponent(kind)}&q=${encodeURIComponent(q||'')}`);
+  if(!resp.ok){ return []; }
+  const data=await resp.json();
+  return data.suggestions || [];
+}
+
 async function loadControlPlane(){
   try{
     const resp=await fetch('/api/control-plane/overview');
@@ -492,6 +536,10 @@ async function loadControlPlane(){
     document.getElementById('cp-endpoints').textContent=String(data.endpoints.length);
     document.getElementById('cp-findings').textContent=String(data.findings.length);
     document.getElementById('cp-proposals').textContent=String(data.proposals.length);
+    renderSimpleList('cp-friends-list', data.friends, (f)=>`${f.name} (${f.status})`);
+    renderSimpleList('cp-endpoints-list', data.endpoints, (e)=>`${e.endpoint_id} · ${e.host_name}`);
+    const dl=document.getElementById('cp-endpoint-suggestions');
+    if(dl){ dl.innerHTML=(data.endpoints||[]).map((e)=>`<option value="${e.endpoint_id}"></option>`).join(''); }
     const latest=data.proposals[data.proposals.length-1];
     if(latest){
       const before=(latest.graph_path_before||[]).map((n)=>n.node||n).join(' → ');
@@ -500,6 +548,7 @@ async function loadControlPlane(){
       document.getElementById('cp-path-after').textContent='After: '+after;
       document.getElementById('cp-diff-expl').textContent='Diff explanation: '+(latest.diff_explanation||'-');
       document.getElementById('cp-code-diff').textContent=latest.code_diff||'No code diff';
+      document.getElementById('cp-reasoning').textContent='Agent reasoning: '+(latest.reasoning||'-');
     }
     document.getElementById('cp-status').textContent='Control-plane synchronized.';
   }catch(_err){
@@ -515,10 +564,40 @@ document.getElementById('cp-seed-btn')?.addEventListener('click', async()=>{
 });
 
 document.getElementById('cp-scan-btn')?.addEventListener('click', async()=>{
-  const resp=await fetch('/api/control-plane/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint_id:'ep-dashboard-demo'})});
+  const endpointInput=document.getElementById('cp-scan-endpoint-input');
+  const endpointId=(endpointInput && endpointInput.value.trim()) || 'ep-dashboard-demo';
+  const resp=await fetch('/api/control-plane/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint_id:endpointId})});
   const data=await resp.json();
   document.getElementById('cp-status').textContent=`Scan complete. findings=${(data.findings||[]).length}`;
   await loadControlPlane();
+});
+
+
+document.querySelectorAll('.cp-arrow').forEach((arrow)=>{
+  const target=document.getElementById(arrow.dataset.target);
+  let collapsed=false;
+  arrow.addEventListener('click',()=>{ collapsed=!collapsed; setCollapsed(target, collapsed); arrow.textContent=collapsed?'▸':'▾'; });
+});
+
+document.getElementById('cp-add-friend-btn')?.addEventListener('click', async()=>{
+  const name=window.prompt('Friend name');
+  if(!name){return;}
+  await fetch('/api/control-plane/add-friend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  await loadControlPlane();
+});
+
+document.getElementById('cp-add-endpoint-btn')?.addEventListener('click', async()=>{
+  const host=window.prompt('Endpoint host name');
+  if(!host){return;}
+  await fetch('/api/control-plane/add-endpoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host_name:host})});
+  await loadControlPlane();
+});
+
+document.getElementById('cp-scan-endpoint-input')?.addEventListener('input', async(event)=>{
+  const target=event.target;
+  const suggestions=await autocompleteTerms('endpoints', target.value || '');
+  const dl=document.getElementById('cp-endpoint-suggestions');
+  if(dl){ dl.innerHTML=suggestions.map((s)=>`<option value="${s}"></option>`).join(''); }
 });
 
 document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
@@ -965,3 +1044,69 @@ def control_plane_scan():
             "proposals": proposals,
         }
     )
+
+
+@app.get("/api/control-plane/autocomplete")
+def control_plane_autocomplete():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    kind = str(request.args.get("kind", "")).strip().lower()
+    q = str(request.args.get("q", "")).strip().lower()
+    if kind == "endpoints":
+        pool = [e.endpoint_id for e in _control_plane.endpoints.values()] + [e.host_name for e in _control_plane.endpoints.values()]
+    elif kind == "friends":
+        pool = [f.name for f in _control_plane.friends.values()]
+    else:
+        pool = [e.endpoint_id for e in _control_plane.endpoints.values()] + [e.host_name for e in _control_plane.endpoints.values()] + [f.name for f in _control_plane.friends.values()]
+    return jsonify({"suggestions": [v for v in pool if q in v.lower()][:15]})
+
+
+@app.post("/api/control-plane/add-friend")
+def control_plane_add_friend():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "invalid_payload", "message": "name required"}), 400
+    friend = _control_plane.add_friend(
+        {
+            "name": name,
+            "identity_type": "user",
+            "identity_method": "sso",
+            "capabilities": ["approve_patches"],
+            "expiry": "2030-01-01T00:00:00Z",
+        },
+        actor="dashboard",
+    )
+    return jsonify(_control_plane.as_dict(friend)), 201
+
+
+@app.post("/api/control-plane/add-endpoint")
+def control_plane_add_endpoint():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    host_name = str(payload.get("host_name", "")).strip()
+    if not host_name:
+        return jsonify({"error": "invalid_payload", "message": "host_name required"}), 400
+    endpoint = _control_plane.add_endpoint(
+        {
+            "host_name": host_name,
+            "endpoint_type": "on-prem",
+            "os": "linux",
+            "kernel": "unknown",
+            "sbom_status": "unknown",
+            "enrollment_method": "manual",
+            "installed_packages": {},
+        },
+        actor="dashboard",
+    )
+    return jsonify(_control_plane.as_dict(endpoint)), 201

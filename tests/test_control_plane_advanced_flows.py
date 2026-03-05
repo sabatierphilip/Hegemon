@@ -77,6 +77,7 @@ def test_friend_endpoint_vulnerability_and_patch_flow(tmp_path: Path):
     proposal = proposal_resp.get_json()
     assert proposal["approvals_required"] == 2
     assert proposal["graph_path_before"][-1]["node"] == "CVE-2026-0001"
+    assert "reasoning" in proposal and proposal["reasoning"]
 
     apply_before = client.post(f"/patch-proposals/{proposal['proposal_id']}/apply", json={"actor": "admin-1"})
     assert apply_before.status_code == 400

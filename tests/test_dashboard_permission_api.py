@@ -477,6 +477,9 @@ def test_dashboard_renders_tabbed_control_plane_view(auth_headers):
     body = resp.get_data(as_text=True)
     assert 'data-tab="control-plane"' in body
     assert "Run Sophisticated Scan" in body
+    assert "cp-add-friend-btn" in body
+    assert "cp-add-endpoint-btn" in body
+    assert "cp-autocomplete-enabled" in body
 
 
 def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
@@ -507,3 +510,20 @@ def test_control_plane_scan_api_seed_and_scan(auth_headers, monkeypatch):
     assert overview.status_code == 200
     overview_payload = overview.get_json()
     assert overview_payload["proposals"]
+
+
+
+def test_control_plane_autocomplete_and_adders(auth_headers):
+    client = app.test_client()
+    seed = client.post('/api/control-plane/demo-seed', json={'seed': True}, headers=auth_headers)
+    assert seed.status_code == 200
+
+    add_friend = client.post('/api/control-plane/add-friend', json={'name': 'SOC Approver'}, headers=auth_headers)
+    assert add_friend.status_code == 201
+
+    add_endpoint = client.post('/api/control-plane/add-endpoint', json={'host_name': 'edge-node-44'}, headers=auth_headers)
+    assert add_endpoint.status_code == 201
+
+    ac = client.get('/api/control-plane/autocomplete?kind=endpoints&q=edge', headers=auth_headers)
+    assert ac.status_code == 200
+    assert any('edge' in x for x in ac.get_json()['suggestions'])

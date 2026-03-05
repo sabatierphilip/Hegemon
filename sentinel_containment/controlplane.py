@@ -111,6 +111,7 @@ class VulnerabilityFinding:
     suggested_remediations: list[str]
     risk_score: float
     graph_path: list[dict[str, Any]] = field(default_factory=list)
+    reasoning: str = ""
 
 
 @dataclass
@@ -132,6 +133,7 @@ class PatchProposal:
     approvals_received: list[str] = field(default_factory=list)
     rollout_policy: dict[str, Any] = field(default_factory=dict)
     status: str = "pending_review"
+    reasoning: str = ""
 
 
 class HegemonControlPlane:
@@ -392,6 +394,7 @@ class HegemonControlPlane:
             suggested_remediations=payload.get("suggested_remediations", []),
             risk_score=risk,
             graph_path=list(payload.get("graph_path", self._build_attack_path(endpoint, payload["cve"], 0.6))),
+            reasoning=str(payload.get("reasoning", "")),
         )
         self.findings[finding.finding_id] = finding
         self._record("vulnerability.detected", {"actor": actor, "finding": asdict(finding)})
@@ -415,6 +418,7 @@ class HegemonControlPlane:
                             if "fixed" in event:
                                 fixed.append(event["fixed"])
                 target_version = fixed[0] if fixed else "latest"
+                chain_summary = f"MTRE chain drift={chain_risk:.2f}; package={package}; age_days={age_days:.0f}"
                 evidence = [
                     {"type": "osv_live_query", "package": package, "version": version, "cve": cve},
                     {"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk},
@@ -432,6 +436,7 @@ class HegemonControlPlane:
                         "evidence": evidence,
                         "suggested_remediations": [f"upgrade {package} to {target_version}", "restart impacted services"],
                         "graph_path": self._build_attack_path(endpoint, cve, chain_risk),
+                        "reasoning": chain_summary,
                     },
                     actor,
                 )
@@ -500,6 +505,11 @@ class HegemonControlPlane:
             code_diff=code_diff,
             diff_explanation=diff_explanation,
             rollout_policy={"rings": ["canary", "staging", "production"], "rollback_on": ["healthcheck_failure", "error_rate_spike"]},
+            reasoning=(
+                f"Agent MTRE reasoning: risk={finding.risk_score}, impact={impact}, "
+                f"regression={regression_risk}, confidence={confidence}. "
+                f"Source: {finding.reasoning or 'live-osv+kill-chain'}"
+            ),
         )
         self.patch_proposals[proposal_id] = proposal
         self._record("patch.proposed", {"actor": actor, "proposal": asdict(proposal)})
