@@ -79,6 +79,7 @@ PACKAGE_TO_FRIENDLY_APP: dict[str, dict[str, str]] = {
     "curl": {"name": "curl", "icon": "🌐", "store_id": "store-linux", "publisher": "curl"},
     "wget": {"name": "wget", "icon": "📥", "store_id": "store-linux", "publisher": "GNU"},
     "python3": {"name": "Python 3", "icon": "🐍", "store_id": "store-linux", "publisher": "Python Software Foundation"},
+    "anthropic": {"name": "Anthropic SDK", "icon": "🤖", "store_id": "store-linux", "publisher": "Anthropic"},
     "nodejs": {"name": "Node.js", "icon": "🟢", "store_id": "store-linux", "publisher": "OpenJS"},
     "docker": {"name": "Docker", "icon": "🐳", "store_id": "store-linux", "publisher": "Docker"},
     "containerd": {"name": "containerd", "icon": "📦", "store_id": "store-linux", "publisher": "CNCF"},
@@ -1444,6 +1445,25 @@ class HegemonControlPlane:
             },
         )
         return discovered
+
+
+    def discover_new_issues(
+        self,
+        endpoint_id: str,
+        actor: str = "autonomous-scanner",
+        include_external_intel: bool = False,
+    ) -> list[VulnerabilityFinding]:
+        prior_cves = {
+            finding.cve
+            for finding in self.findings.values()
+            if finding.endpoint_id == endpoint_id
+        }
+        discovered = self.run_vulnerability_scan(
+            endpoint_id,
+            actor=actor,
+            include_external_intel=include_external_intel,
+        )
+        return [finding for finding in discovered if finding.cve not in prior_cves]
 
     def run_autonomous_self_patch(self) -> dict[str, Any]:
         if HEGEMON_SELF_ENDPOINT_ID not in self.endpoints:
