@@ -289,6 +289,39 @@ def apply_patch(proposal_id: str):
     return jsonify(CONTROL_PLANE.as_dict(proposal))
 
 
+
+
+@app.get("/friendly-stores")
+def list_friendly_stores():
+    return jsonify([CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.friendly_stores.values()])
+
+
+@app.post("/friendly-stores")
+def add_friendly_store():
+    body = request.get_json(force=True, silent=False)
+    actor = body.get("actor", "system")
+    try:
+        store = CONTROL_PLANE.add_friendly_store(body, actor)
+    except (ValueError, KeyError) as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(CONTROL_PLANE.as_dict(store)), 201
+
+
+@app.get("/friendly-apps")
+def list_friendly_apps():
+    return jsonify([CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.friendly_apps.values()])
+
+
+@app.post("/friendly-apps")
+def add_friendly_app():
+    body = request.get_json(force=True, silent=False)
+    actor = body.get("actor", "system")
+    try:
+        app_obj = CONTROL_PLANE.add_friendly_app(body, actor)
+    except (ValueError, KeyError) as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(CONTROL_PLANE.as_dict(app_obj)), 201
+
 @app.get("/entity-graph")
 def entity_graph():
     return jsonify(CONTROL_PLANE.export_graph())
@@ -307,6 +340,8 @@ def control_plane_preview():
         endpoints=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.endpoints.values()],
         findings=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.findings.values()],
         proposals=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.patch_proposals.values()],
+        stores=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.friendly_stores.values()],
+        apps=[CONTROL_PLANE.as_dict(v) for v in CONTROL_PLANE.friendly_apps.values()],
     )
 
 def main() -> int:

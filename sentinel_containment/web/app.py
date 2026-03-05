@@ -880,6 +880,8 @@ def control_plane_overview():
             "endpoints": [_control_plane.as_dict(v) for v in _control_plane.endpoints.values()],
             "findings": [_control_plane.as_dict(v) for v in _control_plane.findings.values()],
             "proposals": [_control_plane.as_dict(v) for v in _control_plane.patch_proposals.values()],
+            "stores": [_control_plane.as_dict(v) for v in _control_plane.friendly_stores.values()],
+            "apps": [_control_plane.as_dict(v) for v in _control_plane.friendly_apps.values()],
             "ledger_health": _control_plane.ledger_health(),
         }
     )
@@ -920,6 +922,18 @@ def control_plane_demo_seed():
                 "asset_value": 9.4,
                 "trust_level": 6.0,
                 "installed_packages": {"openssl": "3.0.2", "glibc": "2.37", "openssh": "9.3"},
+            },
+            actor="dashboard",
+        )
+    if "app-dashboard-nginx" not in _control_plane.friendly_apps:
+        _control_plane.add_friendly_app(
+            {
+                "app_id": "app-dashboard-nginx",
+                "name": "Nginx",
+                "icon": "🌐",
+                "store_id": "store-linux",
+                "publisher": "NGINX Inc.",
+                "version": "1.25.5",
             },
             actor="dashboard",
         )

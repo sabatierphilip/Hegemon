@@ -177,3 +177,36 @@ def test_app_store_endpoint_requires_signature(tmp_path: Path):
     )
     assert resp.status_code == 400
     assert "publisher_signature" in resp.get_json()["message"]
+
+
+def test_friendly_store_and_app_management_defaults_and_add(tmp_path: Path):
+    client = _client(tmp_path)
+    stores = client.get('/friendly-stores')
+    assert stores.status_code == 200
+    store_payload = stores.get_json()
+    assert any(s['store_id'] == 'store-windows' for s in store_payload)
+    assert any(s['store_id'] == 'store-apple' for s in store_payload)
+
+    add_store = client.post('/friendly-stores', json={
+        'actor': 'admin-1',
+        'store_id': 'store-internal',
+        'name': 'Internal Signed Store',
+        'icon': '🏢',
+        'platform': 'linux',
+    })
+    assert add_store.status_code == 201
+
+    add_app = client.post('/friendly-apps', json={
+        'actor': 'admin-1',
+        'app_id': 'app-observability-agent',
+        'name': 'Observability Agent',
+        'icon': '📈',
+        'store_id': 'store-internal',
+        'publisher': 'Acme Security',
+        'version': '4.3.1',
+    })
+    assert add_app.status_code == 201
+
+    apps = client.get('/friendly-apps')
+    assert apps.status_code == 200
+    assert any(a['app_id'] == 'app-observability-agent' for a in apps.get_json())
