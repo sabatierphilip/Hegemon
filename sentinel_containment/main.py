@@ -959,6 +959,26 @@ def run_cycle(
             immediate=immediate_honeypot_containment,
         )
 
+        # A.1 FIX: allowlist SSH targets to registered endpoints only
+        registered_cfg = settings.get("registered_endpoints", [])
+        _registered_hostnames = {str(v).strip().lower() for v in registered_cfg if str(v).strip()}
+        for node in topology.get("nodes", []):
+            host_name = str(node.get("host") or node.get("host_name") or "").strip().lower()
+            if host_name:
+                _registered_hostnames.add(host_name)
+        if target_host.lower() not in _registered_hostnames:
+            logger.error(
+                "SSH containment target %r is not a registered endpoint — "
+                "possible telemetry injection attack. Aborting containment.",
+                target_host,
+            )
+            audit.append(
+                "containment.ssh_target_rejected",
+                {"target_host": target_host, "reason": "not_in_registered_endpoints"},
+            )
+            target_host = "rejected-unknown-host"
+            simulation_mode = True
+
         containment_result = containment.execute(
             host=target_host,
             severity=candidate_severity,

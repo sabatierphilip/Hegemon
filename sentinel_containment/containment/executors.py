@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -13,6 +14,8 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from sentinel_containment.config import Settings
 
 
 _HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)[a-zA-Z0-9._-]+(?<!-)$")
@@ -331,6 +334,17 @@ class ContainmentActionExecutor:
                 details={"reason": "invalid_remote_host", "host": host, "remote_host": remote_host},
             )
 
+        try:
+            parsed = ipaddress.ip_address(remote_host)
+            if parsed.is_loopback or parsed.is_private:
+                return ActionExecutionResult(
+                    action="execute_remote_ssh_containment",
+                    status="skipped",
+                    details={"reason": "loopback_or_rfc1918_target_rejected", "host": remote_host},
+                )
+        except ValueError:
+            pass
+
         allowed = {
             "snapshot": "sudo /usr/local/bin/sentinel_snapshot --emit-json",
             "lockdown": "sudo /usr/local/bin/sentinel_lockdown --mode emergency",
@@ -371,7 +385,11 @@ class ContainmentActionExecutor:
         joined_commands = " && ".join(allowed[name] for name in requested)
         known_hosts_path = self._state_file(payload, "ssh_known_hosts_path", "containment_ssh/known_hosts")
         strict_host_key_checking = str(payload.get("ssh_strict_host_key_checking", "yes")).strip() or "yes"
-        allow_insecure_tofu = bool(payload.get("allow_insecure_tofu", False))
+        try:
+            _settings = Settings.load()
+            allow_insecure_tofu = bool(_settings.get("containment_ssh_allow_insecure_tofu", False))
+        except Exception:
+            allow_insecure_tofu = False
         if allow_insecure_tofu:
             strict_host_key_checking = "accept-new"
 

@@ -5,6 +5,15 @@ import hashlib
 import json
 import os
 import secrets
+import shelve
+import sre_parse
+import subprocess
+import threading
+import time
+import re
+import sys
+import shutil
+import math
 from collections import defaultdict
 import urllib.error
 import urllib.parse
@@ -12,34 +21,126 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from nacl import signing
 
 from signed_ledger import SignedLedger
+from sentinel_containment.store_client import StoreClient, StoreSearchResult
+
+try:
+    import requests
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
+
+try:
+    import networkx as nx
+    _NETWORKX_AVAILABLE = True
+except ImportError:
+    _NETWORKX_AVAILABLE = False
+
+try:
+    from pgmpy.models import BayesianNetwork
+    from pgmpy.factors.discrete import TabularCPD
+    from pgmpy.inference import VariableElimination
+    _PGMPY_AVAILABLE = True
+except ImportError:
+    _PGMPY_AVAILABLE = False
 
 CRITICAL_CAPABILITIES = {"approve_firmware", "approve_hypervisor", "revoke"}
 
 KILL_CHAIN_STAGES = [
     "recon",
+    "resource_development",
     "initial_access",
     "execution",
     "persistence",
     "privilege_escalation",
     "defense_evasion",
     "credential_access",
+    "discovery",
     "lateral_movement",
     "collection",
+    "command_and_control",
     "exfiltration",
     "impact",
 ]
 
-DEFAULT_FRIENDLY_STORES: list[dict[str, str]] = [
-    {"store_id": "store-windows", "name": "Microsoft Store", "icon": "🪟", "platform": "windows"},
-    {"store_id": "store-linux", "name": "Linux Package Repos", "icon": "🐧", "platform": "linux"},
-    {"store_id": "store-apple", "name": "Apple App Store", "icon": "🍎", "platform": "apple"},
-    {"store_id": "store-steam", "name": "Steam", "icon": "🎮", "platform": "cross-platform"},
+STAGE_TO_TACTIC: dict[str, str] = {
+    "recon": "TA0043",
+    "resource_development": "TA0042",
+    "initial_access": "TA0001",
+    "execution": "TA0002",
+    "persistence": "TA0003",
+    "privilege_escalation": "TA0004",
+    "defense_evasion": "TA0005",
+    "credential_access": "TA0006",
+    "discovery": "TA0007",
+    "lateral_movement": "TA0008",
+    "collection": "TA0009",
+    "command_and_control": "TA0011",
+    "exfiltration": "TA0010",
+    "impact": "TA0040",
+}
+
+BASE_DWELL_DAYS = {
+    "recon": 14, "resource_development": 7, "initial_access": 3,
+    "execution": 1, "persistence": 2, "privilege_escalation": 2,
+    "defense_evasion": 3, "credential_access": 2, "discovery": 4,
+    "lateral_movement": 5, "collection": 3, "command_and_control": 7,
+    "exfiltration": 2, "impact": 1,
+}
+
+ISSUE_TO_TECHNIQUES: dict[str, list[str]] = {
+    "tainted-cmd-exec": ["T1059.004", "T1059.006"],
+    "tainted-sql-query": ["T1190"],
+    "hardcoded-secret": ["T1552.001"],
+    "weak-rng-auth": ["T1110.001"],
+    "dynamic-exec": ["T1059.006"],
+    "pickle-loads": ["T1059.006", "T1204.002"],
+    "yaml-unsafe-load": ["T1059.006"],
+    "weak-hash": ["T1600"],
+    "shell-true": ["T1059.004"],
+    "open-redirect": ["T1550.001"],
+    "path-traversal": ["T1083"],
+    "ssrf": ["T1090.002"],
+    "xxe": ["T1059.006"],
+    "prototype-pollution": ["T1211"],
+    "regex-dos": ["T1499.004"],
+    "insecure-deserialization": ["T1059.006", "T1204.002"],
+    "jwt-none-alg": ["T1552.004"],
+    "cors-wildcard": ["T1185"],
+    "unvalidated-redirect": ["T1550.001"],
+    "hardcoded-ip": ["T1071"],
+    "cleartext-credential": ["T1552.002"],
+    "missing-tls-verify": ["T1040"],
+    "tainted-template": ["T1190"],
+    "race-condition-toctou": ["T1499"],
+    "integer-overflow": ["T1499"],
+    "format-string": ["T1059"],
+    "interprocedural-sink-reachability": ["T1059"],
+}
+
+PROTECTED_FILES = {
+    "signed_ledger.py", "controlplane.py", "security/hardware_keys.py",
+    "security/peer_mesh.py", "web/app.py",
+}
+
+STORE_REGISTRY: list[dict[str, Any]] = [
+    {"store_id": "store-apple", "name": "Apple App Store", "icon": "🍎", "platform": "apple", "trust_tier": "verified", "verification_method": "apple_notarization", "metadata_api": "https://itunes.apple.com/search", "search_param": "term", "result_path": ["results"], "name_field": "trackName", "publisher_field": "artistName", "version_field": "version", "bundle_id_field": "bundleId", "category_field": "primaryGenreName", "icon_field": "artworkUrl100"},
+    {"store_id": "store-windows", "name": "Microsoft Store", "icon": "🪟", "platform": "windows", "trust_tier": "verified", "verification_method": "microsoft_signature", "metadata_api": "https://storeedgefd.dsx.mp.microsoft.com/v9.0/products", "search_param": "query", "result_path": ["Products"], "name_field": "Title", "publisher_field": "PublisherName", "version_field": "Version", "icon_field": "Images"},
+    {"store_id": "store-google-play", "name": "Google Play Store", "icon": "🤖", "platform": "android", "trust_tier": "verified", "verification_method": "google_play_protect", "metadata_api": "https://play.google.com/store/search", "search_param": "q", "result_path": [], "name_field": "title", "publisher_field": "developer", "version_field": "version"},
+    {"store_id": "store-pypi", "name": "PyPI", "icon": "🐍", "platform": "python", "trust_tier": "community", "verification_method": "sha256_checksum", "metadata_api": "https://pypi.org/pypi/{package}/json", "search_api": "https://pypi.org/search/?q={query}&o=&c=&format=json", "name_field": "info.name", "publisher_field": "info.author", "version_field": "info.version", "home_field": "info.home_page"},
+    {"store_id": "store-npm", "name": "npm", "icon": "📦", "platform": "javascript", "trust_tier": "community", "verification_method": "sha512_integrity", "metadata_api": "https://registry.npmjs.org/{package}", "search_api": "https://registry.npmjs.org/-/v1/search?text={query}&size=10", "name_field": "name", "publisher_field": "author.name", "version_field": "dist-tags.latest"},
+    {"store_id": "store-linux", "name": "Linux Package Repos", "icon": "🐧", "platform": "linux", "trust_tier": "verified", "verification_method": "gpg_signed_package", "metadata_api": "https://repology.org/api/v1/project/{package}", "search_api": "https://repology.org/api/v1/projects/?search={query}&limit=10", "name_field": "package", "publisher_field": "maintainer", "version_field": "newest_version"},
+    {"store_id": "store-homebrew", "name": "Homebrew", "icon": "🍺", "platform": "macos", "trust_tier": "community", "verification_method": "sha256_checksum", "metadata_api": "https://formulae.brew.sh/api/formula/{package}.json", "search_api": "https://formulae.brew.sh/api/formula.json", "name_field": "name", "publisher_field": "homepage", "version_field": "versions.stable"},
+    {"store_id": "store-nuget", "name": "NuGet", "icon": "🔷", "platform": "dotnet", "trust_tier": "community", "verification_method": "nuget_signature", "metadata_api": "https://api.nuget.org/v3/registration5/{package}/index.json", "search_api": "https://azuresearch-usnc.nuget.org/query?q={query}&take=10", "name_field": "id", "publisher_field": "authors", "version_field": "version"},
+    {"store_id": "store-steam", "name": "Steam", "icon": "🎮", "platform": "cross-platform", "trust_tier": "verified", "verification_method": "steam_signature", "metadata_api": "https://store.steampowered.com/api/appdetails", "search_api": "https://store.steampowered.com/api/storesearch/?term={query}&cc=US&l=en", "name_field": "name", "publisher_field": "publisher", "version_field": "release_date.date"},
+    {"store_id": "store-github", "name": "GitHub Releases", "icon": "🐙", "platform": "cross-platform", "trust_tier": "community", "verification_method": "gpg_tag_signature", "metadata_api": "https://api.github.com/repos/{owner}/{repo}/releases/latest", "search_api": "https://api.github.com/search/repositories?q={query}&sort=stars&per_page=10", "name_field": "name", "publisher_field": "owner.login", "version_field": "tag_name"},
 ]
+
+DEFAULT_FRIENDLY_STORES: list[dict[str, Any]] = STORE_REGISTRY
 
 
 DEFAULT_FRIENDLY_ENDPOINTS: list[dict[str, Any]] = [
@@ -115,6 +216,11 @@ class FriendlyStore:
     name: str
     icon: str
     platform: str
+    trust_tier: str = "community"
+    verification_method: str = "unknown"
+    metadata_api: str = ""
+    icon_url: str = ""
+    publisher_allowlist_url: str = ""
     status: str = "active"
 
 
@@ -171,8 +277,46 @@ class VulnerabilityFinding:
     poc_attack_map: dict[str, Any] = field(default_factory=dict)
     remediation_plan: list[dict[str, Any]] = field(default_factory=list)
     vulnerability_explanation: str = ""
+    bayesian_stage_risk: dict[str, float] = field(default_factory=dict)
+    techniques: list[str] = field(default_factory=list)
+    source: str = "friendly-scan"
+    patch_eligible: bool = True
+    cvss_vector: str = ""
+    epss_score: float = 0.0
+    epss_percentile: float = 0.0
+    remediation_sla_tier: str = "p2"
+    exploitability_timeline_days: float = 0.0
 
 
+@dataclass
+class ScanResult:
+    scan_id: str = ""
+    target_id: str = ""
+    mode: str = "friendly"
+    actor: str = "user"
+    started_at: str = ""
+    completed_at: str = ""
+    duration_seconds: float = 0.0
+    findings: list[VulnerabilityFinding] = field(default_factory=list)
+    new_findings: list[VulnerabilityFinding] = field(default_factory=list)
+    suppressed: int = 0
+    intel_sources: list[str] = field(default_factory=list)
+    ast_files_scanned: int = 0
+    ast_issues_raw: int = 0
+    ast_issues_confirmed: int = 0
+    patch_proposals_generated: int = 0
+    patches_applied: int = 0
+    patches_rolled_back: int = 0
+    markov_tree: list[dict[str, Any]] = field(default_factory=list)
+    bayesian_posteriors: dict[str, float] = field(default_factory=dict)
+    attack_surface_delta: dict[str, Any] = field(default_factory=dict)
+    scan_confidence: float = 0.0
+    lateral_graph: dict[str, Any] = field(default_factory=dict)
+    lang_breakdown: dict[str, int] = field(default_factory=dict)
+    binary_artefacts_scanned: int = 0
+    binary_packed_sections: int = 0
+    cross_language_chains: list[dict[str, Any]] = field(default_factory=list)
+    disassembly_backend: str | None = None
 
 
 @dataclass
@@ -215,14 +359,33 @@ class HegemonControlPlane:
         self.findings: dict[str, VulnerabilityFinding] = {}
         self.patch_proposals: dict[str, PatchProposal] = {}
         self.friendly_stores: dict[str, FriendlyStore] = {
-            row["store_id"]: FriendlyStore(**row) for row in DEFAULT_FRIENDLY_STORES
+            row["store_id"]: FriendlyStore(
+                store_id=row["store_id"],
+                name=str(row.get("name", "unknown")),
+                icon=str(row.get("icon", "🏪")),
+                platform=str(row.get("platform", "unknown")),
+                trust_tier=str(row.get("trust_tier", "community")),
+                verification_method=str(row.get("verification_method", "unknown")),
+                metadata_api=str(row.get("metadata_api", "")),
+                icon_url=str(row.get("icon_url", "")),
+                publisher_allowlist_url=str(row.get("publisher_allowlist_url", "")),
+                status="active",
+            )
+            for row in DEFAULT_FRIENDLY_STORES
         }
         self.friendly_apps: dict[str, FriendlyApp] = {}
+        self._state_lock = threading.RLock()
         self._seed_default_friendly_entities()
         self._seed_self_endpoint()
         self.auto_patch_policy = AutoPatchPolicy()
         self.human_review_queue: list[str] = []
         self._proposal_approved_at: dict[str, float] = {}
+        self.scan_history: dict[str, list[ScanResult]] = {}
+        self.scan_results_by_id: dict[str, ScanResult] = {}
+        self.suppressed_findings: list[dict[str, Any]] = []
+        self._allow_absolute_program_roots: bool = False
+        self.store_client = StoreClient()
+        self._self_scan_loop = self.SelfScanLoop(self)
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         entry = self.ledger.append(event_type, payload)
@@ -291,6 +454,7 @@ class HegemonControlPlane:
     def _seed_self_endpoint(self) -> None:
         if HEGEMON_SELF_ENDPOINT_ID in self.endpoints:
             return
+        self._allow_absolute_program_roots = True
         self.add_endpoint(
             {
                 "endpoint_id": HEGEMON_SELF_ENDPOINT_ID,
@@ -314,6 +478,7 @@ class HegemonControlPlane:
             },
             actor="bootstrap:self",
         )
+        self._allow_absolute_program_roots = False
 
     def _autodiscover_friendly_apps_from_endpoint(self, endpoint: Endpoint, actor: str) -> None:
         for package, version in endpoint.installed_packages.items():
@@ -354,6 +519,19 @@ class HegemonControlPlane:
 
     def add_endpoint(self, payload: dict[str, Any], actor: str) -> Endpoint:
         endpoint_id = payload.get("endpoint_id") or f"ep-{secrets.token_hex(4)}"
+        _PKG_NAME_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9._\-]{0,127}[a-zA-Z0-9])?$")
+        _PKG_VER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._\-+:]{0,63}$")
+        raw_packages = dict(payload.get("installed_packages", {}))
+        installed_packages: dict[str, str] = {}
+        for k, v in raw_packages.items():
+            ks, vs = str(k).strip(), str(v).strip()
+            if _PKG_NAME_RE.match(ks) and _PKG_VER_RE.match(vs):
+                installed_packages[ks] = vs
+        program_root = (str(payload.get("program_root")) if payload.get("program_root") else None)
+        store_id = str(payload.get("store_id", "")).strip()
+        if not program_root and store_id and installed_packages:
+            pkg_name = next(iter(installed_packages.keys()))
+            program_root = self._detect_program_root(pkg_name, store_id)
         endpoint = Endpoint(
             endpoint_id=endpoint_id,
             host_name=payload["host_name"],
@@ -370,18 +548,20 @@ class HegemonControlPlane:
             network_exposure=payload.get("network_exposure", "internal"),
             asset_value=float(payload.get("asset_value", 7.0)),
             trust_level=float(payload.get("trust_level", 6.0)),
-            installed_packages=dict(payload.get("installed_packages", {})),
+            installed_packages=installed_packages,
             telemetry_events=list(payload.get("telemetry_events", [])),
-            program_root=(str(payload.get("program_root")) if payload.get("program_root") else None),
+            program_root=program_root,
         )
         if endpoint.protection_mode not in {"observe-only", "canary", "enforce"}:
             raise ValueError("invalid protection_mode; expected one of observe-only|canary|enforce")
         if endpoint.endpoint_type == "app-store-package" and not endpoint.publisher_signature:
             raise ValueError("app-store-package endpoints require publisher_signature")
-        self.endpoints[endpoint.endpoint_id] = endpoint
+        with self._state_lock:
+            self.endpoints[endpoint.endpoint_id] = endpoint
         self._record("endpoint.added", {"actor": actor, "endpoint": asdict(endpoint)})
         self._autodiscover_friendly_apps_from_endpoint(endpoint, actor=f"{actor}:autodiscovery")
         return endpoint
+
 
     @staticmethod
     def _parse_version(version: str) -> tuple[int, ...]:
@@ -499,29 +679,135 @@ class HegemonControlPlane:
         return 7.0
 
     @staticmethod
-    def _kill_chain_transition_markov(events: list[str]) -> tuple[dict[str, dict[str, float]], float]:
-        matrix: dict[str, dict[str, float]] = {stage: {} for stage in KILL_CHAIN_STAGES}
+    def _kill_chain_markov_second_order(
+        events: list[str],
+    ) -> tuple[dict[tuple[str, str], dict[str, float]], dict[str, float], float]:
         index = {stage: i for i, stage in enumerate(KILL_CHAIN_STAGES)}
-        if len(events) < 2:
-            return matrix, 0.2
-        counts: dict[tuple[str, str], int] = {}
-        total = 0
-        riskiness = 0.0
-        for a, b in zip(events, events[1:]):
-            if a not in index or b not in index:
-                continue
-            counts[(a, b)] = counts.get((a, b), 0) + 1
-            total += 1
+        alpha = 0.1
+        trigram_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+        bigram_counts: dict[tuple[str, str], int] = defaultdict(int)
+        unigram_counts: dict[str, int] = defaultdict(int)
+        weights: list[float] = []
+        valid_events = [e for e in events if e in index]
+        for a, b in zip(valid_events, valid_events[1:]):
             jump = index[b] - index[a]
-            riskiness += 1.4 if jump >= 2 else (1.0 if jump == 1 else 0.3)
-        if total == 0:
-            return matrix, 0.2
-        by_src: dict[str, int] = {}
-        for (a, _b), c in counts.items():
-            by_src[a] = by_src.get(a, 0) + c
-        for (a, b), c in counts.items():
-            matrix[a][b] = round(c / by_src[a], 3)
-        return matrix, min(riskiness / total, 1.8)
+            if jump >= 3:
+                weights.append(2.0)
+            elif jump == 2:
+                weights.append(1.4)
+            elif jump == 1:
+                weights.append(1.0)
+            elif jump == 0:
+                weights.append(0.5)
+            else:
+                weights.append(-0.3)
+            bigram_counts[(a, b)] += 1
+            unigram_counts[a] += 1
+        if valid_events:
+            unigram_counts[valid_events[-1]] += 1
+        for a, b, c in zip(valid_events, valid_events[1:], valid_events[2:]):
+            trigram_counts[(a, b, c)] += 1
+        trans: dict[tuple[str, str], dict[str, float]] = {}
+        for state, state_count in bigram_counts.items():
+            trans[state] = {}
+            denom = state_count + alpha * len(KILL_CHAIN_STAGES)
+            for nxt in KILL_CHAIN_STAGES:
+                c = trigram_counts.get((state[0], state[1], nxt), 0)
+                trans[state][nxt] = round((c + alpha) / denom, 6)
+        total_uni = sum(unigram_counts.values())
+        marg = {k: (round(v / total_uni, 6) if total_uni else 0.0) for k, v in unigram_counts.items()}
+        chain_risk = min(3.0, (sum(weights) / max(1, len(weights))) if weights else 0.2)
+        return trans, marg, chain_risk
+
+    @staticmethod
+    def _kill_chain_transition_markov(events: list[str]) -> tuple[dict[str, dict[str, float]], float]:
+        second, _marg, risk = HegemonControlPlane._kill_chain_markov_second_order(events)
+        matrix: dict[str, dict[str, float]] = {stage: {} for stage in KILL_CHAIN_STAGES}
+        by_src: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        for (a, _b), next_probs in second.items():
+            for nxt, prob in next_probs.items():
+                by_src[a][nxt] += prob
+        for a, rows in by_src.items():
+            total = sum(rows.values())
+            if total <= 0:
+                continue
+            matrix[a] = {k: round(v / total, 3) for k, v in rows.items() if v > 0}
+        return matrix, risk
+
+    def _markov_tree_project(
+        self,
+        events: list[str],
+        depth: int = 4,
+        top_k: int = 3,
+        min_prob: float = 0.05,
+    ) -> list[dict[str, Any]]:
+        second, first, _ = self._kill_chain_markov_second_order(events)
+        valid_events = [e for e in events if e in KILL_CHAIN_STAGES]
+
+        def expand(prev: str | None, cur: str, cur_prob: float, d: int) -> dict[str, Any]:
+            node = {
+                "stage": cur,
+                "tactic_id": STAGE_TO_TACTIC.get(cur, ""),
+                "cumulative_prob": round(cur_prob, 6),
+                "depth": d,
+                "expected_dwell_days": round(BASE_DWELL_DAYS.get(cur, 3) * (1.0 / max(0.01, cur_prob)), 2),
+                "children": [],
+            }
+            if d >= depth:
+                return node
+            probs: dict[str, float]
+            if prev is not None and (prev, cur) in second:
+                probs = second[(prev, cur)]
+            else:
+                probs = {st: first.get(st, 0.0) for st in KILL_CHAIN_STAGES}
+            ranked = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+            for nxt, p in ranked:
+                next_prob = cur_prob * p
+                if next_prob < min_prob:
+                    continue
+                node["children"].append(expand(cur, nxt, next_prob, d + 1))
+            return node
+
+        if len(valid_events) >= 2:
+            prev, cur = valid_events[-2], valid_events[-1]
+        elif len(valid_events) == 1:
+            prev, cur = None, valid_events[-1]
+        else:
+            prev, cur = None, "recon"
+        return [expand(prev, cur, 1.0, 0)]
+
+    def _build_bayesian_kill_chain_net(self, events: list[str]) -> Any | None:
+        if not _PGMPY_AVAILABLE:
+            return None
+        try:
+            edges = [(KILL_CHAIN_STAGES[i], KILL_CHAIN_STAGES[i + 1]) for i in range(len(KILL_CHAIN_STAGES) - 1)] + [("recon", "execution"), ("recon", "lateral_movement")]
+            model = BayesianNetwork(edges)
+            cpds = []
+            for st in KILL_CHAIN_STAGES:
+                cpds.append(TabularCPD(variable=st, variable_card=2, values=[[0.7], [0.3]]))
+            model.add_cpds(*cpds)
+            return model
+        except Exception:
+            return None
+
+    def _bayesian_stage_posterior(self, observed_stages: list[str]) -> dict[str, float]:
+        if not _PGMPY_AVAILABLE:
+            return {}
+        model = self._build_bayesian_kill_chain_net(observed_stages)
+        if model is None:
+            return {}
+        out: dict[str, float] = {}
+        try:
+            inf = VariableElimination(model)
+            evidence = {st: 1 for st in observed_stages if st in KILL_CHAIN_STAGES}
+            for st in KILL_CHAIN_STAGES:
+                if st in evidence:
+                    continue
+                q = inf.query([st], evidence=evidence, show_progress=False)
+                out[st] = float(q.values[1])
+        except Exception:
+            return {}
+        return out
 
     def _build_attack_path(self, endpoint: Endpoint, cve: str, chain_risk: float) -> list[dict[str, Any]]:
         perimeter = "external_attacker" if endpoint.network_exposure == "internet" else "partner_network"
@@ -624,6 +910,7 @@ class HegemonControlPlane:
             float(payload.get("asset_value", endpoint.asset_value)),
             float(payload.get("trust_level", endpoint.trust_level)),
         )
+        bayesian = payload.get("bayesian_stage_risk", {})
         finding = VulnerabilityFinding(
             finding_id=finding_id,
             endpoint_id=payload["endpoint_id"],
@@ -638,6 +925,15 @@ class HegemonControlPlane:
             risk_score=risk,
             graph_path=list(payload.get("graph_path", self._build_attack_path(endpoint, payload["cve"], 0.6))),
             reasoning=str(payload.get("reasoning", "")),
+            bayesian_stage_risk=dict(bayesian) if isinstance(bayesian, dict) else {},
+            techniques=list(payload.get("techniques", [])),
+            source=str(payload.get("source", "friendly-scan")),
+            patch_eligible=bool(payload.get("patch_eligible", True)),
+            cvss_vector=str(payload.get("cvss_vector", "")),
+            epss_score=float(payload.get("epss_score", 0.0)),
+            epss_percentile=float(payload.get("epss_percentile", 0.0)),
+            remediation_sla_tier=str(payload.get("remediation_sla_tier", "p2")),
+            exploitability_timeline_days=float(payload.get("exploitability_timeline_days", 0.0)),
         )
         finding.poc_attack_map = self._build_poc_attack_map(endpoint, finding.cve, finding.evidence, finding.risk_score, finding.graph_path)
         finding.remediation_plan = self._build_remediation_plan(endpoint, payload, finding.risk_score)
@@ -648,7 +944,8 @@ class HegemonControlPlane:
             finding.evidence,
             finding.topological_impact,
         )
-        self.findings[finding.finding_id] = finding
+        with self._state_lock:
+            self.findings[finding.finding_id] = finding
         self._record("vulnerability.detected", {"actor": actor, "finding": asdict(finding)})
         return finding
 
@@ -659,7 +956,7 @@ class HegemonControlPlane:
         except ValueError:
             return str(path)
 
-    def _analyze_program_structure(self, program_root: str | None) -> dict[str, Any]:
+    def _analyze_program_structure(self, program_root: str | None, languages: list[str] | None = None) -> dict[str, Any]:
         if not program_root:
             return {
                 "files_scanned": 0,
@@ -671,6 +968,26 @@ class HegemonControlPlane:
             }
 
         root = Path(program_root).resolve()
+        # A.3 FIX: contain program_root to project working directory
+        _allowed_base = Path(".").resolve()
+        try:
+            root.relative_to(_allowed_base)
+        except ValueError:
+            if not getattr(self, "_allow_absolute_program_roots", False):
+                return {
+                    "files_scanned": 0,
+                    "issues": [],
+                    "ast_confidence": 0.0,
+                    "graph_alignment": 0.0,
+                    "markov_kill_chain": 0.0,
+                    "program_graph": {"modules": 0, "functions": 0, "call_edges": 0, "entrypoints": []},
+                    "error": f"program_root {root} is outside the allowed project directory",
+                    "lang_breakdown": {},
+                    "binary_artefacts_scanned": 0,
+                    "binary_packed_sections": 0,
+                    "cross_language_chains": [],
+                    "disassembly_backend": None,
+                }
         if not root.exists() or not root.is_dir():
             return {
                 "files_scanned": 0,
@@ -693,6 +1010,7 @@ class HegemonControlPlane:
         imports_graph: dict[str, set[str]] = defaultdict(set)
         issues: list[dict[str, Any]] = []
         module_trees: dict[str, ast.AST] = {}
+        module_aliases: dict[str, dict[str, str]] = defaultdict(dict)
 
         def node_name(node: ast.AST) -> str:
             if isinstance(node, ast.Name):
@@ -805,6 +1123,7 @@ class HegemonControlPlane:
             issues.append(
                 {
                     "issue_id": issue_id,
+                    "lang": "python",
                     "severity": severity,
                     "kill_chain_stage": stage,
                     "reconstructed_kill_chain": reconstructed_chain,
@@ -817,6 +1136,10 @@ class HegemonControlPlane:
                     "patch_hint": patch,
                     "dataflow_path": dataflow_path or [],
                     "call_path": call_path or [],
+                    "techniques": ISSUE_TO_TECHNIQUES.get(issue_id, []),
+                    "binary_offset": None,
+                    "section_name": None,
+                    "entropy": None,
                 }
             )
 
@@ -833,8 +1156,13 @@ class HegemonControlPlane:
                 if isinstance(node, ast.Import):
                     for alias in node.names:
                         imports_graph[module_name].add(alias.name.split(".")[0])
+                        local = alias.asname or alias.name.split(".")[0]
+                        module_aliases[module_name][local] = alias.name
                 elif isinstance(node, ast.ImportFrom):
                     imports_graph[module_name].add((node.module or "").split(".")[0])
+                    for alias in node.names:
+                        local = alias.asname or alias.name
+                        module_aliases[module_name][local] = f"{node.module}.{alias.name}" if node.module else alias.name
 
         function_profiles: dict[str, dict[str, Any]] = {}
         call_graph: dict[str, set[str]] = defaultdict(set)
@@ -871,6 +1199,15 @@ class HegemonControlPlane:
                     continue
                 fn_qname = f"{module_name}:{node.name}"
                 tainted_vars = {arg.arg for arg in node.args.args}
+                safe_exec_vars: set[str] = set()
+                aliases = module_aliases.get(module_name, {})
+                def resolved(name: str) -> str:
+                    if name in aliases:
+                        return aliases[name]
+                    parts = name.split(".")
+                    if parts and parts[0] in aliases:
+                        return aliases[parts[0]] + ("." + ".".join(parts[1:]) if len(parts) > 1 else "")
+                    return name
                 source_hits: list[str] = []
                 sink_hits: list[str] = []
                 returns_tainted = False
@@ -885,6 +1222,8 @@ class HegemonControlPlane:
                                 var_name = target.id.lower()
                                 if tainted_from_expr(value, tainted_vars, local_calls_tainted):
                                     tainted_vars.add(target.id)
+                                if isinstance(value, ast.Call) and resolved(node_name(value.func)) == "compile":
+                                    safe_exec_vars.add(target.id)
                                 if isinstance(value, ast.Constant) and isinstance(value.value, str) and len(value.value) >= 18:
                                     secret_hit, tuning_details, tuned_confidence = _hardcoded_secret_signal(target.id, value.value)
                                     if secret_hit:
@@ -906,28 +1245,37 @@ class HegemonControlPlane:
                                             call_path=[fn_qname],
                                         )
                     elif isinstance(child, ast.Call):
-                        func_name = node_name(child.func)
+                        func_name = resolved(node_name(child.func))
                         called_names.add(func_name)
                         line = getattr(child, "lineno", 1)
                         if func_name in {"input", "request.args.get", "request.form.get", "request.get_json", "os.environ.get"}:
                             source_hits.append(func_name)
                         if func_name in {"eval", "exec"}:
-                            add_issue(
-                                "dynamic-exec",
-                                "high",
-                                "execution",
-                                root / module_name,
-                                line,
-                                0.9,
-                                "Dynamic code execution can become an RCE pivot when attacker-controlled data reaches the sink.",
-                                "Replace eval/exec with deterministic parser and allowlisted operation dispatch.",
-                                details=["Execution sink accepts code-like input at runtime."],
-                                tags=["rce-surface"],
-                                dataflow_path=["tainted_input_or_code", func_name],
-                                call_path=[fn_qname, func_name],
-                            )
-                            sink_hits.append(func_name)
-                            risky_sink_functions.add(fn_qname)
+                            arg0 = child.args[0] if child.args else None
+                            should_flag = False
+                            if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
+                                should_flag = True
+                            elif isinstance(arg0, ast.Name) and arg0.id in tainted_vars and arg0.id not in safe_exec_vars:
+                                should_flag = True
+                            elif isinstance(arg0, ast.Call) and resolved(node_name(arg0.func)) == "compile":
+                                should_flag = False
+                            if should_flag:
+                                add_issue(
+                                    "dynamic-exec",
+                                    "high",
+                                    "execution",
+                                    root / module_name,
+                                    line,
+                                    0.9,
+                                    "Dynamic code execution can become an RCE pivot when attacker-controlled data reaches the sink.",
+                                    "Replace eval/exec with deterministic parser and allowlisted operation dispatch.",
+                                    details=["Execution sink accepts code-like input at runtime."],
+                                    tags=["rce-surface"],
+                                    dataflow_path=["tainted_input_or_code", func_name],
+                                    call_path=[fn_qname, func_name],
+                                )
+                                sink_hits.append(func_name)
+                                risky_sink_functions.add(fn_qname)
                         if func_name.endswith("subprocess.run") or func_name.endswith("subprocess.Popen") or func_name == "os.system":
                             shell_true = func_name == "os.system"
                             for kw in child.keywords:
@@ -972,7 +1320,7 @@ class HegemonControlPlane:
                                 )
                                 sink_hits.append(func_name)
                                 risky_sink_functions.add(fn_qname)
-                        if func_name in {"pickle.loads", "loads"}:
+                        if func_name == "pickle.loads":
                             add_issue(
                                 "pickle-loads",
                                 "high",
@@ -1009,6 +1357,11 @@ class HegemonControlPlane:
                                 sink_hits.append(func_name)
                                 risky_sink_functions.add(fn_qname)
                         if func_name in {"hashlib.md5", "hashlib.sha1", "md5", "sha1"}:
+                            nlow = node.name.lower()
+                            if any(tok in nlow for tok in {"digest", "etag", "cache_key", "checksum", "fingerprint", "hmac"}) or any(a.arg in {"algorithm", "alg"} for a in node.args.args):
+                                continue
+                            if any(resolved(node_name(a.func)) in {"hmac.new", "hmac.digest"} for a in ast.walk(node) if isinstance(a, ast.Call)):
+                                continue
                             add_issue(
                                 "weak-hash",
                                 "medium",
@@ -1067,6 +1420,22 @@ class HegemonControlPlane:
                                     call_path=[fn_qname, func_name],
                                 )
 
+                        # additional detectors
+                        if func_name in {"open", "pathlib.Path", "os.path.join", "os.path.abspath"} and child.args:
+                            if tainted_from_expr(child.args[0], tainted_vars, local_calls_tainted):
+                                add_issue("path-traversal", "high", "discovery", root / module_name, line, 0.86, "Tainted path reaches filesystem sink.", "Normalize with os.path.basename and enforce allowlisted roots.")
+                        if func_name in {"requests.get", "requests.post", "requests.put", "requests.delete", "requests.request", "urllib.request.urlopen", "httpx.get", "httpx.post", "aiohttp.ClientSession"} and child.args:
+                            if tainted_from_expr(child.args[0], tainted_vars, local_calls_tainted):
+                                add_issue("ssrf", "critical", "initial_access", root / module_name, line, 0.92, "Tainted URL reaches outbound HTTP sink.", "Validate URL host against an allowlist before dispatch.")
+                        if func_name in {"jwt.decode", "pyjwt.decode"}:
+                            alg_kw = next((kw for kw in child.keywords if kw.arg == "algorithms"), None)
+                            bad = alg_kw is None
+                            if alg_kw and isinstance(alg_kw.value, ast.List):
+                                vals = [getattr(v, "value", None) for v in alg_kw.value.elts if isinstance(v, ast.Constant)]
+                                bad = "none" in [str(v).lower() for v in vals]
+                            if bad:
+                                add_issue("jwt-none-alg", "critical", "credential_access", root / module_name, line, 0.95, "JWT decode missing strict algorithms allowlist.", "Set algorithms=['HS256'] (or approved list) and disallow 'none'.")
+
                     elif isinstance(child, ast.Return):
                         if child.value and tainted_from_expr(child.value, tainted_vars, local_calls_tainted):
                             returns_tainted = True
@@ -1120,6 +1489,43 @@ class HegemonControlPlane:
                         call_path=[fn_qname, callee],
                     )
 
+        extra_issues: list[dict[str, Any]] = []
+        binary_artefacts_scanned = 0
+        binary_packed_sections = 0
+        disassembly_backend: str | None = None
+        for candidate in root.rglob("*"):
+            if candidate.is_dir() or any(part in {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache"} for part in candidate.parts):
+                continue
+            rel = self._safe_relpath(candidate, root)
+            name = candidate.name.lower()
+            suf = candidate.suffix.lower()
+            try:
+                if suf in {".js", ".ts", ".mjs", ".cjs"}:
+                    extra_issues.extend(self._analyze_js_file(candidate, rel))
+                elif suf in {".sh", ".bash", ".zsh"}:
+                    extra_issues.extend(self._analyze_shell_file(candidate, rel))
+                elif name.startswith("dockerfile"):
+                    extra_issues.extend(self._analyze_dockerfile(candidate, rel))
+                elif suf in {".yaml", ".yml", ".json"}:
+                    extra_issues.extend(self._analyze_config_file(candidate, rel))
+                elif candidate.is_file() and suf in {".so", ".exe", ".dll", ".bin", ".o", ""}:
+                    try:
+                        head = candidate.read_bytes()[:4]
+                    except OSError:
+                        head = b""
+                    if head in {b"\x7fELF", b"MZ\x90\x00", b"MZ"}:
+                        binary_artefacts_scanned += 1
+                        b_issues, packed_count, backend = self._analyze_binary_file(candidate, rel)
+                        extra_issues.extend(b_issues)
+                        binary_packed_sections += packed_count
+                        disassembly_backend = disassembly_backend or backend
+            except Exception:
+                continue
+        issues.extend(extra_issues)
+        lang_breakdown: dict[str, int] = defaultdict(int)
+        for issue in issues:
+            lang_breakdown[str(issue.get("lang", "python"))] += 1
+
         severity_weight = {"low": 0.25, "medium": 0.55, "high": 0.82, "critical": 1.0}
         issue_conf = [float(i["confidence"]) * severity_weight.get(str(i["severity"]), 0.55) for i in issues] or [0.0]
         ast_confidence = round(min(0.99, sum(issue_conf) / len(issue_conf) + (0.10 if issues else 0.0)), 3)
@@ -1149,7 +1555,205 @@ class HegemonControlPlane:
                 "entrypoints": entrypoints,
                 "tainted_return_functions": len(tainted_return_functions),
             },
+            "lang_breakdown": dict(lang_breakdown),
+            "binary_artefacts_scanned": binary_artefacts_scanned,
+            "binary_packed_sections": binary_packed_sections,
+            "cross_language_chains": self._build_cross_language_taint_chains(issues),
+            "disassembly_backend": disassembly_backend,
         }
+
+    def _detect_program_root(self, package_name: str, store_id: str) -> str | None:
+        candidates: list[Path] = []
+        try:
+            if store_id in {"store-pypi", "store-linux"}:
+                for sp in sys.path:
+                    p = Path(sp) / package_name
+                    if p.is_dir():
+                        candidates.append(p)
+                try:
+                    result = subprocess.run([sys.executable, "-m", "pip", "show", package_name], capture_output=True, text=True, timeout=5)
+                    for line in result.stdout.splitlines():
+                        if line.startswith("Location:"):
+                            loc = Path(line.split(":", 1)[1].strip()) / package_name
+                            if loc.is_dir():
+                                candidates.append(loc)
+                except Exception:
+                    pass
+            if store_id == "store-npm":
+                for base in [Path("node_modules"), Path("/usr/local/lib/node_modules"), Path.home() / ".npm" / "lib" / "node_modules"]:
+                    p = base / package_name
+                    if p.is_dir():
+                        candidates.append(p)
+            if store_id == "store-homebrew":
+                brew = shutil.which("brew")
+                if brew:
+                    try:
+                        result = subprocess.run([brew, "--prefix", package_name], capture_output=True, text=True, timeout=5)
+                        if result.returncode == 0:
+                            p = Path(result.stdout.strip())
+                            if p.is_dir():
+                                candidates.append(p)
+                    except Exception:
+                        pass
+            if store_id == "store-linux":
+                for cmd in [["dpkg", "-L", package_name], ["rpm", "-ql", package_name]]:
+                    if shutil.which(cmd[0]):
+                        try:
+                            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                            paths = [Path(l.strip()) for l in result.stdout.splitlines() if l.strip()]
+                            dirs = [q.parent for q in paths if q.suffix in {".py", ".rb", ".js", ".go"}]
+                            if dirs:
+                                candidates.append(min(dirs, key=lambda d: len(d.parts)))
+                        except Exception:
+                            pass
+            blocked = {Path("/etc"), Path("/root"), Path("/sys"), Path("/proc")}
+            for c in candidates:
+                try:
+                    resolved = c.resolve()
+                    if resolved.is_dir() and not any(str(resolved).startswith(str(b)) for b in blocked):
+                        return str(resolved)
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    def register_store_endpoint(self, query: str, store_id: str, version: str | None, network_exposure: str, asset_value: float, actor: str) -> dict[str, Any]:
+        meta = self.store_client.get_metadata(query, store_id, version)
+        if meta is None:
+            suggestions = [r.__dict__ for r in self.store_client.search(query, [store_id], limit=5)]
+            raise KeyError(json.dumps({"not_found": query, "suggestions": suggestions}))
+        package_name = re.sub(r"[^a-zA-Z0-9._-]", "-", meta.name.lower()).strip("-") or "package"
+        endpoint_id = f"ep-{package_name[:40]}"
+        detected = self._detect_program_root(package_name, store_id)
+        endpoint = self.add_endpoint({
+            "endpoint_id": endpoint_id,
+            "host_name": meta.name,
+            "endpoint_type": "app-store-package",
+            "os": "linux",
+            "kernel": "unknown",
+            "sbom_status": "unknown",
+            "enrollment_method": "store-import",
+            "publisher_signature": meta.publisher,
+            "network_exposure": network_exposure,
+            "asset_value": float(asset_value),
+            "installed_packages": {package_name: version or meta.version or "latest"},
+            "program_root": detected,
+            "store_id": store_id,
+        }, actor=actor)
+        app = self.add_friendly_app({"name": meta.name, "icon": meta.icon_url or "📦", "store_id": store_id, "publisher": meta.publisher, "version": version or meta.version or "latest"}, actor=actor)
+        scan_id = None
+        triggered = False
+        if detected:
+            triggered = True
+            scan_id = f"scan-{secrets.token_hex(4)}"
+            def _bg() -> None:
+                try:
+                    self.scan(endpoint.endpoint_id, mode="friendly", actor=f"{actor}:store")
+                except Exception:
+                    return
+            threading.Thread(target=_bg, daemon=True).start()
+        self._record("store.endpoint_registered", {"actor": actor, "endpoint_id": endpoint.endpoint_id, "store_id": store_id, "program_root": detected, "scan_triggered": triggered, "scan_id": scan_id})
+        return {"endpoint": endpoint, "friendly_app": app, "program_root_detected": detected, "store_metadata": meta, "scan_triggered": triggered, "scan_id": scan_id}
+
+    def _analyze_js_file(self, path: Path, rel: str) -> list[dict[str, Any]]:
+        issues=[]
+        try:
+            lines=path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        except OSError:
+            return issues
+        for i,l in enumerate(lines,1):
+            ll=l.lower()
+            if 'eval(' in ll or 'function(' in ll and 'user' in ll:
+                issues.append({"issue_id":"js-dynamic-exec","lang":"javascript","severity":"high","kill_chain_stage":"execution","reconstructed_kill_chain":["initial_access","execution","impact"],"techniques":["T1059.007"],"file":rel,"line":i,"confidence":0.78,"reasoning":"Dynamic JS execution pattern.","reasoning_details":[],"tags":["js"],"patch_hint":"Avoid eval/Function; use safe parser.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+            if 'innerhtml' in ll or 'document.write(' in ll:
+                issues.append({"issue_id":"js-dom-xss","lang":"javascript","severity":"high","kill_chain_stage":"execution","reconstructed_kill_chain":["initial_access","execution","impact"],"techniques":["T1059.007"],"file":rel,"line":i,"confidence":0.74,"reasoning":"Potential DOM XSS sink.","reasoning_details":[],"tags":["js"],"patch_hint":"Use textContent and sanitize HTML.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+        return issues
+
+    def _analyze_shell_file(self, path: Path, rel: str) -> list[dict[str, Any]]:
+        issues=[]
+        try: lines=path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        except OSError: return issues
+        has_set=False
+        for i,l in enumerate(lines,1):
+            ll=l.strip().lower()
+            if ll.startswith('set -e') or ll.startswith('set -u'):
+                has_set=True
+            if 'curl ' in ll and '| bash' in ll or 'wget ' in ll and '| sh' in ll:
+                issues.append({"issue_id":"shell-curl-pipe-exec","lang":"shell","severity":"critical","kill_chain_stage":"execution","reconstructed_kill_chain":["initial_access","execution","impact"],"techniques":["T1059.004"],"file":rel,"line":i,"confidence":0.88,"reasoning":"Remote script piped to shell.","reasoning_details":[],"tags":["shell"],"patch_hint":"Download, verify signature/hash, then execute.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+            if 'chmod 777' in ll:
+                issues.append({"issue_id":"shell-world-writable","lang":"shell","severity":"medium","kill_chain_stage":"defense_evasion","reconstructed_kill_chain":["execution","persistence","impact"],"techniques":["T1222"],"file":rel,"line":i,"confidence":0.7,"reasoning":"World writable permission grant.","reasoning_details":[],"tags":["shell"],"patch_hint":"Use least-privilege chmod values.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+        if not has_set:
+            issues.append({"issue_id":"shell-missing-errexit","lang":"shell","severity":"medium","kill_chain_stage":"defense_evasion","reconstructed_kill_chain":["execution","defense_evasion"],"techniques":["T1562"],"file":rel,"line":1,"confidence":0.66,"reasoning":"Script lacks strict mode.","reasoning_details":[],"tags":["shell"],"patch_hint":"Add 'set -eu' near top of script.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+        return issues
+
+    def _analyze_dockerfile(self, path: Path, rel: str) -> list[dict[str, Any]]:
+        issues=[]
+        try: lines=path.read_text(encoding='utf-8', errors='ignore').splitlines()
+        except OSError: return issues
+        has_user=False
+        for i,l in enumerate(lines,1):
+            ll=l.strip().lower()
+            if ll.startswith('from ') and ':latest' in ll:
+                issues.append({"issue_id":"dockerfile-mutable-base-tag","lang":"dockerfile","severity":"high","kill_chain_stage":"resource_development","reconstructed_kill_chain":["resource_development","initial_access"],"techniques":["T1195"],"file":rel,"line":i,"confidence":0.82,"reasoning":"Mutable base image tag used.","reasoning_details":[],"tags":["docker"],"patch_hint":"Pin digest or immutable tag.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+            if ll.startswith('user '):
+                has_user=True
+                if 'root' in ll:
+                    issues.append({"issue_id":"dockerfile-runs-as-root","lang":"dockerfile","severity":"high","kill_chain_stage":"privilege_escalation","reconstructed_kill_chain":["execution","privilege_escalation"],"techniques":["T1611"],"file":rel,"line":i,"confidence":0.8,"reasoning":"Container runs as root.","reasoning_details":[],"tags":["docker"],"patch_hint":"Set non-root USER.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+        if not has_user:
+            issues.append({"issue_id":"dockerfile-runs-as-root","lang":"dockerfile","severity":"high","kill_chain_stage":"privilege_escalation","reconstructed_kill_chain":["execution","privilege_escalation"],"techniques":["T1611"],"file":rel,"line":1,"confidence":0.75,"reasoning":"No USER directive; defaults to root.","reasoning_details":[],"tags":["docker"],"patch_hint":"Add USER nonroot.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+        return issues
+
+    def _analyze_config_file(self, path: Path, rel: str) -> list[dict[str, Any]]:
+        issues=[]
+        try: text=path.read_text(encoding='utf-8', errors='ignore')
+        except OSError: return issues
+        lines=text.splitlines()
+        for i,l in enumerate(lines,1):
+            ll=l.lower()
+            if '"alg"' in ll and 'none' in ll:
+                issues.append({"issue_id":"config-jwt-none-alg","lang":"config","severity":"critical","kill_chain_stage":"credential_access","reconstructed_kill_chain":["initial_access","credential_access"],"techniques":["T1552.004"],"file":rel,"line":i,"confidence":0.9,"reasoning":"JWT none algorithm in config.","reasoning_details":[],"tags":["config"],"patch_hint":"Set strong JWT algorithm and verify signatures.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+            if ('ssl_verify' in ll or 'verify_ssl' in ll or 'tls_verify' in ll) and 'false' in ll:
+                issues.append({"issue_id":"config-tls-disabled","lang":"config","severity":"high","kill_chain_stage":"defense_evasion","reconstructed_kill_chain":["initial_access","defense_evasion"],"techniques":["T1557"],"file":rel,"line":i,"confidence":0.83,"reasoning":"TLS verification disabled in configuration.","reasoning_details":[],"tags":["config"],"patch_hint":"Enable TLS certificate validation.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+        return issues
+
+    def _section_entropy(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+        freq = [0] * 256
+        for b in data:
+            freq[b] += 1
+        n = len(data)
+        return -sum((f / n) * math.log2(f / n) for f in freq if f > 0)
+
+    def _analyze_binary_file(self, path: Path, rel: str) -> tuple[list[dict[str, Any]], int, str | None]:
+        issues=[]
+        backend=None
+        try:
+            blob=path.read_bytes()
+        except OSError:
+            return issues,0,None
+        entropy=self._section_entropy(blob[: min(len(blob), 200000)])
+        if entropy > 7.2:
+            issues.append({"issue_id":"binary-packed-or-encrypted-section","lang":"binary","severity":"high","kill_chain_stage":"defense_evasion","reconstructed_kill_chain":["execution","defense_evasion","impact"],"techniques":["T1027"],"file":rel,"line":1,"confidence":0.7,"reasoning":"High entropy binary section indicates packing/encryption.","reasoning_details":[],"tags":["binary"],"patch_hint":"Verify binary provenance and unpack for review.","dataflow_path":[],"call_path":[],"binary_offset":0,"section_name":"whole-file","entropy":round(entropy,3)})
+        patterns=[(r"(?i)(password|passwd|secret|apikey|api_key|token|bearer)\s*[=:]\s*\S{8,}","binary-hardcoded-credential","critical"),(r"-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----","binary-embedded-private-key","critical")]
+        text=blob.decode('utf-8', errors='ignore')
+        for pat,iid,sev in patterns:
+            m=re.search(pat,text)
+            if m:
+                issues.append({"issue_id":iid,"lang":"binary","severity":sev,"kill_chain_stage":"credential_access","reconstructed_kill_chain":["initial_access","credential_access","impact"],"techniques":["T1552"],"file":rel,"line":1,"confidence":0.72,"reasoning":"Sensitive string found in binary.","reasoning_details":[],"tags":["binary"],"patch_hint":"Remove embedded secrets from binary artifacts.","dataflow_path":[],"call_path":[],"binary_offset":m.start(),"section_name":"strings","entropy":round(entropy,3)})
+        if shutil.which('objdump'):
+            backend='objdump'
+        return issues, int(entropy>7.2), backend
+
+    def _build_cross_language_taint_chains(self, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        chains=[]
+        writers=[i for i in issues if i.get('lang')=='python' and 'path' in str(i.get('issue_id',''))]
+        readers=[i for i in issues if i.get('lang') in {'shell','javascript','binary'}]
+        for w in writers[:3]:
+            for r in readers[:3]:
+                chains.append({"from": {"file": w.get("file"), "issue": w.get("issue_id")}, "to": {"file": r.get("file"), "issue": r.get("issue_id")}, "type": "cross_language_hint"})
+        return chains
 
     def _structural_risk_fingerprint(self, endpoint: Endpoint, package: str, version: str, chain_risk: float, structural_report: dict[str, Any]) -> dict[str, Any]:
         base_score = 0.58 if package.startswith("hegemon") else 0.46
@@ -1715,6 +2319,342 @@ class HegemonControlPlane:
                     applied += 1
                     self._record("patch.auto_applied", {"proposal_id": proposal.proposal_id, "delay_seconds": int(ts - approved_at)})
         return {"approved": approved, "applied": applied, "queued": queued}
+
+    def run_vulnerability_scan(self, endpoint_id: str, actor: str = "scanner", include_external_intel: bool = True) -> list[VulnerabilityFinding]:
+        with self._state_lock:
+            endpoint = self.endpoints[endpoint_id]
+        discovered: list[VulnerabilityFinding] = []
+        markov, chain_risk = self._kill_chain_transition_markov(endpoint.telemetry_events)
+        structural_report = self._analyze_program_structure(endpoint.program_root)
+        for package, version in endpoint.installed_packages.items():
+            candidates: dict[str, dict[str, Any]] = {}
+            for vuln in (self._query_osv(package, version, endpoint.os) if include_external_intel else []):
+                cve = str(vuln.get("id", "UNKNOWN-CVE"))
+                if not cve:
+                    continue
+                candidates[cve] = {"cve": cve, "cvss": self._cvss_from_vuln(vuln), "age_days": self._published_age_days(vuln), "target_version": "latest", "sources": ["osv"], "evidence": [{"type": "osv_live_query", "package": package, "version": version, "cve": cve}]}
+            for vuln in (self._query_nvd(package, version, endpoint.os) if include_external_intel else []):
+                cve = str(vuln.get("id", "UNKNOWN-CVE"))
+                if not cve:
+                    continue
+                row = candidates.setdefault(cve, {"cve": cve, "cvss": self._cvss_from_nvd(vuln), "age_days": self._published_age_days(vuln), "target_version": "latest", "sources": [], "evidence": []})
+                row["cvss"] = max(float(row.get("cvss", 0.0)), self._cvss_from_nvd(vuln))
+                row["sources"] = sorted(set(list(row.get("sources", [])) + ["nvd"]))
+            if include_external_intel:
+                ghsa_nodes = self._query_ghsa(package, self._guess_ecosystem(package, endpoint.os))
+                for node in ghsa_nodes:
+                    ghsa = (node.get("advisory") or {}).get("ghsaId", "GHSA-UNKNOWN")
+                    cve = ghsa
+                    row = candidates.setdefault(cve, {"cve": cve, "cvss": 7.0, "age_days": 120.0, "target_version": ((node.get("firstPatchedVersion") or {}).get("identifier") or "latest"), "sources": [], "evidence": []})
+                    row["sources"] = sorted(set(list(row.get("sources", [])) + ["ghsa"]))
+            for candidate in candidates.values():
+                structural = self._structural_risk_fingerprint(endpoint, package, version, chain_risk, structural_report)
+                double_checks = len(set(candidate.get("sources", []))) + int(structural["confirmations"])
+                if double_checks < 2:
+                    self.suppressed_findings.append({"cve": candidate["cve"], "endpoint_id": endpoint_id, "suppressed_at": datetime.now(timezone.utc).isoformat(), "reason": "double_check_gate", "double_checks": double_checks, "sources": candidate.get("sources", []), "structural_confirmations": structural["confirmations"]})
+                    continue
+                age_days = float(candidate.get("age_days", 365.0))
+                epss_score, epss_percentile = self._query_epss(candidate["cve"])
+                exploit_availability = min(10.0, round(3.0 + max(0.0, (365 - min(age_days, 365))) / 120 + chain_risk * 2.1 + epss_score * 3.5, 2))
+                evidence = list(candidate.get("evidence", []))
+                if self._query_exploitdb_confirmed(candidate["cve"]):
+                    exploit_availability = max(exploit_availability, 9.2)
+                    evidence.append({"type": "public-exploit-confirmed", "tag": "public-exploit-confirmed"})
+                evidence.append({"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk})
+                finding = self.create_finding({"endpoint_id": endpoint_id, "cve": candidate["cve"], "cvss": float(candidate.get("cvss", 7.0)), "exploit_availability": exploit_availability, "topological_impact": 6.8 if endpoint.network_exposure == "internet" else 5.2, "asset_value": endpoint.asset_value, "trust_level": endpoint.trust_level, "evidence": evidence, "suggested_remediations": [f"Upgrade {package} to {candidate.get('target_version', 'latest')}"]}, actor=actor)
+                finding.epss_score = epss_score
+                finding.epss_percentile = epss_percentile
+                discovered.append(finding)
+        for issue in structural_report.get("issues", []):
+            cve = f"HEGEMON-AST-{str(issue.get('issue_id', 'unknown')).upper()}"
+            finding = self.create_finding({"endpoint_id": endpoint_id, "cve": cve, "cvss": 8.8 if issue.get("severity") == "critical" else 7.0, "exploit_availability": 7.5, "topological_impact": 6.1, "asset_value": endpoint.asset_value, "trust_level": endpoint.trust_level, "evidence": [{"type": "ast_issue", **issue}], "suggested_remediations": [issue.get("patch_hint", "Apply secure coding controls")], "reasoning": issue.get("reasoning", "")}, actor=actor)
+            finding.techniques = issue.get("techniques", ISSUE_TO_TECHNIQUES.get(str(issue.get("issue_id", "")), []))
+            discovered.append(finding)
+        return discovered
+
+    def discover_new_issues(self, endpoint_id: str, actor: str = "autonomous-scanner", include_external_intel: bool = False) -> list[VulnerabilityFinding]:
+        with self._state_lock:
+            prior_cves = {finding.cve for finding in self.findings.values() if finding.endpoint_id == endpoint_id}
+        discovered = self.run_vulnerability_scan(endpoint_id, actor=actor, include_external_intel=include_external_intel)
+        return [finding for finding in discovered if finding.cve not in prior_cves]
+
+    def run_autonomous_self_patch(self) -> dict[str, Any]:
+        if HEGEMON_SELF_ENDPOINT_ID not in self.endpoints:
+            return {"generated": 0, "applied": 0}
+        findings = self.run_vulnerability_scan(HEGEMON_SELF_ENDPOINT_ID, actor="hegemon-self-scanner", include_external_intel=False)
+        generated = applied = 0
+        for finding in findings:
+            proposal = next((p for p in self.patch_proposals.values() if p.finding_id == finding.finding_id), None)
+            if proposal is None:
+                proposal = self.generate_patch_proposal(finding.finding_id, actor="hegemon-self-patcher")
+                generated += 1
+            if finding.cvss >= 8.5:
+                if proposal.proposal_id not in self.human_review_queue:
+                    self.human_review_queue.append(proposal.proposal_id)
+                self._record("patch.human_required", {"proposal_id": proposal.proposal_id, "priority": "p0"})
+                continue
+            if proposal.confidence >= 0.72 and proposal.regression_risk <= 2.0 and proposal.approvals_required == 1 and proposal.status == "pending_review":
+                self.approve_patch(proposal.proposal_id, "hegemon-self-approver")
+            if proposal.status == "approved":
+                self.apply_patch(proposal.proposal_id, "hegemon-self-patcher")
+                applied += 1
+        self._record("patch.self_autonomous", {"generated": generated, "applied": applied})
+        return {"generated": generated, "applied": applied}
+
+    def _intel_cache_get(self, key: str) -> Any | None:
+        cache_path = Path("data/intel_cache.shelve")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        try:
+            with shelve.open(str(cache_path)) as db:
+                row = db.get(key)
+                if not row:
+                    return None
+                if now - float(row.get("ts", 0)) > 86400:
+                    return None
+                return row.get("value")
+        except Exception:
+            return None
+
+    def _intel_cache_set(self, key: str, value: Any) -> None:
+        cache_path = Path("data/intel_cache.shelve")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with shelve.open(str(cache_path)) as db:
+                db[key] = {"ts": time.time(), "value": value}
+        except Exception:
+            return
+
+    def _query_ghsa(self, package: str, ecosystem: str) -> list[dict[str, Any]]:
+        query = {
+            "query": "query($pkg:String!, $eco:SecurityAdvisoryEcosystem!){ securityVulnerabilities(first:10, ecosystem:$eco, package:$pkg){ nodes{ advisory{ ghsaId severity publishedAt } firstPatchedVersion{identifier} vulnerableVersionRange } } }",
+            "variables": {"pkg": package, "eco": ecosystem.upper()},
+        }
+        headers = {"Content-Type": "application/json"}
+        token = os.getenv("GITHUB_TOKEN", "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            req = urllib.request.Request("https://api.github.com/graphql", data=json.dumps(query).encode(), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return data.get("data", {}).get("securityVulnerabilities", {}).get("nodes", []) or []
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+            return []
+
+    def _query_epss(self, cve_id: str) -> tuple[float, float]:
+        ck = f"epss:{cve_id}"
+        cached = self._intel_cache_get(ck)
+        if cached:
+            return float(cached.get("epss", 0.0)), float(cached.get("percentile", 0.0))
+        try:
+            with urllib.request.urlopen(f"https://api.first.org/data/v1/epss?cve={urllib.parse.quote(cve_id)}", timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            row = (data.get("data") or [{}])[0]
+            out = {"epss": float(row.get("epss", 0.0)), "percentile": float(row.get("percentile", 0.0))}
+            self._intel_cache_set(ck, out)
+            return out["epss"], out["percentile"]
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+            return 0.0, 0.0
+
+    def _query_exploitdb_confirmed(self, cve_id: str) -> bool:
+        ck = f"exploitdb:{cve_id}"
+        cached = self._intel_cache_get(ck)
+        if cached is not None:
+            return bool(cached)
+        try:
+            req = urllib.request.Request(f"https://www.exploit-db.com/search?cve={urllib.parse.quote(cve_id)}&type=exploits", headers={"Accept": "application/json"}, method="GET")
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            confirmed = bool((data.get("data") or []))
+            self._intel_cache_set(ck, confirmed)
+            return confirmed
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception):
+            return False
+
+    def _diff_scan_results(self, endpoint_id: str, current_findings: list[VulnerabilityFinding]) -> tuple[list[VulnerabilityFinding], list[VulnerabilityFinding], list[VulnerabilityFinding]]:
+        prior = self.scan_history.get(endpoint_id, [])[-1] if self.scan_history.get(endpoint_id) else None
+        if not prior:
+            return current_findings, [], []
+        prev_by = {f.cve: f for f in prior.findings}
+        cur_by = {f.cve: f for f in current_findings}
+        new = [f for c, f in cur_by.items() if c not in prev_by]
+        escalated = [f for c, f in cur_by.items() if c in prev_by and (f.cvss - prev_by[c].cvss) >= 0.5]
+        resolved = []
+        for c, pf in prev_by.items():
+            if c not in cur_by:
+                if any(p.finding_id == pf.finding_id and p.status == "deployed_canary" for p in self.patch_proposals.values()):
+                    resolved.append(pf)
+        return new, resolved, escalated
+
+    def _build_lateral_movement_graph(self) -> dict[str, Any]:
+        nodes = [{"id": ep.endpoint_id, "risk": ep.risk_score, "exposure": ep.network_exposure} for ep in self.endpoints.values()]
+        edges: list[dict[str, Any]] = []
+        for a in self.endpoints.values():
+            for b in self.endpoints.values():
+                if a.endpoint_id == b.endpoint_id:
+                    continue
+                reason = None
+                weight = 0.0
+                if a.network_exposure == "internet" and b.network_exposure == "internal":
+                    reason = "internet_to_internal_pivot"
+                    weight = 1.5
+                shared = set(a.installed_packages).intersection(set(b.installed_packages))
+                if shared and any("lateral_movement" in (f.reasoning or "") for f in self.findings.values() if f.endpoint_id == a.endpoint_id):
+                    reason = reason or "shared_vulnerable_package"
+                    weight = max(weight, 1.2)
+                if reason:
+                    edges.append({"source": a.endpoint_id, "target": b.endpoint_id, "reason": reason, "weight": weight})
+        centrality = {n["id"]: 0.0 for n in nodes}
+        blast_radius = {n["id"]: 0 for n in nodes}
+        highest_path: list[str] = []
+        if _NETWORKX_AVAILABLE:
+            g = nx.DiGraph()
+            for n in nodes:
+                g.add_node(n["id"])
+            for e in edges:
+                g.add_edge(e["source"], e["target"], weight=e["weight"])
+            try:
+                centrality = nx.betweenness_centrality(g)
+                for n in g.nodes:
+                    blast_radius[n] = len(nx.descendants(g, n))
+            except Exception:
+                pass
+        return {"nodes": nodes, "edges": edges, "centrality": centrality, "highest_risk_path": highest_path, "blast_radius": blast_radius}
+
+    def _run_regression_tests(self) -> dict[str, Any]:
+        started = time.time()
+        cmd = ["python", "-m", "pytest", "--tb=no", "-q", "--timeout=30"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=120, text=True)
+            if proc.returncode == 0:
+                return {"passed": True, "tests_run": 1, "failures": [], "duration_s": round(time.time()-started, 3)}
+            if proc.returncode in {1, 2}:
+                return {"passed": False, "tests_run": 1, "failures": [proc.stdout[-400:] or proc.stderr[-400:]], "duration_s": round(time.time()-started, 3)}
+        except Exception:
+            pass
+        return {"passed": False, "tests_run": 0, "failures": ["test runner timed out or failed to launch"], "duration_s": round(time.time()-started, 3)}
+
+    def scan(self, target: str | dict[str, Any], *, mode: Literal["friendly", "unfriendly", "auto"] = "auto", include_external_intel: bool = True, include_ast: bool = True, program_root: str | None = None, actor: str = "user") -> ScanResult:
+        started = datetime.now(timezone.utc)
+        with self._state_lock:
+            if isinstance(target, str):
+                endpoint_id = target
+                endpoint = self.endpoints.get(endpoint_id)
+                if endpoint is None:
+                    raise KeyError(endpoint_id)
+                resolved_mode = "friendly" if mode == "auto" else mode
+            else:
+                endpoint_id = str(target.get("host", "unfriendly-target"))
+                resolved_mode = "unfriendly" if mode == "auto" else mode
+                endpoint = Endpoint(endpoint_id=endpoint_id, host_name=endpoint_id, endpoint_type="external", os=str(target.get("os", "unknown")), kernel="unknown", hypervisor=None, firmware_baseline=None, sbom_status="unknown", enrollment_method="manual", network_exposure=str(target.get("network_exposure", "internet")), installed_packages=dict(target.get("packages", {})), program_root=str(target.get("program_root") or program_root or "") or None)
+
+        structural_report = self._analyze_program_structure(endpoint.program_root) if include_ast else {"files_scanned": 0, "issues": [], "lang_breakdown": {}, "binary_artefacts_scanned": 0, "binary_packed_sections": 0, "cross_language_chains": [], "disassembly_backend": None}
+        findings = self.run_vulnerability_scan(endpoint.endpoint_id, actor=actor, include_external_intel=include_external_intel) if resolved_mode == "friendly" else self._scan_unfriendly(endpoint, actor=actor, include_external_intel=include_external_intel, include_ast=include_ast)
+        new_findings, _resolved, _escalated = self._diff_scan_results(endpoint.endpoint_id, findings)
+        graph = self._build_lateral_movement_graph()
+        for f in findings:
+            reachable = [e["target"] for e in graph.get("edges", []) if e["source"] == endpoint.endpoint_id]
+            f.poc_attack_map.setdefault("blast_radius_estimate", {})["reachable_endpoints"] = reachable
+        mk = self._markov_tree_project(endpoint.telemetry_events if hasattr(endpoint, "telemetry_events") else [])
+        result = ScanResult(scan_id=f"scan-{secrets.token_hex(4)}", target_id=endpoint.endpoint_id, mode=resolved_mode, actor=actor, started_at=started.isoformat(), completed_at=datetime.now(timezone.utc).isoformat(), duration_seconds=round((datetime.now(timezone.utc)-started).total_seconds(), 3), findings=findings, new_findings=new_findings, suppressed=len(self.suppressed_findings), intel_sources=["osv", "nvd", "ghsa", "epss"], ast_files_scanned=int(structural_report.get("files_scanned", 0)), ast_issues_raw=len(structural_report.get("issues", [])), ast_issues_confirmed=len(structural_report.get("issues", [])), markov_tree=mk, bayesian_posteriors={}, attack_surface_delta={"new": len(new_findings)}, scan_confidence=0.8, lateral_graph=graph, lang_breakdown=dict(structural_report.get("lang_breakdown", {})), binary_artefacts_scanned=int(structural_report.get("binary_artefacts_scanned", 0)), binary_packed_sections=int(structural_report.get("binary_packed_sections", 0)), cross_language_chains=list(structural_report.get("cross_language_chains", [])), disassembly_backend=structural_report.get("disassembly_backend"))
+        with self._state_lock:
+            self.scan_results_by_id[result.scan_id] = result
+            self.scan_history.setdefault(endpoint.endpoint_id, []).append(result)
+            self.scan_history[endpoint.endpoint_id] = self.scan_history[endpoint.endpoint_id][-10:]
+        return result
+
+    def schedule_periodic_scan(self, endpoint_id: str, interval_seconds: float, *, include_external_intel: bool = True, actor: str = "scheduler") -> str:
+        job_id = f"job-{secrets.token_hex(4)}"
+        def _runner() -> None:
+            while True:
+                try:
+                    self.scan(endpoint_id, mode="friendly", include_external_intel=include_external_intel, actor=actor)
+                except Exception:
+                    pass
+                time.sleep(interval_seconds)
+        t = threading.Thread(target=_runner, daemon=True)
+        if not hasattr(self, "_scheduled_jobs"):
+            self._scheduled_jobs = {}
+        self._scheduled_jobs[job_id] = t
+        t.start()
+        return job_id
+
+    def cancel_periodic_scan(self, job_id: str) -> bool:
+        # daemon threads are not forcibly cancelled in this lightweight implementation
+        return bool(getattr(self, "_scheduled_jobs", {}).pop(job_id, None))
+
+    def _scan_unfriendly(self, endpoint: Endpoint, actor: str, include_external_intel: bool, include_ast: bool) -> list[VulnerabilityFinding]:
+        discovered: list[VulnerabilityFinding] = []
+        chain = self._kill_chain_transition_markov(endpoint.telemetry_events)[1]
+        for package, version in endpoint.installed_packages.items():
+            for vuln in (self._query_osv(package, version, endpoint.os) if include_external_intel else []):
+                cve = str(vuln.get("id", "UNKNOWN-CVE"))
+                epss, perc = self._query_epss(cve)
+                discovered.append(VulnerabilityFinding(finding_id=f"vuln-{secrets.token_hex(4)}", endpoint_id=endpoint.endpoint_id, cve=cve, cvss=self._cvss_from_vuln(vuln), exploit_availability=round(min(10.0, 3.0 + chain * 2.1 + epss * 3.5), 2), topological_impact=6.0, asset_value=endpoint.asset_value, trust_level=endpoint.trust_level, evidence=[{"type": "unfriendly-scan"}], suggested_remediations=["manual remediation only"], risk_score=6.0, source="unfriendly-scan", patch_eligible=False, epss_score=epss, epss_percentile=perc))
+        return discovered
+
+    class SelfScanLoop:
+        def __init__(self, cp: "HegemonControlPlane"):
+            self.cp = cp
+            self._stop = threading.Event()
+            self._thread: threading.Thread | None = None
+            self.scan_interval_seconds: float = 300.0
+            self.max_interval_seconds: float = 3600.0
+            self.consecutive_errors: int = 0
+            self.last_scan_at: float = 0.0
+            self.last_findings_count: int = 0
+            self.total_patches_applied: int = 0
+            self.total_rolled_back: int = 0
+
+        def start(self) -> None:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+        def stop(self, timeout: float = 5.0) -> None:
+            self._stop.set()
+            if self._thread:
+                self._thread.join(timeout=timeout)
+
+        def _run_one_cycle(self) -> dict[str, Any]:
+            started = time.time()
+            findings = self.cp.discover_new_issues(HEGEMON_SELF_ENDPOINT_ID, include_external_intel=False)
+            self.last_findings_count = len(findings)
+            generated = applied = rolled_back = 0
+            for finding in findings:
+                proposal = self.cp.generate_patch_proposal(finding.finding_id, actor="self-scan-loop")
+                generated += 1
+                if finding.cvss >= 8.5 or any(pf in proposal.code_diff for pf in PROTECTED_FILES):
+                    self.cp.human_review_queue.append(proposal.proposal_id)
+                    self.cp._record("patch.human_required", {"proposal_id": proposal.proposal_id, "priority": "p0"})
+                    continue
+                if proposal.confidence >= 0.72 and proposal.regression_risk <= 2.0 and proposal.approvals_required == 1:
+                    self.cp.approve_patch(proposal.proposal_id, "self-scan-loop")
+                    self.cp.apply_patch(proposal.proposal_id, "self-scan-loop")
+                    applied += 1
+                    test = self.cp._run_regression_tests()
+                    if not test.get("passed"):
+                        proposal.status = "rolled_back"
+                        rolled_back += 1
+            self.cp._record("self_scan.cycle", {"new_findings": len(findings), "proposals_generated": generated, "applied": applied, "rolled_back": rolled_back})
+            self.total_patches_applied += applied
+            self.total_rolled_back += rolled_back
+            self.last_scan_at = time.time()
+            return {"new_findings": len(findings), "proposals_generated": generated, "applied": applied, "rolled_back": rolled_back, "elapsed_seconds": round(time.time()-started, 3)}
+
+        def _loop(self) -> None:
+            while not self._stop.is_set():
+                try:
+                    self._run_one_cycle()
+                    self.consecutive_errors = 0
+                    interval = self.scan_interval_seconds
+                except Exception:
+                    self.consecutive_errors += 1
+                    interval = min(self.max_interval_seconds, self.scan_interval_seconds * (2 ** self.consecutive_errors))
+                self._stop.wait(interval)
 
     def as_dict(self, obj: Any) -> dict[str, Any]:
         if hasattr(obj, "__dataclass_fields__"):

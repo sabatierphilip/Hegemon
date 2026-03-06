@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _runtime: SentinelRuntime | None = None
 _auth_warning_emitted = False
 _control_plane = HegemonControlPlane()
+_AUTOCOMPLETE_CACHE: dict[str, tuple[float, dict]] = {}
 
 
 @dataclass
@@ -363,8 +364,10 @@ HTML = """
         Enable autocomplete suggestions (optional)
       </label>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <input id="cp-scan-endpoint-input" list="cp-endpoint-suggestions" placeholder="endpoint id for scan" style="padding:8px;border-radius:8px;border:1px solid #35508f;background:#0f1528;color:#d8e2ff;" />
-        <datalist id="cp-endpoint-suggestions"></datalist>
+        <div style="position:relative;min-width:320px;flex:1;">
+          <input id="cp-scan-endpoint-input" placeholder="Search apps, packages, endpoints..." style="width:100%;padding:8px;border-radius:8px;border:1px solid #35508f;background:#0f1528;color:#d8e2ff;" />
+          <div id="cp-autocomplete-dropdown" style="display:none;position:absolute;z-index:30;left:0;right:0;top:38px;background:#0f1528;border:1px solid #35508f;border-radius:8px;max-height:260px;overflow:auto;"></div>
+        </div>
         <button id="cp-seed-btn" style="padding:8px 12px;background:#2a3a68;color:#d8e2ff;border:1px solid #3e5393;border-radius:8px;cursor:pointer;">Seed Demo Endpoint</button>
               </div>
       <div class="cp-subtabs">
@@ -399,6 +402,23 @@ HTML = """
       <div class="json" style="margin-top:8px;"><pre id="cp-code-diff">No code diff generated yet.</pre></div>
       <div class="json" style="margin-top:8px;"><pre id="cp-patch-terminal">No generated patches yet.</pre></div>
     </div>
+
+    <div class="panel">
+      <h3>Add Software to Monitoring</h3>
+      <div class="small" id="store-selected">Selected: none</div>
+      <div class="small" id="store-detected-root">Detected root: unknown</div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+        <select id="store-filter"><option value="">All Stores</option></select>
+        <select id="store-exposure"><option value="internal">Internal</option><option value="internet">Internet</option></select>
+        <input id="store-asset" type="number" step="0.1" value="7.0" style="width:100px;padding:6px;border-radius:6px;background:#0f1528;color:#d8e2ff;border:1px solid #35508f;" />
+        <button id="store-register-scan-btn" style="padding:8px 12px;background:#22543d;color:#d8e2ff;border:1px solid #2f855a;border-radius:8px;cursor:pointer;">Register & Scan</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Issues by Language</h3>
+      <div class="json"><pre id="cp-lang-breakdown">No scan reports generated yet.</pre></div>
+    </div>
+
     <div class="panel">
       <h3>Autonomous Scan Terminal</h3>
       <div class="small">Detailed loopholes/bug findings from autonomous security scans.</div>
@@ -563,13 +583,65 @@ function renderSimpleList(targetId, rows, formatter){
   node.innerHTML = rows.slice(0,12).map(formatter).join('<br/>');
 }
 
-async function autocompleteTerms(kind, q){
+async function autocompleteTerms(kind, q, storeIds){
   const enabled=document.getElementById('cp-autocomplete-enabled');
   if(enabled && !enabled.checked){ return []; }
-  const resp=await fetch(`/api/control-plane/autocomplete?kind=${encodeURIComponent(kind)}&q=${encodeURIComponent(q||'')}`);
+  const sid=(storeIds||[]).join(',');
+  const resp=await fetch(`/api/control-plane/autocomplete?kind=${encodeURIComponent(kind)}&q=${encodeURIComponent(q||'')}&store_ids=${encodeURIComponent(sid)}`);
   if(!resp.ok){ return []; }
   const data=await resp.json();
   return data.suggestions || [];
+}
+
+class HegemonAutocomplete {
+  constructor(inputEl, dropdownEl){
+    this.inputEl=inputEl; this.dropdownEl=dropdownEl; this.timer=null; this.items=[]; this.active=-1; this.selected=null;
+    inputEl.addEventListener('input', ()=>this.schedule());
+    inputEl.addEventListener('keydown', (e)=>this.onKey(e));
+    document.addEventListener('click', (e)=>{ if(!dropdownEl.contains(e.target) && e.target!==inputEl){ this.hide(); } });
+  }
+  schedule(){ clearTimeout(this.timer); this.timer=setTimeout(()=>this.fetch(),200); }
+  async fetch(){
+    const q=(this.inputEl.value||'').trim();
+    if(!q){this.hide(); return;}
+    this.dropdownEl.style.display='block';
+    this.dropdownEl.innerHTML='<div style="padding:8px;opacity:0.7;">Loading…</div>';
+    const storeSel=document.getElementById('store-filter');
+    const storeIds=storeSel && storeSel.value ? [storeSel.value] : [];
+    this.items=await autocompleteTerms('all', q, storeIds);
+    this.active=-1;
+    if(!this.items.length){ this.dropdownEl.innerHTML='<div style="padding:8px;opacity:0.7;">No results</div>'; return; }
+    this.render();
+  }
+  render(){
+    this.dropdownEl.innerHTML=this.items.map((it,idx)=>{
+      const badge=it.trust_tier==='verified' ? '<span style="color:#7CFC8A">✓ Verified</span>' : (it.trust_tier? '<span style="color:#f6ad55">⚠ Community</span>' : '');
+      const icon=(it.icon||'').startsWith('http')?`<img src="${it.icon}" style="width:18px;height:18px;border-radius:4px;"/>`:`<span>${it.icon||'📦'}</span>`;
+      return `<div data-idx="${idx}" style="padding:8px;display:flex;gap:8px;align-items:center;cursor:pointer;background:${idx===this.active?'#1a2342':'transparent'};">
+        ${icon}<div style="flex:1;"><div style="font-weight:700;">${it.label}</div><div style="font-size:12px;opacity:0.8;">${it.sublabel||''}</div></div><div style="font-size:12px;">${badge}</div></div>`;
+    }).join('');
+    this.dropdownEl.querySelectorAll('[data-idx]').forEach((el)=>el.addEventListener('mouseenter',()=>{this.active=Number(el.dataset.idx); this.render();}));
+    this.dropdownEl.querySelectorAll('[data-idx]').forEach((el)=>el.addEventListener('click',()=>this.select(Number(el.dataset.idx))));
+  }
+  onKey(e){
+    if(!this.dropdownEl || this.dropdownEl.style.display==='none') return;
+    if(e.key==='ArrowDown'){ e.preventDefault(); this.active=Math.min(this.items.length-1,this.active+1); this.render(); }
+    if(e.key==='ArrowUp'){ e.preventDefault(); this.active=Math.max(0,this.active-1); this.render(); }
+    if(e.key==='Enter'){ if(this.active>=0){ e.preventDefault(); this.select(this.active);} }
+    if(e.key==='Escape'){ this.hide(); }
+  }
+  select(idx){
+    const it=this.items[idx];
+    if(!it) return;
+    this.selected=it;
+    this.inputEl.value=it.label;
+    this.hide();
+    const selected=document.getElementById('store-selected');
+    if(selected){ selected.textContent=`Selected: ${it.label} (${it.store_id||it.type})`; }
+    const root=document.getElementById('store-detected-root');
+    if(root){ root.textContent='Detected root: auto-detect on register'; }
+  }
+  hide(){ this.dropdownEl.style.display='none'; }
 }
 
 async function loadControlPlane(){
@@ -631,6 +703,13 @@ async function runAutonomousScan(){
       global_weakness_report:data.global_weakness_report || {},
     }, null, 2);
   }
+
+  const langNode=document.getElementById('cp-lang-breakdown');
+  if(langNode){
+    const lb=data.lang_breakdown || {};
+    const rows=Object.entries(lb).map(([k,v])=>`${k.padEnd(10,' ')} ${'█'.repeat(Math.min(10,Number(v)||0))} ${v} issues`);
+    langNode.textContent=rows.length? rows.join('\n') : 'No language issues yet.';
+  }
   await loadControlPlane();
 }
 
@@ -661,6 +740,17 @@ async function approveAndApplyLatestPatch(){
     }
   }
   await loadControlPlane();
+}
+
+async function loadStoreFilters(){
+  const sel=document.getElementById('store-filter');
+  if(!sel) return;
+  try{
+    const resp=await fetch('/api/control-plane/overview');
+    const data=await resp.json();
+    const stores=data.friendly_stores||[];
+    sel.innerHTML='<option value="">All Stores</option>'+stores.map((s)=>`<option value="${s.store_id}">${s.name}</option>`).join('');
+  }catch(_err){}
 }
 
 async function loadKernelTelemetryStatus(){
@@ -718,11 +808,27 @@ document.getElementById('cp-add-endpoint-btn')?.addEventListener('click', async(
   await loadControlPlane();
 });
 
-document.getElementById('cp-scan-endpoint-input')?.addEventListener('input', async(event)=>{
-  const target=event.target;
-  const suggestions=await autocompleteTerms('endpoints', target.value || '');
-  const dl=document.getElementById('cp-endpoint-suggestions');
-  if(dl){ dl.innerHTML=suggestions.map((s)=>`<option value="${s}"></option>`).join(''); }
+let hegemonAutocomplete=null;
+const scanInput=document.getElementById('cp-scan-endpoint-input');
+const scanDropdown=document.getElementById('cp-autocomplete-dropdown');
+if(scanInput && scanDropdown){ hegemonAutocomplete=new HegemonAutocomplete(scanInput, scanDropdown); }
+
+document.getElementById('store-register-scan-btn')?.addEventListener('click', async()=>{
+  const q=(scanInput && scanInput.value || '').trim();
+  if(!q){return;}
+  const storeId=(document.getElementById('store-filter')?.value)||'';
+  const network_exposure=(document.getElementById('store-exposure')?.value)||'internal';
+  const asset_value=parseFloat((document.getElementById('store-asset')?.value)||'7.0');
+  const resp=await fetch('/api/store/register-endpoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q,store_id:storeId,network_exposure,asset_value,actor:'dashboard'})});
+  const data=await resp.json();
+  if(resp.ok){
+    document.getElementById('store-detected-root').textContent=`Detected root: ${data.program_root_detected || 'not found'}`;
+    if(scanInput && data.endpoint){ scanInput.value=data.endpoint.endpoint_id; }
+    document.getElementById('cp-status').textContent='Store endpoint registered.';
+  }else{
+    document.getElementById('cp-status').textContent=`Store registration failed: ${data.error||'unknown_error'}`;
+  }
+  await loadControlPlane();
 });
 document.getElementById('cp-approve-latest-btn')?.addEventListener('click', approveLatestPatch);
 document.getElementById('cp-approve-apply-btn')?.addEventListener('click', approveAndApplyLatestPatch);
@@ -743,7 +849,7 @@ document.getElementById("kernel-telemetry-mode-toggle")?.addEventListener("chang
   const target=event.target;
   updateKernelTelemetryMode(Boolean(target && target.checked));
 });
-window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadControlPlane(); runAutonomousScan(); loadKernelTelemetryStatus(); window.setInterval(runAutonomousScan, 60000); window.setInterval(loadKernelTelemetryStatus, 5000);});
+window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadStoreFilters(); loadControlPlane(); runAutonomousScan(); loadKernelTelemetryStatus(); window.setInterval(runAutonomousScan, 60000); window.setInterval(loadKernelTelemetryStatus, 5000);});
 </script>
 </body>
 </html>
@@ -1354,15 +1460,56 @@ def control_plane_autocomplete():
     unauthorized = _require_auth()
     if unauthorized:
         return unauthorized
-    kind = str(request.args.get("kind", "")).strip().lower()
+    kind = str(request.args.get("kind", "all")).strip().lower()
     q = str(request.args.get("q", "")).strip().lower()
-    if kind == "endpoints":
-        pool = [e.endpoint_id for e in _control_plane.endpoints.values()] + [e.host_name for e in _control_plane.endpoints.values()]
-    elif kind == "friends":
-        pool = [f.name for f in _control_plane.friends.values()]
-    else:
-        pool = [e.endpoint_id for e in _control_plane.endpoints.values()] + [e.host_name for e in _control_plane.endpoints.values()] + [f.name for f in _control_plane.friends.values()]
-    return jsonify({"suggestions": [v for v in pool if q in v.lower()][:15]})
+    store_ids_raw = str(request.args.get("store_ids", "")).strip()
+    store_ids = [v.strip() for v in store_ids_raw.split(",") if v.strip()] if store_ids_raw else None
+    if len(q) < 1 or len(q) > 128 or "../" in q or "\x00" in q:
+        return jsonify({"suggestions": [], "total": 0, "from_cache": False, "query": q})
+    cache_key = f"{kind}:{q}"
+    now = time.monotonic()
+    cached = _AUTOCOMPLETE_CACHE.get(cache_key)
+    if cached and now - cached[0] <= 0.1:
+        out = dict(cached[1])
+        out["from_cache"] = True
+        return jsonify(out)
+
+    suggestions: list[dict] = []
+    if kind in {"endpoints", "all"}:
+        for ep in _control_plane.endpoints.values():
+            if q in ep.endpoint_id.lower() or q in ep.host_name.lower():
+                suggestions.append({"type": "endpoint", "id": ep.endpoint_id, "label": ep.host_name, "sublabel": ep.endpoint_id, "icon": "🖥️", "store_id": None, "trust_tier": None, "score": 0.9 if ep.host_name.lower().startswith(q) else 0.7, "meta": {}})
+    if kind in {"friends", "all"}:
+        for fr in _control_plane.friends.values():
+            if q in fr.name.lower():
+                suggestions.append({"type": "friend", "id": fr.friend_id, "label": fr.name, "sublabel": fr.identity_method, "icon": "👤", "store_id": None, "trust_tier": None, "score": 0.8 if fr.name.lower().startswith(q) else 0.6, "meta": {}})
+    if kind in {"packages", "all"}:
+        for hit in _control_plane.store_client.search(q, store_ids, limit=20):
+            suggestions.append({"type": "store_app", "id": f"{hit.store_id}:{hit.name}", "label": hit.name, "sublabel": f"{hit.publisher} • {hit.version}", "icon": hit.icon_url or "📦", "store_id": hit.store_id, "trust_tier": hit.trust_tier, "score": hit.score, "meta": hit.raw})
+    suggestions = sorted(suggestions, key=lambda row: float(row.get("score", 0.0)), reverse=True)[:15]
+    payload = {"suggestions": suggestions, "total": len(suggestions), "from_cache": False, "query": q}
+    _AUTOCOMPLETE_CACHE[cache_key] = (now, payload)
+    return jsonify(payload)
+
+
+@app.post("/api/store/register-endpoint")
+def api_store_register_endpoint():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    query = str(payload.get("query", "")).strip()
+    store_id = str(payload.get("store_id", "")).strip()
+    if not query or not store_id:
+        return jsonify({"error": "invalid_payload", "message": "query and store_id required"}), 400
+    try:
+        result = _control_plane.register_store_endpoint(query=query, store_id=store_id, version=payload.get("version"), network_exposure=str(payload.get("network_exposure", "internal")), asset_value=float(payload.get("asset_value", 7.0)), actor=str(payload.get("actor", "user")))
+    except KeyError:
+        suggestions = [r.__dict__ for r in _control_plane.store_client.search(query, [store_id], limit=5)]
+        return jsonify({"error": "not_found", "suggestions": suggestions}), 404
+    return jsonify({"endpoint": _control_plane.as_dict(result["endpoint"]), "friendly_app": _control_plane.as_dict(result["friendly_app"]), "program_root_detected": result["program_root_detected"], "store_metadata": result["store_metadata"].__dict__, "scan_triggered": result["scan_triggered"], "scan_id": result["scan_id"]})
 
 
 @app.post("/api/control-plane/add-friend")
@@ -1489,3 +1636,110 @@ def peer_verify():
     if error:
         return error
     return jsonify({"valid": bool(payload.get("directive")), "attestor": "local"})
+
+
+@app.post("/api/scan")
+def api_scan_unified():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    result = _control_plane.scan(
+        payload.get("target"),
+        mode=str(payload.get("mode", "auto")),
+        include_external_intel=bool(payload.get("include_external_intel", True)),
+        include_ast=bool(payload.get("include_ast", True)),
+        program_root=payload.get("program_root"),
+        actor="dashboard_scanner",
+    )
+    return jsonify(_control_plane.as_dict(result))
+
+
+@app.get("/api/scan/<scan_id>")
+def api_scan_by_id(scan_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    row = _control_plane.scan_results_by_id.get(scan_id)
+    if row is None:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(_control_plane.as_dict(row))
+
+
+@app.get("/api/endpoints/<endpoint_id>/scan_history")
+def api_scan_history(endpoint_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    history = _control_plane.scan_history.get(endpoint_id, [])[-10:]
+    return jsonify([{"scan_id": h.scan_id, "mode": h.mode, "duration_seconds": h.duration_seconds, "findings": len(h.findings), "new_findings": len(h.new_findings)} for h in history])
+
+
+@app.get("/api/endpoints/<endpoint_id>/lateral_graph")
+def api_lateral_graph(endpoint_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    graph = _control_plane._build_lateral_movement_graph()
+    return jsonify({"origin": endpoint_id, **graph})
+
+
+@app.get("/api/self/scan_loop")
+def api_self_scan_loop_state():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    loop = _control_plane._self_scan_loop
+    return jsonify({"running": bool(loop._thread and loop._thread.is_alive()), "last_scan_at": loop.last_scan_at, "last_findings_count": loop.last_findings_count, "scan_interval_seconds": loop.scan_interval_seconds, "consecutive_errors": loop.consecutive_errors, "total_patches_applied": loop.total_patches_applied, "total_rolled_back": loop.total_rolled_back})
+
+
+@app.post("/api/self/scan_loop/start")
+def api_self_scan_loop_start():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    _control_plane._self_scan_loop.start()
+    return jsonify({"status": "started"})
+
+
+@app.post("/api/self/scan_loop/stop")
+def api_self_scan_loop_stop():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    _control_plane._self_scan_loop.stop()
+    return jsonify({"status": "stopped"})
+
+
+@app.get("/api/findings/<finding_id>/markov_tree")
+def api_finding_markov_tree(finding_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    finding = _control_plane.findings.get(finding_id)
+    if not finding:
+        return jsonify({"error": "not_found"}), 404
+    endpoint = _control_plane.endpoints.get(finding.endpoint_id)
+    tree = _control_plane._markov_tree_project(endpoint.telemetry_events if endpoint else [])
+    return jsonify(tree)
+
+
+@app.get("/api/findings/<finding_id>/bayesian_posteriors")
+def api_finding_posteriors(finding_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    finding = _control_plane.findings.get(finding_id)
+    if not finding:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(finding.bayesian_stage_risk)
+
+
+@app.get("/api/scan_suppressed")
+def api_scan_suppressed():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify(_control_plane.suppressed_findings)
