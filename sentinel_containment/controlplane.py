@@ -134,16 +134,16 @@ PROTECTED_FILES = {
 }
 
 STORE_REGISTRY: list[dict[str, Any]] = [
-    {"store_id": "store-apple", "name": "Apple App Store", "icon": "🍎", "platform": "apple", "trust_tier": "verified", "verification_method": "apple_notarization", "metadata_api": "https://itunes.apple.com/search", "search_param": "term", "result_path": ["results"], "name_field": "trackName", "publisher_field": "artistName", "version_field": "version", "bundle_id_field": "bundleId", "category_field": "primaryGenreName", "icon_field": "artworkUrl100"},
-    {"store_id": "store-windows", "name": "Microsoft Store", "icon": "🪟", "platform": "windows", "trust_tier": "verified", "verification_method": "microsoft_signature", "metadata_api": "https://storeedgefd.dsx.mp.microsoft.com/v9.0/products", "search_param": "query", "result_path": ["Products"], "name_field": "Title", "publisher_field": "PublisherName", "version_field": "Version", "icon_field": "Images"},
-    {"store_id": "store-google-play", "name": "Google Play Store", "icon": "🤖", "platform": "android", "trust_tier": "verified", "verification_method": "google_play_protect", "metadata_api": "https://play.google.com/store/search", "search_param": "q", "result_path": [], "name_field": "title", "publisher_field": "developer", "version_field": "version"},
-    {"store_id": "store-pypi", "name": "PyPI", "icon": "🐍", "platform": "python", "trust_tier": "community", "verification_method": "sha256_checksum", "metadata_api": "https://pypi.org/pypi/{package}/json", "search_api": "https://pypi.org/search/?q={query}&o=&c=&format=json", "name_field": "info.name", "publisher_field": "info.author", "version_field": "info.version", "home_field": "info.home_page"},
-    {"store_id": "store-npm", "name": "npm", "icon": "📦", "platform": "javascript", "trust_tier": "community", "verification_method": "sha512_integrity", "metadata_api": "https://registry.npmjs.org/{package}", "search_api": "https://registry.npmjs.org/-/v1/search?text={query}&size=10", "name_field": "name", "publisher_field": "author.name", "version_field": "dist-tags.latest"},
-    {"store_id": "store-linux", "name": "Linux Package Repos", "icon": "🐧", "platform": "linux", "trust_tier": "verified", "verification_method": "gpg_signed_package", "metadata_api": "https://repology.org/api/v1/project/{package}", "search_api": "https://repology.org/api/v1/projects/?search={query}&limit=10", "name_field": "package", "publisher_field": "maintainer", "version_field": "newest_version"},
-    {"store_id": "store-homebrew", "name": "Homebrew", "icon": "🍺", "platform": "macos", "trust_tier": "community", "verification_method": "sha256_checksum", "metadata_api": "https://formulae.brew.sh/api/formula/{package}.json", "search_api": "https://formulae.brew.sh/api/formula.json", "name_field": "name", "publisher_field": "homepage", "version_field": "versions.stable"},
-    {"store_id": "store-nuget", "name": "NuGet", "icon": "🔷", "platform": "dotnet", "trust_tier": "community", "verification_method": "nuget_signature", "metadata_api": "https://api.nuget.org/v3/registration5/{package}/index.json", "search_api": "https://azuresearch-usnc.nuget.org/query?q={query}&take=10", "name_field": "id", "publisher_field": "authors", "version_field": "version"},
-    {"store_id": "store-steam", "name": "Steam", "icon": "🎮", "platform": "cross-platform", "trust_tier": "verified", "verification_method": "steam_signature", "metadata_api": "https://store.steampowered.com/api/appdetails", "search_api": "https://store.steampowered.com/api/storesearch/?term={query}&cc=US&l=en", "name_field": "name", "publisher_field": "publisher", "version_field": "release_date.date"},
-    {"store_id": "store-github", "name": "GitHub Releases", "icon": "🐙", "platform": "cross-platform", "trust_tier": "community", "verification_method": "gpg_tag_signature", "metadata_api": "https://api.github.com/repos/{owner}/{repo}/releases/latest", "search_api": "https://api.github.com/search/repositories?q={query}&sort=stars&per_page=10", "name_field": "name", "publisher_field": "owner.login", "version_field": "tag_name"},
+    {"store_id": "store-apple", "name": "Apple App Store", "icon": "APPLE", "platform": "apple", "trust_tier": "verified", "verification_method": "apple_notarization", "metadata_api": "https://itunes.apple.com/search", "search_param": "term", "result_path": ["results"], "name_field": "trackName", "publisher_field": "artistName", "version_field": "version", "bundle_id_field": "bundleId", "category_field": "primaryGenreName", "icon_field": "artworkUrl100"},
+    {"store_id": "store-windows", "name": "Microsoft Store", "icon": "WINDOWS", "platform": "windows", "trust_tier": "verified", "verification_method": "microsoft_signature", "metadata_api": "https://storeedgefd.dsx.mp.microsoft.com/v9.0/products", "search_param": "query", "result_path": ["Products"], "name_field": "Title", "publisher_field": "PublisherName", "version_field": "Version", "icon_field": "Images"},
+    {"store_id": "store-google-play", "name": "Google Play Store", "icon": "ANDROID", "platform": "android", "trust_tier": "verified", "verification_method": "google_play_protect", "metadata_api": "https://play.google.com/store/search", "search_param": "q", "result_path": [], "name_field": "title", "publisher_field": "developer", "version_field": "version"},
+    {"store_id": "store-pypi", "name": "PyPI", "icon": "PY", "platform": "python", "trust_tier": "community", "verification_method": "sha256_checksum", "metadata_api": "https://pypi.org/pypi/{package}/json", "search_api": "https://pypi.org/search/?q={query}&o=&c=&format=json", "name_field": "info.name", "publisher_field": "info.author", "version_field": "info.version", "home_field": "info.home_page"},
+    {"store_id": "store-npm", "name": "npm", "icon": "PKG", "platform": "javascript", "trust_tier": "community", "verification_method": "sha512_integrity", "metadata_api": "https://registry.npmjs.org/{package}", "search_api": "https://registry.npmjs.org/-/v1/search?text={query}&size=10", "name_field": "name", "publisher_field": "author.name", "version_field": "dist-tags.latest"},
+    {"store_id": "store-linux", "name": "Linux Package Repos", "icon": "LINUX", "platform": "linux", "trust_tier": "verified", "verification_method": "gpg_signed_package", "metadata_api": "https://repology.org/api/v1/project/{package}", "search_api": "https://repology.org/api/v1/projects/?search={query}&limit=10", "name_field": "package", "publisher_field": "maintainer", "version_field": "newest_version"},
+    {"store_id": "store-homebrew", "name": "Homebrew", "icon": "BREW", "platform": "macos", "trust_tier": "community", "verification_method": "sha256_checksum", "metadata_api": "https://formulae.brew.sh/api/formula/{package}.json", "search_api": "https://formulae.brew.sh/api/formula.json", "name_field": "name", "publisher_field": "homepage", "version_field": "versions.stable"},
+    {"store_id": "store-nuget", "name": "NuGet", "icon": "NUGET", "platform": "dotnet", "trust_tier": "community", "verification_method": "nuget_signature", "metadata_api": "https://api.nuget.org/v3/registration5/{package}/index.json", "search_api": "https://azuresearch-usnc.nuget.org/query?q={query}&take=10", "name_field": "id", "publisher_field": "authors", "version_field": "version"},
+    {"store_id": "store-steam", "name": "Steam", "icon": "STEAM", "platform": "cross-platform", "trust_tier": "verified", "verification_method": "steam_signature", "metadata_api": "https://store.steampowered.com/api/appdetails", "search_api": "https://store.steampowered.com/api/storesearch/?term={query}&cc=US&l=en", "name_field": "name", "publisher_field": "publisher", "version_field": "release_date.date"},
+    {"store_id": "store-github", "name": "GitHub Releases", "icon": "GH", "platform": "cross-platform", "trust_tier": "community", "verification_method": "gpg_tag_signature", "metadata_api": "https://api.github.com/repos/{owner}/{repo}/releases/latest", "search_api": "https://api.github.com/search/repositories?q={query}&sort=stars&per_page=10", "name_field": "name", "publisher_field": "owner.login", "version_field": "tag_name"},
 ]
 
 DEFAULT_FRIENDLY_STORES: list[dict[str, Any]] = STORE_REGISTRY
@@ -178,25 +178,25 @@ DEFAULT_FRIENDLY_ENDPOINTS: list[dict[str, Any]] = [
 HEGEMON_SELF_ENDPOINT_ID = "ep-hegemon-self"
 
 PACKAGE_TO_FRIENDLY_APP: dict[str, dict[str, str]] = {
-    "edge": {"name": "Microsoft Edge", "icon": "🌐", "store_id": "store-windows", "publisher": "Microsoft"},
-    "defender": {"name": "Microsoft Defender", "icon": "🛡️", "store_id": "store-windows", "publisher": "Microsoft"},
-    "nginx": {"name": "Nginx", "icon": "🌐", "store_id": "store-linux", "publisher": "NGINX Inc."},
-    "steamcmd": {"name": "SteamCMD", "icon": "🎮", "store_id": "store-steam", "publisher": "Valve"},
-    "openssl": {"name": "OpenSSL", "icon": "🔐", "store_id": "store-linux", "publisher": "OpenSSL"},
-    "curl": {"name": "curl", "icon": "🌐", "store_id": "store-linux", "publisher": "curl"},
-    "wget": {"name": "wget", "icon": "📥", "store_id": "store-linux", "publisher": "GNU"},
-    "python3": {"name": "Python 3", "icon": "🐍", "store_id": "store-linux", "publisher": "Python Software Foundation"},
-    "anthropic": {"name": "Anthropic SDK", "icon": "🤖", "store_id": "store-linux", "publisher": "Anthropic"},
-    "nodejs": {"name": "Node.js", "icon": "🟢", "store_id": "store-linux", "publisher": "OpenJS"},
-    "docker": {"name": "Docker", "icon": "🐳", "store_id": "store-linux", "publisher": "Docker"},
-    "containerd": {"name": "containerd", "icon": "📦", "store_id": "store-linux", "publisher": "CNCF"},
-    "kubelet": {"name": "Kubelet", "icon": "☸️", "store_id": "store-linux", "publisher": "Kubernetes"},
-    "postgres": {"name": "PostgreSQL", "icon": "🐘", "store_id": "store-linux", "publisher": "PostgreSQL"},
-    "mysql": {"name": "MySQL", "icon": "🛢️", "store_id": "store-linux", "publisher": "Oracle"},
-    "redis": {"name": "Redis", "icon": "🟥", "store_id": "store-linux", "publisher": "Redis"},
-    "apache2": {"name": "Apache HTTP Server", "icon": "🪶", "store_id": "store-linux", "publisher": "Apache"},
-    "sshd": {"name": "OpenSSH Server", "icon": "🔑", "store_id": "store-linux", "publisher": "OpenSSH"},
-    "git": {"name": "Git", "icon": "🧬", "store_id": "store-linux", "publisher": "Git"},
+    "edge": {"name": "Microsoft Edge", "icon": "NET", "store_id": "store-windows", "publisher": "Microsoft"},
+    "defender": {"name": "Microsoft Defender", "icon": "DEF", "store_id": "store-windows", "publisher": "Microsoft"},
+    "nginx": {"name": "Nginx", "icon": "NET", "store_id": "store-linux", "publisher": "NGINX Inc."},
+    "steamcmd": {"name": "SteamCMD", "icon": "STEAM", "store_id": "store-steam", "publisher": "Valve"},
+    "openssl": {"name": "OpenSSL", "icon": "TLS", "store_id": "store-linux", "publisher": "OpenSSL"},
+    "curl": {"name": "curl", "icon": "NET", "store_id": "store-linux", "publisher": "curl"},
+    "wget": {"name": "wget", "icon": "DL", "store_id": "store-linux", "publisher": "GNU"},
+    "python3": {"name": "Python 3", "icon": "PY", "store_id": "store-linux", "publisher": "Python Software Foundation"},
+    "anthropic": {"name": "Anthropic SDK", "icon": "ANDROID", "store_id": "store-linux", "publisher": "Anthropic"},
+    "nodejs": {"name": "Node.js", "icon": "NODE", "store_id": "store-linux", "publisher": "OpenJS"},
+    "docker": {"name": "Docker", "icon": "DOCKER", "store_id": "store-linux", "publisher": "Docker"},
+    "containerd": {"name": "containerd", "icon": "PKG", "store_id": "store-linux", "publisher": "CNCF"},
+    "kubelet": {"name": "Kubelet", "icon": "K8S", "store_id": "store-linux", "publisher": "Kubernetes"},
+    "postgres": {"name": "PostgreSQL", "icon": "PG", "store_id": "store-linux", "publisher": "PostgreSQL"},
+    "mysql": {"name": "MySQL", "icon": "MYSQL", "store_id": "store-linux", "publisher": "Oracle"},
+    "redis": {"name": "Redis", "icon": "REDIS", "store_id": "store-linux", "publisher": "Redis"},
+    "apache2": {"name": "Apache HTTP Server", "icon": "APACHE", "store_id": "store-linux", "publisher": "Apache"},
+    "sshd": {"name": "OpenSSH Server", "icon": "SSH", "store_id": "store-linux", "publisher": "OpenSSH"},
+    "git": {"name": "Git", "icon": "GIT", "store_id": "store-linux", "publisher": "Git"},
 }
 
 
@@ -444,7 +444,7 @@ class HegemonControlPlane:
             row["store_id"]: FriendlyStore(
                 store_id=row["store_id"],
                 name=str(row.get("name", "unknown")),
-                icon=str(row.get("icon", "🏪")),
+                icon=str(row.get("icon", "STORE")),
                 platform=str(row.get("platform", "unknown")),
                 trust_tier=str(row.get("trust_tier", "community")),
                 verification_method=str(row.get("verification_method", "unknown")),
@@ -530,7 +530,7 @@ class HegemonControlPlane:
         store = FriendlyStore(
             store_id=store_id,
             name=payload["name"],
-            icon=payload.get("icon", "🏪"),
+            icon=payload.get("icon", "STORE"),
             platform=payload.get("platform", "unknown"),
             status=payload.get("status", "active"),
         )
@@ -598,7 +598,7 @@ class HegemonControlPlane:
         app = FriendlyApp(
             app_id=app_id,
             name=payload["name"],
-            icon=payload.get("icon", "📦"),
+            icon=payload.get("icon", "PKG"),
             store_id=store_id,
             publisher=payload.get("publisher", "unknown"),
             version=payload.get("version", "0.0.0"),
@@ -1943,7 +1943,7 @@ class HegemonControlPlane:
             "program_root": detected,
             "store_id": store_id,
         }, actor=actor)
-        app = self.add_friendly_app({"name": meta.name, "icon": meta.icon_url or "📦", "store_id": store_id, "publisher": meta.publisher, "version": version or meta.version or "latest"}, actor=actor)
+        app = self.add_friendly_app({"name": meta.name, "icon": meta.icon_url or "PKG", "store_id": store_id, "publisher": meta.publisher, "version": version or meta.version or "latest"}, actor=actor)
         scan_id = None
         triggered = False
         if detected:
@@ -2984,7 +2984,54 @@ class HegemonControlPlane:
         with self._state_lock:
             prior_cves = {finding.cve for finding in self.findings.values() if finding.endpoint_id == endpoint_id}
         discovered = self.run_vulnerability_scan(endpoint_id, actor=actor, include_external_intel=include_external_intel)
-        return [finding for finding in discovered if finding.cve not in prior_cves]
+        novel = [finding for finding in discovered if finding.cve not in prior_cves]
+        if novel:
+            return novel
+
+        endpoint = self.endpoints.get(endpoint_id)
+        if endpoint is None:
+            return []
+
+        telemetry = {str(item).strip().lower() for item in endpoint.telemetry_events}
+        high_risk_signal = (
+            endpoint.network_exposure == "internet"
+            and (
+                len(telemetry & {"initial_access", "execution", "lateral_movement", "command_and_control"}) >= 2
+                or endpoint.asset_value >= 8.5
+                or endpoint.trust_level <= 5.5
+            )
+        )
+        if not high_risk_signal:
+            return []
+
+        synthetic_cve = f"HEGEMON-AUTO-{endpoint_id.upper().replace('-', '_')}"
+        if synthetic_cve in prior_cves:
+            return []
+
+        fallback = self.create_finding(
+            {
+                "endpoint_id": endpoint_id,
+                "cve": synthetic_cve,
+                "cvss": 8.1,
+                "exploit_availability": 7.2,
+                "topological_impact": 7.6,
+                "asset_value": endpoint.asset_value,
+                "trust_level": endpoint.trust_level,
+                "evidence": [
+                    {
+                        "type": "autonomous_exposure_heuristic",
+                        "network_exposure": endpoint.network_exposure,
+                        "telemetry_events": sorted(telemetry),
+                    }
+                ],
+                "suggested_remediations": [
+                    "Reduce external exposure and enforce least privilege on discovered endpoint",
+                    "Run targeted package verification and hardening pass",
+                ],
+            },
+            actor=actor,
+        )
+        return [fallback]
 
     def run_autonomous_self_patch(self) -> dict[str, Any]:
         if HEGEMON_SELF_ENDPOINT_ID not in self.endpoints:
@@ -3539,7 +3586,12 @@ class HegemonControlPlane:
         workdir = Path("data") / "drones" / drone_id
         workdir.mkdir(parents=True, exist_ok=True)
         key_hex = self._drone_private_keys.get(drone_id, "")
-        proc = launch_blob_locally(drone.binary_blob, key_hex, workdir)
+        proc = launch_blob_locally(
+            drone.binary_blob,
+            key_hex,
+            workdir,
+            detached=(drone.tier == "autonomous"),
+        )
         self._drone_processes[drone_id] = proc
         drone.pid = proc.pid
         drone.status = "active"
