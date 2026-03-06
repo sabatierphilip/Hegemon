@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import base64
 import copy
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -29,6 +31,7 @@ from uuid import uuid4
 from nacl import signing
 
 from signed_ledger import SignedLedger
+from sentinel_containment.drone_compiler import DroneBlobCompiler, decode_blob, deploy_blob_remote, launch_blob_locally
 from sentinel_containment.store_client import StoreClient, StoreSearchResult
 
 try:
@@ -316,6 +319,12 @@ class Drone:
     actor: str
     pending_commands: list[dict[str, Any]] = field(default_factory=list)
     binary_blueprint: str = ""
+    binary_blob: str = ""
+    blob_size_bytes: int = 0
+    blob_hash: str = ""
+    pid: int | None = None
+    deadrop_path: str = ""
+    child_drone_ids: list[int] = field(default_factory=list)
     supported_binary_actions: list[str] = field(default_factory=list)
 
 
@@ -457,7 +466,9 @@ class HegemonControlPlane:
         self._drone_threads: dict[str, threading.Thread] = {}
         self._drone_stop_events: dict[str, threading.Event] = {}
         self._drone_command_locks: dict[str, threading.Lock] = {}
-        self._drone_private_keys: dict[str, signing.SigningKey] = {}
+        self._drone_private_keys: dict[str, str] = {}
+        self._drone_processes: dict[str, subprocess.Popen] = {}
+        self._drone_compiler = DroneBlobCompiler()
         self._seed_drone_brains()
         self._proposal_approved_at: dict[str, float] = {}
         self.scan_history: dict[str, list[ScanResult]] = {}
@@ -3303,6 +3314,22 @@ class HegemonControlPlane:
     def _registered_hosts(self) -> set[str]:
         return {ep.host_name for ep in self.endpoints.values()} | set(self.endpoints.keys())
 
+    def decode_drone_source(self, drone_id: str) -> str:
+        drone = self.drones[drone_id]
+        key_hex = self._drone_private_keys.get(drone_id, "")
+        return decode_blob(drone.binary_blob, key_hex)
+
+    def deploy_drone_remote(self, drone_id: str, host: str, ssh_key_path: str, remote_workdir: str, actor: str) -> dict[str, Any]:
+        drone = self.drones[drone_id]
+        if drone.autonomy_level not in {"contain", "enforce"}:
+            raise ValueError("remote deployment requires contain/enforce autonomy")
+        if host not in self._registered_hosts():
+            raise ValueError("target host is not a registered endpoint")
+        key_hex = self._drone_private_keys.get(drone_id, "")
+        out = deploy_blob_remote(drone.binary_blob, key_hex, host, ssh_key_path, remote_workdir)
+        self._record("drone.remote_deploy", {"drone_id": drone_id, "host": host, "actor": actor, **out})
+        return out
+
     def available_drone_actions(self) -> list[dict[str, Any]]:
         return [
             {"binary": opcode, "action": action, "description": f"Dispatch {action} command"}
@@ -3367,13 +3394,19 @@ class HegemonControlPlane:
         behaviour_obj = self._resolve_behaviour(behaviour)
         drone_id = f"drone-{uuid4().hex[:8]}"
         keypair = signing.SigningKey.generate()
-        self._drone_private_keys[drone_id] = keypair
+        private_key_hex = keypair.encode().hex()
+        self._drone_private_keys[drone_id] = private_key_hex
         workdir = Path("data") / "drones" / drone_id
         workdir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc).isoformat()
         ttl_seconds = int(ttl_seconds)
         checkin_interval_seconds = int(checkin_interval_seconds)
         supported_binary_actions = sorted(self.DRONE_BINARY_COMMANDS.keys())
+        embedded_intel = self._select_embedded_intel(
+            target_os=self.endpoints.get(target_endpoint_id).os if target_endpoint_id and target_endpoint_id in self.endpoints else None,
+            target_host=target_host,
+            installed_packages=self.endpoints.get(target_endpoint_id).installed_packages if target_endpoint_id and target_endpoint_id in self.endpoints else {},
+        )
         binary_blueprint = self._drone_binary_blueprint(
             name=name,
             tier=tier,
@@ -3410,12 +3443,41 @@ class HegemonControlPlane:
             created_at=now,
             actor=actor,
             binary_blueprint=binary_blueprint,
+            binary_blob=self._drone_compiler.compile(drone=Drone(
+                drone_id=drone_id, name=name, tier=tier, status="ready", mission=mission, behaviour=behaviour_obj,
+                target_endpoint_id=target_endpoint_id, target_host=target_host, target_network=target_network, autonomy_level=autonomy_level,
+                ttl_seconds=ttl_seconds, checkin_interval_seconds=checkin_interval_seconds, launched_at=None, last_checkin_at=None, return_at=None,
+                keypair_public=keypair.verify_key.encode().hex(), findings=[], telemetry=[], health={}, live_output=[], current_node_id=None,
+                stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor
+            ), private_key_hex=private_key_hex, embedded_intel=embedded_intel),
             supported_binary_actions=supported_binary_actions,
         )
+        drone.blob_size_bytes = len(base64.b64decode(drone.binary_blob.encode("ascii"))) if drone.binary_blob else 0
+        drone.blob_hash = hashlib.sha256(drone.binary_blob.encode("utf-8")).hexdigest()[:16] if drone.binary_blob else ""
+        drone.deadrop_path = f"/tmp/.hg_drop_{drone_id.replace('drone-','')}"
         self.drones[drone_id] = drone
         self._drone_command_locks[drone_id] = threading.Lock()
         self._record("drone.assembled", {"actor": actor, "drone_id": drone_id, "tier": tier, "mission": mission})
         return drone
+
+    def _select_embedded_intel(self, target_os: str | None, target_host: str | None, installed_packages: dict[str, str]) -> dict[str, Any]:
+        vuln_sigs: list[dict[str, Any]] = []
+        for pkg, ver in (installed_packages or {}).items():
+            for vuln in self._query_osv(pkg, ver, target_os or "")[:5]:
+                vuln_sigs.append({
+                    "id": str(vuln.get("id", "UNKNOWN-CVE")),
+                    "pattern": rf"{re.escape(pkg)}/?{re.escape(str(ver).split('.')[0])}.*",
+                    "severity": float(self._cvss_from_vuln(vuln)),
+                    "service": pkg,
+                    "affected_versions": str(vuln.get("affected", ""))[:120],
+                })
+        attack_patterns = [
+            {"id": "T1059.004", "pattern": r"(eval|exec)\s*\(", "stage": "execution"},
+            {"id": "T1190", "pattern": r"(sqlmap|union\s+select)", "stage": "initial_access"},
+            {"id": "T1046", "pattern": r"(nmap|masscan|zmap)", "stage": "discovery"},
+        ]
+        port_risk = {22: 0.3, 23: 0.9, 3389: 0.8, 6379: 0.7, 27017: 0.8}
+        return {"vuln_sigs": vuln_sigs[:50], "attack_patterns": attack_patterns, "port_risk": port_risk, "known_banners": []}
 
     def auto_assemble_drone(self, endpoint_id: str, actor: str) -> Drone | None:
         endpoint = self.endpoints.get(endpoint_id)
@@ -3474,17 +3536,22 @@ class HegemonControlPlane:
                 self.human_review_queue.append(token)
             self._record("drone.human_review_required", {"drone_id": drone_id, "priority": "p0", "actor": actor})
             raise PermissionError("human approval required")
-        drone.status = "launched"
+        workdir = Path("data") / "drones" / drone_id
+        workdir.mkdir(parents=True, exist_ok=True)
+        key_hex = self._drone_private_keys.get(drone_id, "")
+        proc = launch_blob_locally(drone.binary_blob, key_hex, workdir)
+        self._drone_processes[drone_id] = proc
+        drone.pid = proc.pid
+        drone.status = "active"
         drone.launched_at = datetime.now(timezone.utc).isoformat()
         if drone.ttl_seconds > 0 and drone.tier == "autonomous":
             drone.return_at = datetime.fromtimestamp(time.time() + drone.ttl_seconds, tz=timezone.utc).isoformat()
         stop_event = threading.Event()
         self._drone_stop_events[drone_id] = stop_event
-        t = threading.Thread(target=self._drone_execution_loop, args=(drone_id,), daemon=True)
+        t = threading.Thread(target=self._drone_monitor, args=(drone_id, proc), daemon=True)
         self._drone_threads[drone_id] = t
-        drone.status = "active"
         t.start()
-        self._record("drone.launched", {"actor": actor, "drone_id": drone_id})
+        self._record("drone.launched", {"actor": actor, "drone_id": drone_id, "pid": proc.pid})
         return drone
 
     def _next_node(self, node: DroneNode, decision: str | None = None) -> str | None:
@@ -3497,29 +3564,26 @@ class HegemonControlPlane:
         return node.edges_out[0]
 
     def _append_signed_telemetry(self, drone: Drone, message: str, **extra: Any) -> None:
-        private = self._drone_private_keys.get(drone.drone_id)
-        if private is None:
+        key_hex = self._drone_private_keys.get(drone.drone_id)
+        if not key_hex:
             return
         payload = {"ts": datetime.now(timezone.utc).isoformat(), "message": message, **extra}
         blob = json.dumps(payload, sort_keys=True).encode("utf-8")
-        sig = private.sign(blob).signature.hex()
+        sig = hmac.new(bytes.fromhex(key_hex[:64]), blob, hashlib.sha256).hexdigest()
         signed_payload = {**payload, "signature": sig}
         if self._verify_telemetry_signature(drone, signed_payload):
             drone.telemetry.append(signed_payload)
 
     def _verify_telemetry_signature(self, drone: Drone, payload: dict[str, Any]) -> bool:
         sig = payload.get("signature")
-        if not isinstance(sig, str) or not drone.keypair_public:
+        key_hex = self._drone_private_keys.get(drone.drone_id)
+        if not isinstance(sig, str) or not key_hex:
             return False
         body = dict(payload)
         body.pop("signature", None)
         blob = json.dumps(body, sort_keys=True).encode("utf-8")
-        try:
-            verify_key = signing.VerifyKey(bytes.fromhex(drone.keypair_public))
-            verify_key.verify(blob, bytes.fromhex(sig))
-            return True
-        except Exception:
-            return False
+        expected = hmac.new(bytes.fromhex(key_hex[:64]), blob, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected)
 
     def _execute_node(self, drone: Drone, node: DroneNode, node_map: dict[str, DroneNode], repeat_count: dict[str, int], stop_event: threading.Event, launch_time: float) -> str | None:
         kind = node.kind
@@ -3666,6 +3730,64 @@ class HegemonControlPlane:
         self._append_signed_telemetry(drone, f"Unknown node kind {kind}")
         return self._next_node(node)
 
+    def _poll_deadrop(self, drone_id: str) -> None:
+        drone = self.drones.get(drone_id)
+        if not drone:
+            return
+        dd = Path(drone.deadrop_path or "")
+        if not dd.exists():
+            return
+        try:
+            key_hex = self._drone_private_keys.get(drone_id, "")
+            raw = dd.read_text(encoding="utf-8")
+            env = json.loads(base64.b64decode(raw).decode("utf-8"))
+            encrypted = base64.b64decode(str(env.get("data", "")))
+            sig = str(env.get("sig", ""))
+            expected = hmac.new(bytes.fromhex(key_hex[:64]), encrypted, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(sig, expected):
+                return
+            key = bytes.fromhex(key_hex[:32])
+            key_cycle = (key * (len(encrypted) // len(key) + 1))[:len(encrypted)]
+            plain = bytes(a ^ b for a, b in zip(encrypted, key_cycle))
+            payload = json.loads(plain.decode("utf-8"))
+            for finding in payload.get("findings", []):
+                if finding not in drone.findings:
+                    drone.findings.append(finding)
+            drone.telemetry.extend(payload.get("telemetry", []))
+            drone.stats["findings_count"] = len(drone.findings)
+            drone.last_checkin_at = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            return
+
+    def _drone_monitor(self, drone_id: str, proc: subprocess.Popen) -> None:
+        drone = self.drones.get(drone_id)
+        if drone is None:
+            return
+        launch_time = time.time()
+        last_deadrop_poll = 0.0
+        while True:
+            if proc.stdout:
+                line = proc.stdout.readline()
+                if line:
+                    drone.live_output.append(line.decode("utf-8", errors="ignore").strip())
+            if proc.stderr:
+                err = proc.stderr.readline()
+                if err:
+                    drone.live_output.append("ERR: " + err.decode("utf-8", errors="ignore").strip())
+            now = time.time()
+            if now - last_deadrop_poll > max(1, drone.checkin_interval_seconds):
+                self._poll_deadrop(drone_id)
+                last_deadrop_poll = now
+            if drone.tier == "controlled" and drone.ttl_seconds > 0 and now > launch_time + drone.ttl_seconds:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            if proc.poll() is not None:
+                drone.status = "terminated"
+                break
+            time.sleep(0.1)
+
     def _drone_execution_loop(self, drone_id: str) -> None:
         drone = self.drones.get(drone_id)
         if drone is None:
@@ -3765,6 +3887,9 @@ class HegemonControlPlane:
             ev.set()
         self.drones.pop(drone_id, None)
         self._drone_threads.pop(drone_id, None)
+        proc = self._drone_processes.pop(drone_id, None)
+        if proc and proc.poll() is None:
+            proc.terminate()
         self._drone_stop_events.pop(drone_id, None)
         self._drone_command_locks.pop(drone_id, None)
         self._drone_private_keys.pop(drone_id, None)
@@ -3778,9 +3903,9 @@ class HegemonControlPlane:
         ev = self._drone_stop_events.get(drone_id)
         if ev:
             ev.set()
-        th = self._drone_threads.get(drone_id)
-        if th:
-            th.join(timeout=10)
+        proc = self._drone_processes.get(drone_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
         drone.status = "returning"
         self._record("drone.recalled", {"drone_id": drone_id, "actor": actor})
         return drone
@@ -3791,6 +3916,9 @@ class HegemonControlPlane:
         ev = self._drone_stop_events.get(drone_id)
         if ev:
             ev.set()
+        proc = self._drone_processes.get(drone_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
         self._record("drone.terminated", {"drone_id": drone_id, "actor": actor})
         return drone
 

@@ -1920,6 +1920,71 @@ def api_drones_assemble():
 
 
 
+
+
+@app.get("/api/drones/<drone_id>/blob")
+def api_drones_blob(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    drone = _control_plane.drones.get(drone_id)
+    if drone is None:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify({"blob_b64": drone.binary_blob, "blob_hash": drone.blob_hash, "blob_size_bytes": drone.blob_size_bytes})
+
+
+@app.get("/api/drones/<drone_id>/source")
+def api_drones_source(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    drone = _control_plane.drones.get(drone_id)
+    if drone is None:
+        return jsonify({"error": "not_found"}), 404
+    if drone.status not in {"ready", "terminated"}:
+        return jsonify({"error": "invalid_state", "message": "source only available when drone is ready or terminated"}), 400
+    try:
+        source = _control_plane.decode_drone_source(drone_id)
+    except Exception as exc:
+        return jsonify({"error": "decode_failed", "message": str(exc)}), 400
+    return jsonify({"source": source})
+
+
+@app.post("/api/drones/<drone_id>/deploy-remote")
+def api_drones_deploy_remote(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    try:
+        result = _control_plane.deploy_drone_remote(
+            drone_id=drone_id,
+            host=str(payload.get("host", "")),
+            ssh_key_path=str(payload.get("ssh_key_path", "")),
+            remote_workdir=str(payload.get("remote_workdir", "")),
+            actor=str(payload.get("actor", "user")),
+        )
+    except ValueError as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": "deploy_failed", "message": str(exc)}), 500
+    return jsonify(result)
+
+
+@app.get("/api/drones/<drone_id>/deadrop")
+def api_drones_deadrop(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    drone = _control_plane.drones.get(drone_id)
+    if drone is None:
+        return jsonify({"error": "not_found"}), 404
+    _control_plane._poll_deadrop(drone_id)
+    return jsonify({"findings": drone.findings, "telemetry": drone.telemetry[-200:], "deadrop_path": drone.deadrop_path})
+
+
 @app.get("/api/drones/actions")
 def api_drones_actions():
     unauthorized = _require_auth()

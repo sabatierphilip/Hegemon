@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import pytest
 
@@ -113,3 +114,28 @@ def test_available_binary_action_catalog(tmp_path: Path):
     actions = cp.available_drone_actions()
     assert any(row["binary"] == "00000011" and row["action"] == "report" for row in actions)
     assert len(actions) >= 10
+
+
+def test_blob_roundtrip_and_source_decode(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Blobber", "tethered", "custom", _mini_behaviour(), autonomy_level="contain", actor="tester")
+    assert drone.binary_blob
+    source = cp.decode_drone_source(drone.drone_id)
+    assert "DRONE_ID" in source
+    assert drone.drone_id in source
+
+
+def test_deadrop_polling_merges_payload(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Dropper", "autonomous", "custom", _mini_behaviour(), actor="tester")
+    key_hex = cp._drone_private_keys[drone.drone_id]
+    payload = {"findings": ["f1"], "telemetry": [{"message": "hi"}]}
+    raw = json.dumps(payload).encode("utf-8")
+    key = bytes.fromhex(key_hex[:32])
+    key_cycle = (key * (len(raw) // len(key) + 1))[:len(raw)]
+    encrypted = bytes(a ^ b for a, b in zip(raw, key_cycle))
+    sig = __import__("hmac").new(bytes.fromhex(key_hex[:64]), encrypted, __import__("hashlib").sha256).hexdigest()
+    envelope = __import__("base64").b64encode(json.dumps({"sig": sig, "data": __import__("base64").b64encode(encrypted).decode()}).encode()).decode()
+    Path(drone.deadrop_path).write_text(envelope, encoding="utf-8")
+    cp._poll_deadrop(drone.drone_id)
+    assert "f1" in cp.drones[drone.drone_id].findings
