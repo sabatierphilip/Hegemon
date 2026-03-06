@@ -40,12 +40,16 @@ def test_assemble_launch_and_terminate_drone(tmp_path: Path):
 def test_controlled_command_dispatch_and_autonomous_block(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     controlled = cp.assemble_drone("Ctl", "controlled", "custom", _mini_behaviour(), actor="tester")
-    queued = cp.send_drone_command(controlled.drone_id, "report", {}, actor="tester")
+    queued = cp.send_drone_command(controlled.drone_id, "00000011", {}, actor="tester")
     assert queued["queued"] is True
+    assert queued["command"] == "report"
+
+    with pytest.raises(ValueError):
+        cp.send_drone_command(controlled.drone_id, "report", {}, actor="tester")
 
     auto = cp.assemble_drone("Auto", "autonomous", "custom", _mini_behaviour(), actor="tester")
     with pytest.raises(ValueError):
-        cp.send_drone_command(auto.drone_id, "report", {}, actor="tester")
+        cp.send_drone_command(auto.drone_id, "00000011", {}, actor="tester")
 
 
 def test_safety_constraint_external_host_requires_observe(tmp_path: Path):
@@ -82,3 +86,30 @@ def test_ttl_expiry_terminates_drone(tmp_path: Path):
 
     time.sleep(6)
     assert cp.drones[drone.drone_id].status == "terminated"
+
+
+def test_delete_drone_restrictions(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    controlled = cp.assemble_drone("CtlDel", "controlled", "custom", _mini_behaviour(), actor="tester")
+    deleted = cp.delete_drone(controlled.drone_id, actor="tester")
+    assert deleted["deleted"] is True
+
+    autonomous = cp.assemble_drone("AutoDel", "autonomous", "custom", _mini_behaviour(), actor="tester")
+    with pytest.raises(ValueError):
+        cp.delete_drone(autonomous.drone_id, actor="tester")
+
+
+def test_drone_is_compiled_to_binary_blueprint(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("BinaryPrime", "controlled", "custom", _mini_behaviour(), actor="tester")
+    assert drone.binary_blueprint
+    assert set(drone.binary_blueprint).issubset({"0", "1"})
+    assert len(drone.binary_blueprint) > 128
+    assert "00000011" in drone.supported_binary_actions
+
+
+def test_available_binary_action_catalog(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    actions = cp.available_drone_actions()
+    assert any(row["binary"] == "00000011" and row["action"] == "report" for row in actions)
+    assert len(actions) >= 10
