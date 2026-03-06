@@ -281,6 +281,39 @@ def _execute(node_id):
             proc = subprocess.Popen([sys.executable, str(p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             _state['child_drone_ids'].append(proc.pid)
         return _next_node(node)
+    if kind in ('repeat', 'loop'):
+        max_iterations = max(0, int(params.get('max_iterations', 1)))
+        target = str(params.get('target_node_id', ''))
+        cnt = int(_state['repeat_counts'].get(node_id, 0))
+        if cnt >= max_iterations:
+            _state['repeat_counts'][node_id] = 0
+            return _next_node(node)
+        _state['repeat_counts'][node_id] = cnt + 1
+        if target and target in NODES:
+            return target
+        return _next_node(node)
+    if kind in ('loop_until', 'while_condition'):
+        key = str(params.get('condition_key', 'findings_count'))
+        operator = str(params.get('operator', '<'))
+        threshold = float(params.get('threshold', 1))
+        target = str(params.get('target_node_id', ''))
+        current_value = float(_state['stats'].get(key, len(_state['findings'])))
+        should_loop = False
+        if operator == '<':
+            should_loop = current_value < threshold
+        elif operator == '<=':
+            should_loop = current_value <= threshold
+        elif operator == '>':
+            should_loop = current_value > threshold
+        elif operator == '>=':
+            should_loop = current_value >= threshold
+        elif operator == '==':
+            should_loop = abs(current_value - threshold) < 1e-9
+        elif operator == '!=':
+            should_loop = abs(current_value - threshold) >= 1e-9
+        if should_loop and target and target in NODES:
+            return target
+        return _next_node(node)
     if kind in ('self_destruct',):
         for pid in list(_state.get('child_drone_ids', [])):
             try:

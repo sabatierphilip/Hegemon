@@ -132,7 +132,9 @@ def test_available_binary_action_catalog(tmp_path: Path):
 def test_blob_roundtrip_and_source_decode(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     drone = cp.assemble_drone("Blobber", "tethered", "custom", _mini_behaviour(), autonomy_level="contain", actor="tester")
-    assert drone.binary_blob
+    assert drone.binary_blob == ""
+    assert drone.blob_path
+    assert Path(drone.blob_path).exists()
     source = cp.decode_drone_source(drone.drone_id)
     assert "DRONE_ID" in source
     assert drone.drone_id in source
@@ -162,3 +164,36 @@ def test_deadrop_polling_merges_payload(tmp_path: Path):
     Path(drone.deadrop_path).write_text(envelope, encoding="utf-8")
     cp._poll_deadrop(drone.drone_id)
     assert "f1" in cp.drones[drone.drone_id].findings
+
+
+def test_drone_blob_is_stored_as_separate_file(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("FileBlob", "controlled", "custom", _mini_behaviour(), actor="tester")
+    assert drone.binary_blob == ""
+    assert drone.blob_path
+    blob_file = Path(drone.blob_path)
+    assert blob_file.exists()
+    assert blob_file.read_text(encoding="utf-8").strip()
+
+
+def test_compiled_drone_source_supports_looping_constructs(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    loop_behaviour = DroneBehaviour(
+        behaviour_id="loop-mini",
+        name="loop-mini",
+        nodes=[
+            DroneNode(node_id="a", node_type="trigger", kind="on_launch", label="On Launch", params={}, position={"x": 0.0, "y": 0.0}, edges_out=["b"], edge_labels={}),
+            DroneNode(node_id="b", node_type="control", kind="repeat", label="Repeat", params={"target_node_id": "b", "max_iterations": 2}, position={"x": 1.0, "y": 1.0}, edges_out=["c"], edge_labels={}),
+            DroneNode(node_id="c", node_type="control", kind="while_condition", label="While", params={"condition_key": "findings_count", "operator": "<", "threshold": 1, "target_node_id": "d"}, position={"x": 2.0, "y": 2.0}, edges_out=["e"], edge_labels={}),
+            DroneNode(node_id="d", node_type="control", kind="wait", label="Wait", params={"seconds": 1}, position={"x": 3.0, "y": 3.0}, edges_out=["c"], edge_labels={}),
+            DroneNode(node_id="e", node_type="control", kind="self_terminate", label="Stop", params={}, position={"x": 4.0, "y": 4.0}, edges_out=[], edge_labels={}),
+        ],
+        created_at="2026-01-01T00:00:00+00:00",
+        author="tester",
+        description="loop",
+        is_brain_preset=False,
+    )
+    drone = cp.assemble_drone("Looper", "tethered", "custom", loop_behaviour, actor="tester")
+    source = cp.decode_drone_source(drone.drone_id)
+    assert "if kind in ('repeat', 'loop'):" in source
+    assert "if kind in ('loop_until', 'while_condition'):" in source

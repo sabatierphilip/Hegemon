@@ -324,6 +324,7 @@ class Drone:
     binary_blob: str = ""
     blob_size_bytes: int = 0
     blob_hash: str = ""
+    blob_path: str = ""
     pid: int | None = None
     deadrop_path: str = ""
     child_drone_ids: list[int] = field(default_factory=list)
@@ -3366,7 +3367,10 @@ class HegemonControlPlane:
     def decode_drone_source(self, drone_id: str) -> str:
         drone = self.drones[drone_id]
         key_hex = self._drone_private_keys.get(drone_id, "")
-        return decode_blob(drone.binary_blob, key_hex)
+        blob_b64 = drone.binary_blob
+        if drone.blob_path:
+            blob_b64 = Path(drone.blob_path).read_text(encoding="utf-8").strip()
+        return decode_blob(blob_b64, key_hex)
 
     def deploy_drone_remote(self, drone_id: str, host: str, ssh_key_path: str, remote_workdir: str, actor: str) -> dict[str, Any]:
         drone = self.drones[drone_id]
@@ -3375,7 +3379,10 @@ class HegemonControlPlane:
         if host not in self._registered_hosts():
             raise ValueError("target host is not a registered endpoint")
         key_hex = self._drone_private_keys.get(drone_id, "")
-        out = deploy_blob_remote(drone.binary_blob, key_hex, host, ssh_key_path, remote_workdir)
+        blob_b64 = drone.binary_blob
+        if drone.blob_path:
+            blob_b64 = Path(drone.blob_path).read_text(encoding="utf-8").strip()
+        out = deploy_blob_remote(blob_b64, key_hex, host, ssh_key_path, remote_workdir)
         self._record("drone.remote_deploy", {"drone_id": drone_id, "host": host, "actor": actor, **out})
         return out
 
@@ -3470,6 +3477,16 @@ class HegemonControlPlane:
             autonomy_level=autonomy_level,
             payload_binary=payload_binary,
         )
+        compiled_blob = self._drone_compiler.compile(drone=Drone(
+            drone_id=drone_id, name=name, tier=tier, status="ready", mission=mission, behaviour=behaviour_obj,
+            target_endpoint_id=target_endpoint_id, target_host=target_host, target_network=target_network, autonomy_level=autonomy_level,
+            ttl_seconds=ttl_seconds, checkin_interval_seconds=checkin_interval_seconds, launched_at=None, last_checkin_at=None, return_at=None,
+            keypair_public=keypair.verify_key.encode().hex(), findings=[], telemetry=[], health={}, live_output=[], current_node_id=None,
+            stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor,
+            payload=payload_obj, payload_binary=payload_binary,
+        ), private_key_hex=private_key_hex, embedded_intel=embedded_intel)
+        blob_path = workdir / "drone.blob"
+        blob_path.write_text(compiled_blob, encoding="utf-8")
         drone = Drone(
             drone_id=drone_id,
             name=name,
@@ -3499,18 +3516,12 @@ class HegemonControlPlane:
             payload=payload_obj,
             payload_binary=payload_binary,
             binary_blueprint=binary_blueprint,
-            binary_blob=self._drone_compiler.compile(drone=Drone(
-                drone_id=drone_id, name=name, tier=tier, status="ready", mission=mission, behaviour=behaviour_obj,
-                target_endpoint_id=target_endpoint_id, target_host=target_host, target_network=target_network, autonomy_level=autonomy_level,
-                ttl_seconds=ttl_seconds, checkin_interval_seconds=checkin_interval_seconds, launched_at=None, last_checkin_at=None, return_at=None,
-                keypair_public=keypair.verify_key.encode().hex(), findings=[], telemetry=[], health={}, live_output=[], current_node_id=None,
-                stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor,
-                payload=payload_obj, payload_binary=payload_binary,
-            ), private_key_hex=private_key_hex, embedded_intel=embedded_intel),
+            binary_blob="",
+            blob_path=str(blob_path),
             supported_binary_actions=supported_binary_actions,
         )
-        drone.blob_size_bytes = len(base64.b64decode(drone.binary_blob.encode("ascii"))) if drone.binary_blob else 0
-        drone.blob_hash = hashlib.sha256(drone.binary_blob.encode("utf-8")).hexdigest()[:16] if drone.binary_blob else ""
+        drone.blob_size_bytes = len(base64.b64decode(compiled_blob.encode("ascii"))) if compiled_blob else 0
+        drone.blob_hash = hashlib.sha256(compiled_blob.encode("utf-8")).hexdigest()[:16] if compiled_blob else ""
         drone.deadrop_path = f"/tmp/.hg_drop_{drone_id.replace('drone-','')}"
         self.drones[drone_id] = drone
         self._drone_command_locks[drone_id] = threading.Lock()
@@ -3596,8 +3607,11 @@ class HegemonControlPlane:
         workdir = Path("data") / "drones" / drone_id
         workdir.mkdir(parents=True, exist_ok=True)
         key_hex = self._drone_private_keys.get(drone_id, "")
+        blob_b64 = drone.binary_blob
+        if drone.blob_path:
+            blob_b64 = Path(drone.blob_path).read_text(encoding="utf-8").strip()
         proc = launch_blob_locally(
-            drone.binary_blob,
+            blob_b64,
             key_hex,
             workdir,
             detached=(drone.tier == "autonomous"),

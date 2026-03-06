@@ -2137,7 +2137,13 @@ def api_drones_blob(drone_id: str):
     drone = _control_plane.drones.get(drone_id)
     if drone is None:
         return jsonify({"error": "not_found"}), 404
-    return jsonify({"blob_b64": drone.binary_blob, "blob_hash": drone.blob_hash, "blob_size_bytes": drone.blob_size_bytes})
+    blob_b64 = drone.binary_blob
+    if drone.blob_path:
+        try:
+            blob_b64 = Path(drone.blob_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            blob_b64 = ""
+    return jsonify({"blob_b64": blob_b64, "blob_hash": drone.blob_hash, "blob_size_bytes": drone.blob_size_bytes, "blob_path": drone.blob_path})
 
 
 @app.get("/api/drones/<drone_id>/source")
