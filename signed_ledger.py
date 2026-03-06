@@ -42,6 +42,12 @@ class SignedLedger:
                 pass
             os.chmod(self.path, 0o600)
         self._validate_permissions(self.path, allowed_modes={0o600})
+        if self.path.exists() and not self.verify_chain():
+            import logging
+            logging.getLogger(__name__).critical(
+                "LEDGER INTEGRITY FAILURE: %s — chain or signature verification failed. Possible tampering detected.",
+                self.path,
+            )
 
     def _validate_permissions(self, target: Path, allowed_modes: set[int]) -> None:
         st = target.stat()
@@ -110,12 +116,24 @@ class SignedLedger:
         return rows
 
     def verify_chain(self) -> bool:
+        verify_key = self.signer.verify_key
         prev = "genesis"
         for row in self.read_all():
-            core = {"ts": row["ts"], "event_type": row["event_type"], "payload": row["payload"], "prev_hash": row["prev_hash"]}
+            core = {
+                "ts": row["ts"],
+                "event_type": row["event_type"],
+                "payload": row["payload"],
+                "prev_hash": row["prev_hash"],
+            }
             if row["prev_hash"] != prev:
                 return False
-            if hashlib.sha256(_canonical(core)).hexdigest() != row["entry_hash"]:
+            computed_hash = hashlib.sha256(_canonical(core)).hexdigest()
+            if computed_hash != row["entry_hash"]:
+                return False
+            try:
+                sig_bytes = base64.b64decode(row["signature"])
+                verify_key.verify(row["entry_hash"].encode("utf-8"), sig_bytes)
+            except Exception:
                 return False
             prev = row["entry_hash"]
         return True
