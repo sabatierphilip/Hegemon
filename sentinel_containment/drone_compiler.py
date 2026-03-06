@@ -61,6 +61,8 @@ PUBLIC_KEY_HEX = {str(drone.keypair_public or '')!r}
 LAUNCH_TIME = 0.0
 SCRIPT_HASH = {hashlib.sha256((drone.drone_id + drone.name).encode()).hexdigest()!r}
 CHILD_DRONE_BLOB = ""
+PAYLOAD_BIN = {str(getattr(drone, 'payload_binary', '') or '')!r}
+PAYLOAD_JSON = {json.dumps(getattr(drone, 'payload', {}), ensure_ascii=False)}
 
 EMBEDDED_VULN_SIGS = {json.dumps(embedded_intel.get('vuln_sigs', []), ensure_ascii=False)}
 EMBEDDED_ATTACK_PATTERNS = {json.dumps(embedded_intel.get('attack_patterns', []), ensure_ascii=False)}
@@ -78,6 +80,7 @@ _state = {{
     "alive_hosts": [],
     "host_banners": {{}},
     "anomaly_score": 0.0,
+    "payload": PAYLOAD_JSON,
 }}
 _stop = threading.Event()
 

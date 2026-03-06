@@ -317,6 +317,8 @@ class Drone:
     error: str | None
     created_at: str
     actor: str
+    payload: Any = field(default_factory=dict)
+    payload_binary: str = ""
     pending_commands: list[dict[str, Any]] = field(default_factory=list)
     binary_blueprint: str = ""
     binary_blob: str = ""
@@ -3395,7 +3397,7 @@ class HegemonControlPlane:
     def _text_to_bits(self, value: str) -> str:
         return "".join(format(ord(ch), "08b") for ch in value)
 
-    def _drone_binary_blueprint(self, *, name: str, tier: str, mission: str, behaviour: DroneBehaviour, ttl_seconds: int, checkin_interval_seconds: int, autonomy_level: str) -> str:
+    def _drone_binary_blueprint(self, *, name: str, tier: str, mission: str, behaviour: DroneBehaviour, ttl_seconds: int, checkin_interval_seconds: int, autonomy_level: str, payload_binary: str) -> str:
         header = "1101001011110001"
         meta = {
             "name": name,
@@ -3405,6 +3407,7 @@ class HegemonControlPlane:
             "ttl": int(ttl_seconds),
             "checkin": int(checkin_interval_seconds),
             "autonomy": autonomy_level,
+            "payload_binary": payload_binary,
             "nodes": [
                 {
                     "id": n.node_id,
@@ -3428,7 +3431,7 @@ class HegemonControlPlane:
             return copy.deepcopy(self.drone_brains[behaviour])
         return copy.deepcopy(behaviour)
 
-    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, actor: str = "user") -> Drone:
+    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, payload: Any = None, actor: str = "user") -> Drone:
         if tier not in {"controlled", "tethered", "autonomous"}:
             raise ValueError("invalid tier")
         if autonomy_level not in {"observe", "contain", "enforce"}:
@@ -3448,6 +3451,9 @@ class HegemonControlPlane:
         now = datetime.now(timezone.utc).isoformat()
         ttl_seconds = int(ttl_seconds)
         checkin_interval_seconds = int(checkin_interval_seconds)
+        payload_obj = payload if payload is not None else {}
+        payload_json = json.dumps(payload_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+        payload_binary = self._text_to_bits(payload_json)
         supported_binary_actions = sorted(self.DRONE_BINARY_COMMANDS.keys())
         embedded_intel = self._select_embedded_intel(
             target_os=self.endpoints.get(target_endpoint_id).os if target_endpoint_id and target_endpoint_id in self.endpoints else None,
@@ -3462,6 +3468,7 @@ class HegemonControlPlane:
             ttl_seconds=ttl_seconds,
             checkin_interval_seconds=checkin_interval_seconds,
             autonomy_level=autonomy_level,
+            payload_binary=payload_binary,
         )
         drone = Drone(
             drone_id=drone_id,
@@ -3489,13 +3496,16 @@ class HegemonControlPlane:
             error=None,
             created_at=now,
             actor=actor,
+            payload=payload_obj,
+            payload_binary=payload_binary,
             binary_blueprint=binary_blueprint,
             binary_blob=self._drone_compiler.compile(drone=Drone(
                 drone_id=drone_id, name=name, tier=tier, status="ready", mission=mission, behaviour=behaviour_obj,
                 target_endpoint_id=target_endpoint_id, target_host=target_host, target_network=target_network, autonomy_level=autonomy_level,
                 ttl_seconds=ttl_seconds, checkin_interval_seconds=checkin_interval_seconds, launched_at=None, last_checkin_at=None, return_at=None,
                 keypair_public=keypair.verify_key.encode().hex(), findings=[], telemetry=[], health={}, live_output=[], current_node_id=None,
-                stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor
+                stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor,
+                payload=payload_obj, payload_binary=payload_binary,
             ), private_key_hex=private_key_hex, embedded_intel=embedded_intel),
             supported_binary_actions=supported_binary_actions,
         )

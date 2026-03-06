@@ -109,6 +109,19 @@ def test_drone_is_compiled_to_binary_blueprint(tmp_path: Path):
     assert "00000011" in drone.supported_binary_actions
 
 
+
+
+def test_drone_payload_is_compiled_to_binary_and_embedded(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    payload = {"task": "collect", "targets": ["10.0.0.10", "10.0.0.11"], "depth": 2}
+    drone = cp.assemble_drone("Carrier", "tethered", "custom", _mini_behaviour(), payload=payload, actor="tester")
+    assert drone.payload == payload
+    assert drone.payload_binary
+    assert set(drone.payload_binary).issubset({"0", "1"})
+    source = cp.decode_drone_source(drone.drone_id)
+    assert "PAYLOAD_BIN" in source
+    assert "PAYLOAD_JSON" in source
+
 def test_available_binary_action_catalog(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     actions = cp.available_drone_actions()
