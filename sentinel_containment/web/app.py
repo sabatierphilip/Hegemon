@@ -2117,6 +2117,7 @@ def api_drones_assemble():
             autonomy_level=str(payload.get("autonomy_level", "observe")),
             ttl_seconds=int(payload.get("ttl_seconds", 3600)),
             checkin_interval_seconds=int(payload.get("checkin_interval_seconds", 60)),
+            payload=payload.get("payload", {}),
             actor=str(payload.get("actor", "user")),
         )
     except ValueError as exc:
@@ -2223,6 +2224,7 @@ def api_drones_preview_build():
             autonomy_level="observe",
             ttl_seconds=1800,
             checkin_interval_seconds=45,
+            payload={"profile": spec["mission"], "generated_by": "preview-build"},
             actor=actor,
         )
         built.append({
@@ -2233,6 +2235,7 @@ def api_drones_preview_build():
             "behaviour_id": drone.behaviour.behaviour_id,
             "binary_blueprint_preview": drone.binary_blueprint[:128],
             "supported_binary_actions": drone.supported_binary_actions,
+            "payload_binary_preview": drone.payload_binary[:128],
         })
     return jsonify({"built": built, "count": len(built)})
 
