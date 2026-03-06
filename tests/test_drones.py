@@ -125,6 +125,16 @@ def test_blob_roundtrip_and_source_decode(tmp_path: Path):
     assert drone.drone_id in source
 
 
+def test_autonomous_drone_launches_detached_from_hegemon_io(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("FreeAuto", "autonomous", "custom", _mini_behaviour(), actor="tester")
+    cp.launch_drone(drone.drone_id, actor="tester")
+
+    proc = cp._drone_processes[drone.drone_id]
+    assert proc.stdout is None
+    assert proc.stderr is None
+
+
 def test_deadrop_polling_merges_payload(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     drone = cp.assemble_drone("Dropper", "autonomous", "custom", _mini_behaviour(), actor="tester")

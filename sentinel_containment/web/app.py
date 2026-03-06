@@ -225,7 +225,7 @@ HTML = """
 <body>
 <div class="wrap">
   <div class="title">
-    <h1>🛡️ Sentinel-Containment Command Center</h1>
+    <h1>Sentinel-Containment Command Center</h1>
     <div class="header-cues">
       <div class="cue {{ 'ok' if readiness.token_ready else 'warn' }}">Auth Token: {{ 'Ready' if readiness.token_ready else 'Missing' }}</div>
       <div class="cue {{ 'ok' if readiness.key_policy_ready else 'warn' }}">Key Policy: {{ 'Ready' if readiness.key_policy_ready else 'Blocked' }}</div>
@@ -442,7 +442,7 @@ HTML = """
 
   <div id="tab-drones" class="tab-panel">
     <div class="panel">
-      <h3>🚁 DRONES</h3>
+      <h3>DRONES</h3>
       <div class="small">Visual behaviour builder + compiled blob lifecycle management.</div>
       <div style="display:grid;grid-template-columns:300px 1fr 320px;gap:10px;margin-top:10px;">
         <div>
@@ -669,8 +669,8 @@ class HegemonAutocomplete {
   }
   render(){
     this.dropdownEl.innerHTML=this.items.map((it,idx)=>{
-      const badge=it.trust_tier==='verified' ? '<span style="color:#7CFC8A">✓ Verified</span>' : (it.trust_tier? '<span style="color:#f6ad55">⚠ Community</span>' : '');
-      const icon=(it.icon||'').startsWith('http')?`<img src="${it.icon}" style="width:18px;height:18px;border-radius:4px;"/>`:`<span>${it.icon||'📦'}</span>`;
+      const badge=it.trust_tier==='verified' ? '<span style="color:#7CFC8A">✓ Verified</span>' : (it.trust_tier? '<span style="color:#f6ad55">Community</span>' : '');
+      const icon=(it.icon||'').startsWith('http')?`<img src="${it.icon}" style="width:18px;height:18px;border-radius:4px;"/>`:`<span>${it.icon||'PKG'}</span>`;
       return `<div data-idx="${idx}" style="padding:8px;display:flex;gap:8px;align-items:center;cursor:pointer;background:${idx===this.active?'#1a2342':'transparent'};">
         ${icon}<div style="flex:1;"><div style="font-weight:700;">${it.label}</div><div style="font-size:12px;opacity:0.8;">${it.sublabel||''}</div></div><div style="font-size:12px;">${badge}</div></div>`;
     }).join('');
@@ -1027,7 +1027,7 @@ function validateGraph(){
     if(n.kind.startsWith('if_')){const labels=Object.values(n.edge_labels||{}); if(!(labels.includes('yes')&&labels.includes('no'))) errors.push(`${n.label}: condition needs yes/no edge labels.`);} 
     if(n.kind==='repeat'&&n.params.target_node_id&&!graphState.nodes[n.params.target_node_id]) errors.push(`${n.label}: repeat target node does not exist.`);
   });
-  const panel=document.getElementById('graph-errors'); if(panel) panel.innerHTML=errors.length?errors.map(e=>`• ${e}`).join('<br/>'):'✓ Graph validation passed';
+  const panel=document.getElementById('graph-errors'); if(panel) panel.innerHTML=errors.length?errors.map(e=>`• ${e}`).join('<br/>'):'Graph validation passed';
   return {valid:errors.length===0,errors};
 }
 function graphToBehaviourNodes(){
@@ -1058,7 +1058,7 @@ async function refreshDrones(){
       const card=document.createElement('div'); card.className='card';
       const ttl=Number(d.ttl_seconds||0), left=Math.max(0,ttl); const pct=ttl>0?Math.max(0,Math.min(100,Math.round((left/ttl)*100))):100;
       const barColor=pct<20?'#ff4d6d':'#4cc9f0';
-      card.innerHTML=`<div style='display:flex;justify-content:space-between;'><strong>🚁 ${d.name}</strong><span>${String(d.tier||'').toUpperCase()}</span></div><div>● ${String(d.status||'').toUpperCase()} PID: ${d.pid||'-'} Blob: ${d.blob_hash||'-'}</div><div>Mission: ${d.mission||'-'} Target: ${d.target_host||d.target_network||d.target_endpoint_id||'-'}</div><div style='margin-top:6px;background:#1a2340;border-radius:8px;overflow:hidden;'><div style='height:8px;width:${pct}%;background:${barColor};'></div></div><div class='small'>Hosts: ${(d.stats||{}).hosts_pinged||0} pinged, ${((d.stats||{}).alive_hosts||[]).length||0} alive</div><div class='small'>Ports: ${(d.stats||{}).ports_scanned||0} Findings: ${(d.stats||{}).findings_count||0}</div><div style='margin-top:6px;display:flex;gap:4px;flex-wrap:wrap;'><button data-id='${d.drone_id}' class='dr-detail'>Detail ▶</button><button data-id='${d.drone_id}' class='dr-term'>Terminate</button><button data-id='${d.drone_id}' class='dr-launch'>Launch</button></div>`;
+      card.innerHTML=`<div style='display:flex;justify-content:space-between;'><strong>${d.name}</strong><span>${String(d.tier||'').toUpperCase()}</span></div><div>● ${String(d.status||'').toUpperCase()} PID: ${d.pid||'-'} Blob: ${d.blob_hash||'-'}</div><div>Mission: ${d.mission||'-'} Target: ${d.target_host||d.target_network||d.target_endpoint_id||'-'}</div><div style='margin-top:6px;background:#1a2340;border-radius:8px;overflow:hidden;'><div style='height:8px;width:${pct}%;background:${barColor};'></div></div><div class='small'>Hosts: ${(d.stats||{}).hosts_pinged||0} pinged, ${((d.stats||{}).alive_hosts||[]).length||0} alive</div><div class='small'>Ports: ${(d.stats||{}).ports_scanned||0} Findings: ${(d.stats||{}).findings_count||0}</div><div style='margin-top:6px;display:flex;gap:4px;flex-wrap:wrap;'><button data-id='${d.drone_id}' class='dr-detail'>Detail ▶</button><button data-id='${d.drone_id}' class='dr-term'>Terminate</button><button data-id='${d.drone_id}' class='dr-launch'>Launch</button></div>`;
       fleet.appendChild(card);
     });
     fleet.querySelectorAll('.dr-detail').forEach(b=>b.onclick=()=>loadDroneDetail(b.dataset.id));
@@ -1122,7 +1122,7 @@ document.getElementById('graph-compile')?.addEventListener('click', async ()=>{
   const panel=document.getElementById('drone-build-result');
   if(resp.ok){
     const kb=((data.blob_size_bytes||0)/1024).toFixed(1);
-    panel.innerHTML=`✓ Drone assembled: ${data.name} (${data.drone_id})<br/>Blob size: ${kb} KB ${Number(kb)>100?'⚠️':''} Hash: ${data.blob_hash||'-'}<br/><button id='launch-now-btn'>Launch Now</button>`;
+    panel.innerHTML=`Drone assembled: ${data.name} (${data.drone_id})<br/>Blob size: ${kb} KB ${Number(kb)>100?'(large)':''} Hash: ${data.blob_hash||'-'}<br/><button id='launch-now-btn'>Launch Now</button>`;
     document.getElementById('launch-now-btn')?.addEventListener('click',()=>droneAction(data.drone_id,'launch'));
     await refreshDrones();
   }else{panel.textContent=`Assemble failed: ${data.message||data.error||'unknown error'}`;}
@@ -1274,7 +1274,7 @@ def _readiness_payload() -> dict[str, object]:
         "blocked_reasons": list(runtime_payload.get("blocked_reasons", [])),
     }
     if not token_ready and not readiness["startup_warning"]:
-        readiness["startup_warning"] = "⚠️ HARD WARNING: dashboard API token missing; operator auth is not ready."
+        readiness["startup_warning"] = "HARD WARNING: dashboard API token missing; operator auth is not ready."
     return readiness
 
 
@@ -1593,7 +1593,7 @@ def control_plane_demo_seed():
             {
                 "app_id": "app-dashboard-nginx",
                 "name": "Nginx",
-                "icon": "🌐",
+                "icon": "NET",
                 "store_id": "store-linux",
                 "publisher": "NGINX Inc.",
                 "version": "1.25.5",
@@ -1775,16 +1775,20 @@ def control_plane_autocomplete():
     if kind in {"endpoints", "all"}:
         for ep in _control_plane.endpoints.values():
             if q in ep.endpoint_id.lower() or q in ep.host_name.lower():
-                suggestions.append({"type": "endpoint", "id": ep.endpoint_id, "label": ep.host_name, "sublabel": ep.endpoint_id, "icon": "🖥️", "store_id": None, "trust_tier": None, "score": 0.9 if ep.host_name.lower().startswith(q) else 0.7, "meta": {}})
+                suggestions.append({"type": "endpoint", "id": ep.endpoint_id, "label": ep.host_name, "sublabel": ep.endpoint_id, "icon": "HOST", "store_id": None, "trust_tier": None, "score": 0.9 if ep.host_name.lower().startswith(q) else 0.7, "meta": {}})
     if kind in {"friends", "all"}:
         for fr in _control_plane.friends.values():
             if q in fr.name.lower():
-                suggestions.append({"type": "friend", "id": fr.friend_id, "label": fr.name, "sublabel": fr.identity_method, "icon": "👤", "store_id": None, "trust_tier": None, "score": 0.8 if fr.name.lower().startswith(q) else 0.6, "meta": {}})
+                suggestions.append({"type": "friend", "id": fr.friend_id, "label": fr.name, "sublabel": fr.identity_method, "icon": "USER", "store_id": None, "trust_tier": None, "score": 0.8 if fr.name.lower().startswith(q) else 0.6, "meta": {}})
     if kind in {"packages", "all"}:
         for hit in _control_plane.store_client.search(q, store_ids, limit=20):
-            suggestions.append({"type": "store_app", "id": f"{hit.store_id}:{hit.name}", "label": hit.name, "sublabel": f"{hit.publisher} • {hit.version}", "icon": hit.icon_url or "📦", "store_id": hit.store_id, "trust_tier": hit.trust_tier, "score": hit.score, "meta": hit.raw})
+            suggestions.append({"type": "store_app", "id": f"{hit.store_id}:{hit.name}", "label": hit.name, "sublabel": f"{hit.publisher} • {hit.version}", "icon": hit.icon_url or "PKG", "store_id": hit.store_id, "trust_tier": hit.trust_tier, "score": hit.score, "meta": hit.raw})
     suggestions = sorted(suggestions, key=lambda row: float(row.get("score", 0.0)), reverse=True)[:15]
-    payload = {"suggestions": suggestions, "total": len(suggestions), "from_cache": False, "query": q}
+    if kind == "endpoints":
+        compact_suggestions = [str(item.get("label", "")) for item in suggestions if str(item.get("label", "")).strip()]
+        payload = {"suggestions": compact_suggestions, "total": len(compact_suggestions), "from_cache": False, "query": q}
+    else:
+        payload = {"suggestions": suggestions, "total": len(suggestions), "from_cache": False, "query": q}
     _AUTOCOMPLETE_CACHE[cache_key] = (now, payload)
     return jsonify(payload)
 
@@ -1847,12 +1851,16 @@ def control_plane_add_endpoint():
     endpoint = _control_plane.add_endpoint(
         {
             "host_name": host_name,
-            "endpoint_type": "on-prem",
-            "os": "linux",
-            "kernel": "unknown",
-            "sbom_status": "unknown",
-            "enrollment_method": "manual",
-            "installed_packages": {},
+            "endpoint_type": str(payload.get("endpoint_type", "on-prem")),
+            "os": str(payload.get("os", "linux")),
+            "kernel": str(payload.get("kernel", "unknown")),
+            "sbom_status": str(payload.get("sbom_status", "unknown")),
+            "enrollment_method": str(payload.get("enrollment_method", "manual")),
+            "network_exposure": str(payload.get("network_exposure", "internal")),
+            "asset_value": float(payload.get("asset_value", 7.0)),
+            "trust_level": float(payload.get("trust_level", 6.0)),
+            "installed_packages": payload.get("installed_packages", {}) if isinstance(payload.get("installed_packages", {}), dict) else {},
+            "telemetry_events": payload.get("telemetry_events", []) if isinstance(payload.get("telemetry_events", []), list) else [],
         },
         actor="dashboard",
     )

@@ -340,11 +340,21 @@ def decode_blob(blob_b64: str, private_key_hex: str) -> str:
     return zlib.decompress(compressed).decode("utf-8")
 
 
-def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path) -> subprocess.Popen[bytes]:
+def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, detached: bool = False) -> subprocess.Popen[bytes]:
     source = decode_blob(blob_b64, private_key_hex)
     script_path = workdir / "drone.py"
     script_path.write_text(source, encoding="utf-8")
     os.chmod(script_path, 0o700)
+    if detached:
+        return subprocess.Popen(
+            [sys.executable, str(script_path)],
+            cwd=str(workdir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
     return subprocess.Popen([sys.executable, str(script_path)], cwd=str(workdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
