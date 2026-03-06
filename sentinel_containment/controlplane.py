@@ -315,6 +315,8 @@ class Drone:
     created_at: str
     actor: str
     pending_commands: list[dict[str, Any]] = field(default_factory=list)
+    binary_blueprint: str = ""
+    supported_binary_actions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -409,6 +411,19 @@ class PatchProposal:
 
 
 class HegemonControlPlane:
+    DRONE_BINARY_COMMANDS: dict[str, str] = {
+        "00000001": "ping",
+        "00000010": "scan",
+        "00000011": "report",
+        "00000100": "pause",
+        "00000101": "resume",
+        "00000110": "terminate",
+        "00000111": "inject_node",
+        "00001000": "retask",
+        "00001001": "tighten_checkin",
+        "00001010": "broadcast_status",
+    }
+
     def __init__(self, ledger_path: Path | None = None) -> None:
         signer = signing.SigningKey.generate()
         self.ledger = SignedLedger(ledger_path or Path("data/controlplane_ledger.jsonl"), signer)
@@ -3288,6 +3303,50 @@ class HegemonControlPlane:
     def _registered_hosts(self) -> set[str]:
         return {ep.host_name for ep in self.endpoints.values()} | set(self.endpoints.keys())
 
+    def available_drone_actions(self) -> list[dict[str, Any]]:
+        return [
+            {"binary": opcode, "action": action, "description": f"Dispatch {action} command"}
+            for opcode, action in self.DRONE_BINARY_COMMANDS.items()
+        ]
+
+    def _decode_binary_command(self, binary_command: str) -> str:
+        normalized = "".join(ch for ch in str(binary_command).strip() if ch in {"0", "1"})
+        if not normalized or len(normalized) != 8:
+            raise ValueError("commands must be 8-bit binary strings")
+        command = self.DRONE_BINARY_COMMANDS.get(normalized)
+        if command is None:
+            raise ValueError("unknown binary command opcode")
+        return command
+
+    def _text_to_bits(self, value: str) -> str:
+        return "".join(format(ord(ch), "08b") for ch in value)
+
+    def _drone_binary_blueprint(self, *, name: str, tier: str, mission: str, behaviour: DroneBehaviour, ttl_seconds: int, checkin_interval_seconds: int, autonomy_level: str) -> str:
+        header = "1101001011110001"
+        meta = {
+            "name": name,
+            "tier": tier,
+            "mission": mission,
+            "behaviour": behaviour.behaviour_id,
+            "ttl": int(ttl_seconds),
+            "checkin": int(checkin_interval_seconds),
+            "autonomy": autonomy_level,
+            "nodes": [
+                {
+                    "id": n.node_id,
+                    "type": n.node_type,
+                    "kind": n.kind,
+                    "label": n.label,
+                    "params": n.params,
+                    "edges": n.edges_out,
+                    "edge_labels": n.edge_labels,
+                }
+                for n in behaviour.nodes
+            ],
+        }
+        payload = json.dumps(meta, separators=(",", ":"), sort_keys=True)
+        return header + self._text_to_bits(payload)
+
     def _resolve_behaviour(self, behaviour: DroneBehaviour | str) -> DroneBehaviour:
         if isinstance(behaviour, str):
             if behaviour not in self.drone_brains:
@@ -3312,6 +3371,18 @@ class HegemonControlPlane:
         workdir = Path("data") / "drones" / drone_id
         workdir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc).isoformat()
+        ttl_seconds = int(ttl_seconds)
+        checkin_interval_seconds = int(checkin_interval_seconds)
+        supported_binary_actions = sorted(self.DRONE_BINARY_COMMANDS.keys())
+        binary_blueprint = self._drone_binary_blueprint(
+            name=name,
+            tier=tier,
+            mission=mission,
+            behaviour=behaviour_obj,
+            ttl_seconds=ttl_seconds,
+            checkin_interval_seconds=checkin_interval_seconds,
+            autonomy_level=autonomy_level,
+        )
         drone = Drone(
             drone_id=drone_id,
             name=name,
@@ -3323,8 +3394,8 @@ class HegemonControlPlane:
             target_host=target_host,
             target_network=target_network,
             autonomy_level=autonomy_level,
-            ttl_seconds=int(ttl_seconds),
-            checkin_interval_seconds=int(checkin_interval_seconds),
+            ttl_seconds=ttl_seconds,
+            checkin_interval_seconds=checkin_interval_seconds,
             launched_at=None,
             last_checkin_at=None,
             return_at=None,
@@ -3338,6 +3409,8 @@ class HegemonControlPlane:
             error=None,
             created_at=now,
             actor=actor,
+            binary_blueprint=binary_blueprint,
+            supported_binary_actions=supported_binary_actions,
         )
         self.drones[drone_id] = drone
         self._drone_command_locks[drone_id] = threading.Lock()
@@ -3635,6 +3708,22 @@ class HegemonControlPlane:
                         break
                     elif c == "report":
                         self._append_signed_telemetry(drone, "On-demand report", command=True)
+                    elif c == "ping":
+                        self._append_signed_telemetry(drone, "Binary command ping acknowledged", command=True)
+                    elif c == "scan":
+                        self._append_signed_telemetry(drone, "Binary command initiated focused scan", command=True)
+                    elif c == "resume":
+                        drone.status = "active"
+                    elif c == "retask":
+                        mission = str(cmd.get("params", {}).get("mission", "dynamic-tasking"))
+                        drone.mission = mission
+                        self._append_signed_telemetry(drone, f"Mission retasked to {mission}", command=True)
+                    elif c == "tighten_checkin":
+                        interval = int(cmd.get("params", {}).get("seconds", 10))
+                        drone.checkin_interval_seconds = max(1, min(interval, 300))
+                        self._append_signed_telemetry(drone, f"Check-in interval set to {drone.checkin_interval_seconds}s", command=True)
+                    elif c == "broadcast_status":
+                        self._append_signed_telemetry(drone, f"Status broadcast: {drone.status}", command=True)
                     elif c == "inject_node":
                         raw_node = cmd.get("params", {}).get("node", {})
                         node = DroneNode(node_id=raw_node.get("node_id", f"n-{uuid4().hex[:6]}"), node_type=raw_node.get("node_type", "action"), kind=raw_node.get("kind", "send_report"), label=raw_node.get("label", "Injected Node"), params=dict(raw_node.get("params", {})), position={"x": 0.0, "y": 0.0}, edges_out=[], edge_labels={})
@@ -3655,12 +3744,32 @@ class HegemonControlPlane:
         drone = self.drones[drone_id]
         if drone.tier != "controlled":
             raise ValueError("commands only valid for controlled drones")
-        if command not in {"ping", "scan", "report", "pause", "resume", "terminate", "inject_node"}:
-            raise ValueError("invalid command")
+        decoded = self._decode_binary_command(command)
+        if command not in drone.supported_binary_actions:
+            raise ValueError("binary opcode not supported by this drone")
         with self._drone_command_locks[drone_id]:
-            drone.pending_commands.append({"command": command, "params": params, "actor": actor, "at": datetime.now(timezone.utc).isoformat()})
-        self._record("drone.command_sent", {"drone_id": drone_id, "command": command, "actor": actor})
-        return {"queued": True, "command": command}
+            drone.pending_commands.append({"command": decoded, "command_binary": command, "params": params, "actor": actor, "at": datetime.now(timezone.utc).isoformat()})
+        self._record("drone.command_sent", {"drone_id": drone_id, "command": decoded, "command_binary": command, "actor": actor})
+        return {"queued": True, "command": decoded, "command_binary": command}
+
+    def delete_drone(self, drone_id: str, actor: str) -> dict[str, Any]:
+        drone = self.drones.get(drone_id)
+        if drone is None:
+            raise ValueError("drone not found")
+        if drone.tier == "autonomous" or drone.status == "dark":
+            raise ValueError("dark or autonomous drones cannot be deleted")
+        if drone.tier not in {"controlled", "tethered"}:
+            raise ValueError("only controlled or tethered drones can be deleted")
+        ev = self._drone_stop_events.get(drone_id)
+        if ev:
+            ev.set()
+        self.drones.pop(drone_id, None)
+        self._drone_threads.pop(drone_id, None)
+        self._drone_stop_events.pop(drone_id, None)
+        self._drone_command_locks.pop(drone_id, None)
+        self._drone_private_keys.pop(drone_id, None)
+        self._record("drone.deleted", {"drone_id": drone_id, "tier": drone.tier, "actor": actor})
+        return {"deleted": True, "drone_id": drone_id}
 
     def recall_drone(self, drone_id: str, actor: str) -> Drone:
         drone = self.drones[drone_id]

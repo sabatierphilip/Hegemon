@@ -442,10 +442,15 @@ HTML = """
 
   <div id="tab-drones" class="tab-panel">
     <div class="panel">
-      <h3>🚁 DRONES <button id="new-drone-btn" class="tab-btn" style="float:right;">+ New Drone</button></h3>
+      <h3>🚁 Advanced Drone Operations <button id="new-drone-btn" class="tab-btn" style="float:right;">+ New Drone</button></h3>
+      <div class="small">Binary command protocol enabled. Use 8-bit opcodes for all controlled drone commands.</div>
       <div style="display:grid;grid-template-columns:1fr 1.6fr;gap:10px;">
         <div id="drone-fleet"></div>
-        <div id="drone-detail" class="json">Select a drone to see details.</div>
+        <div>
+          <div id="drone-detail" class="json">Select a drone to see details.</div>
+          <div class="json" style="margin-top:8px;"><pre id="drone-actions">Loading binary action matrix...</pre></div>
+          <div class="json" style="margin-top:8px;"><pre id="drone-comms">Awaiting drone comms telemetry and binary uplink decode.</pre></div>
+        </div>
       </div>
     </div>
   </div>
@@ -867,6 +872,18 @@ document.getElementById("kernel-telemetry-mode-toggle")?.addEventListener("chang
 window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadStoreFilters(); loadControlPlane(); runAutonomousScan(); loadKernelTelemetryStatus(); window.setInterval(runAutonomousScan, 60000); window.setInterval(loadKernelTelemetryStatus, 5000);});
 
 let selectedDroneId=null;
+let droneActionMatrix=[];
+async function refreshDroneActions(){
+  try{
+    const resp=await fetch('/api/drones/actions');
+    if(!resp.ok){return;}
+    droneActionMatrix=await resp.json();
+    const panel=document.getElementById('drone-actions');
+    if(panel){
+      panel.textContent=droneActionMatrix.map(a=>`${a.binary} -> ${a.action} :: ${a.description}`).join('\n');
+    }
+  }catch(_e){}
+}
 async function refreshDrones(){
   try{
     const resp=await fetch('/api/drones');
@@ -876,23 +893,29 @@ async function refreshDrones(){
     if(!fleet)return;
     fleet.innerHTML='';
     drones.forEach(d=>{
+      const canDelete=(d.tier==='controlled'||d.tier==='tethered') && d.status!=='dark';
       const card=document.createElement('div');
       card.className='card';
-      card.innerHTML=`<div><strong>🚁 ${d.name}</strong> ${d.tier}</div><div>Status: ${d.status}</div><div>Mission: ${d.mission}</div><div>TTL: ${d.ttl_seconds}</div><button data-id='${d.drone_id}' class='dr-detail'>Details ▶</button> <button data-id='${d.drone_id}' class='dr-recall'>Recall</button> <button data-id='${d.drone_id}' class='dr-term'>Terminate</button>`;
+      card.innerHTML=`<div><strong>🚁 ${d.name}</strong> ${d.tier}</div><div>Status: ${d.status}</div><div>Mission: ${d.mission}</div><div>Brain: ${d.behaviour_name||'-'}</div><div>TTL: ${d.ttl_seconds}</div><button data-id='${d.drone_id}' class='dr-detail'>Details ▶</button> <button data-id='${d.drone_id}' class='dr-recall'>Recall</button> <button data-id='${d.drone_id}' class='dr-term'>Terminate</button> ${canDelete?`<button data-id='${d.drone_id}' class='dr-delete'>Delete</button>`:''}`;
       fleet.appendChild(card);
     });
     fleet.querySelectorAll('.dr-detail').forEach(b=>b.onclick=()=>loadDroneDetail(b.dataset.id));
     fleet.querySelectorAll('.dr-recall').forEach(b=>b.onclick=()=>droneAction(b.dataset.id,'recall'));
     fleet.querySelectorAll('.dr-term').forEach(b=>b.onclick=()=>droneAction(b.dataset.id,'terminate'));
-  }catch(e){}
+    fleet.querySelectorAll('.dr-delete').forEach(b=>b.onclick=()=>deleteDrone(b.dataset.id));
+  }catch(_e){}
 }
 async function loadDroneDetail(droneId){
   selectedDroneId=droneId;
   const resp=await fetch(`/api/drones/${droneId}`);
   if(!resp.ok)return;
   const d=await resp.json();
+  const comms=document.getElementById('drone-comms');
+  if(comms){
+    comms.textContent=(d.live_output||[]).slice(-25).join('\n') || 'No live comms output yet.';
+  }
   const panel=document.getElementById('drone-detail');
-  panel.innerHTML=`<div><strong>${d.name}</strong> (${d.tier}) - ${d.status}</div><div>Mission: ${d.mission} Target: ${d.target_host||d.target_network||d.target_endpoint_id||'-'}</div><div>Current Node: ${d.current_node_id||'-'}</div><div>Telemetry:</div><pre>${(d.telemetry||[]).map(t=>`[${t.ts}] ${t.message}`).join('\n')}</pre>${d.tier==='controlled'?`<div><input id='dr-cmd' placeholder='command'/><button id='dr-send'>Send</button></div>`:`<div style='opacity:.6'>🌑 DARK MODE Autonomous drone controls limited.</div>`}`;
+  panel.innerHTML=`<div><strong>${d.name}</strong> (${d.tier}) - ${d.status}</div><div>Mission: ${d.mission} Target: ${d.target_host||d.target_network||d.target_endpoint_id||'-'}</div><div>Brain: ${d.behaviour?.name||'-'} (${d.behaviour?.behaviour_id||'-'})</div><div>Assembly Binary (preview): <code>${(d.binary_blueprint||'').slice(0,96)}...</code></div><div>Supported opcodes: ${(d.supported_binary_actions||[]).join(', ')}</div><div>Current Node: ${d.current_node_id||'-'}</div><div>Telemetry:</div><pre>${(d.telemetry||[]).map(t=>`[${t.ts}] ${t.message}`).join('\n')}</pre>${d.tier==='controlled'?`<div><input id='dr-cmd' placeholder='binary opcode e.g. 00000011'/><button id='dr-send'>Send Binary</button></div>`:`<div style='opacity:.6'>🌑 DARK MODE Autonomous drone controls limited.</div>`}`;
   const send=document.getElementById('dr-send');
   if(send){send.onclick=()=>sendDroneCommand(droneId);}
 }
@@ -907,10 +930,17 @@ async function droneAction(droneId,action){
   await refreshDrones();
   if(selectedDroneId===droneId)await loadDroneDetail(droneId);
 }
+async function deleteDrone(droneId){
+  await fetch(`/api/drones/${droneId}`,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'dashboard'})});
+  if(selectedDroneId===droneId){selectedDroneId=null; const p=document.getElementById('drone-detail'); if(p){p.textContent='Select a drone to see details.';}}
+  await refreshDrones();
+}
 document.getElementById('new-drone-btn')?.addEventListener('click', async ()=>{
-  await fetch('/api/drones/assemble',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'Scout-Beta',tier:'controlled',mission:'scout',brain_id:'brain-pinger-basic',autonomy_level:'observe',ttl_seconds:3600,checkin_interval_seconds:60,actor:'dashboard'})});
+  const generatedName=(window.prompt('Drone name','Aegis-Drone')||`Drone-${Math.random().toString(16).slice(2,6).toUpperCase()}`).trim();
+  await fetch('/api/drones/assemble',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:generatedName,tier:'controlled',mission:'advanced-recon',brain_id:'brain-ghost-hunter',autonomy_level:'observe',ttl_seconds:3600,checkin_interval_seconds:60,actor:'dashboard'})});
   await refreshDrones();
 });
+refreshDroneActions();
 setInterval(()=>{if(document.getElementById('tab-drones')?.classList.contains('active')){refreshDrones(); if(selectedDroneId) loadDroneDetail(selectedDroneId);}},3000);
 
 </script>
@@ -1832,6 +1862,8 @@ def api_drones_list():
             "ttl_seconds": drone.ttl_seconds,
             "last_checkin_at": drone.last_checkin_at,
             "stats": drone.stats,
+            "behaviour_name": drone.behaviour.name,
+            "behaviour_id": drone.behaviour.behaviour_id,
         })
     return jsonify(rows)
 
@@ -1884,6 +1916,69 @@ def api_drones_assemble():
     except ValueError as exc:
         return jsonify({"error": "invalid_request", "message": str(exc)}), 400
     return jsonify(_control_plane.as_dict(drone))
+
+
+
+
+@app.get("/api/drones/actions")
+def api_drones_actions():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify(_control_plane.available_drone_actions())
+
+
+@app.post("/api/drones/preview-build")
+def api_drones_preview_build():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    actor = str(payload.get("actor", "preview-builder"))
+    roster = [
+        {"name": "Aegis-Scout", "tier": "controlled", "mission": "wide-recon", "brain_id": "brain-ghost-hunter"},
+        {"name": "Aegis-Tether", "tier": "tethered", "mission": "honeypot-net", "brain_id": "brain-sentinel-honeypot"},
+        {"name": "Aegis-Dark", "tier": "autonomous", "mission": "watch-loop", "brain_id": "brain-watcher"},
+    ]
+    built = []
+    for spec in roster:
+        drone = _control_plane.assemble_drone(
+            name=spec["name"],
+            tier=spec["tier"],
+            mission=spec["mission"],
+            behaviour=spec["brain_id"],
+            autonomy_level="observe",
+            ttl_seconds=1800,
+            checkin_interval_seconds=45,
+            actor=actor,
+        )
+        built.append({
+            "drone_id": drone.drone_id,
+            "name": drone.name,
+            "tier": drone.tier,
+            "mission": drone.mission,
+            "behaviour_id": drone.behaviour.behaviour_id,
+            "binary_blueprint_preview": drone.binary_blueprint[:128],
+            "supported_binary_actions": drone.supported_binary_actions,
+        })
+    return jsonify({"built": built, "count": len(built)})
+
+
+@app.delete("/api/drones/<drone_id>")
+def api_drones_delete(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    try:
+        result = _control_plane.delete_drone(drone_id, str(payload.get("actor", "user")))
+    except ValueError as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(result)
 
 
 @app.post("/api/drones/<drone_id>/launch")
