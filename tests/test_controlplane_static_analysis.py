@@ -45,6 +45,44 @@ def test_js_analyzer_tracks_property_and_jquery_sinks(tmp_path: Path):
     issues = cp._analyze_js_file(js_path, "jquery.js")
     assert any(i["issue_id"] == "js-dom-xss" for i in issues)
 
+def test_js_analyzer_ignores_template_literal_braces_for_scope_pop(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    js_path = tmp_path / "template_scope.js"
+    js_path.write_text(
+        """
+        function passthrough(v) { return v; }
+        const doEval = (value) => {
+            const sample = `template has braces } and ${value}`;
+            const alias = passthrough(value);
+            eval(alias);
+        };
+        const source = window.location.search;
+        doEval(source);
+        """,
+        encoding="utf-8",
+    )
+
+    issues = cp._analyze_js_file(js_path, "template_scope.js")
+    assert any(i["issue_id"] == "js-dynamic-exec" for i in issues)
+
+
+def test_js_analyzer_handles_multiline_destructuring_without_false_scope_closure(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    js_path = tmp_path / "destructuring.js"
+    js_path.write_text(
+        """
+        const source = window.location.search;
+        const {
+          payload,
+        } = { payload: source };
+        document.body.innerHTML = payload;
+        """,
+        encoding="utf-8",
+    )
+
+    issues = cp._analyze_js_file(js_path, "destructuring.js")
+    assert any(i["issue_id"] == "js-dom-xss" for i in issues)
+
 
 def test_cross_language_hints_are_potential_with_evidence_and_sorted(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
@@ -116,6 +154,8 @@ def test_lstm_rnn_binary_model_is_built_from_markov_graph_context(tmp_path: Path
     assert model["timesteps"] == 4
     assert 0.0 <= model["sequence_anomaly"] <= 1.0
     assert 0.0 <= model["confidence"] <= 1.0
+    assert "dynamic_weights" in model
+    assert set(model["dynamic_weights"]).issuperset({"i_x", "f_h", "o_x", "cand_x"})
 
 
 def test_scan_populates_markov_rnn_bayesian_posteriors(tmp_path: Path):
