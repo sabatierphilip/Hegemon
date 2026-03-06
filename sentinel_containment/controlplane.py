@@ -831,6 +831,44 @@ class HegemonControlPlane:
         vocab = sorted(set(sequence_tokens))
         vocab_index = {tok: i for i, tok in enumerate(vocab)}
         bit_width = 20
+        token_counts: dict[str, int] = defaultdict(int)
+        transition_counts: dict[tuple[str, str], int] = defaultdict(int)
+        for token in sequence_tokens:
+            token_counts[token] += 1
+        for left, right in zip(sequence_tokens, sequence_tokens[1:]):
+            transition_counts[(left, right)] += 1
+
+        def _seeded_unit(seed_key: str) -> float:
+            digest = hashlib.sha256(seed_key.encode("utf-8", errors="ignore")).digest()
+            value = int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+            return (value * 2.0) - 1.0
+
+        graph_density = (
+            min(1.0, float(graph_features.get("call_edges", 0.0)) / 6000.0)
+            + min(1.0, float(graph_features.get("functions", 0.0)) / 24000.0)
+            + min(1.0, float(graph_features.get("modules", 0.0)) / 4000.0)
+        ) / 3.0
+        avg_stage_transition = 0.0
+        transition_probs = [float(prob) for row in markov_matrix.values() for prob in row.values() if isinstance(prob, (int, float))]
+        if transition_probs:
+            avg_stage_transition = sum(transition_probs) / len(transition_probs)
+        transition_energy = min(1.0, avg_stage_transition * 1.8)
+
+        model_seed = (
+            f"{'|'.join(sequence_tokens)}::"
+            f"{round(graph_density, 5)}::{round(transition_energy, 5)}::"
+            f"{len(vocab)}::{len(sequence_tokens)}"
+        )
+        gate_bases = {
+            "i_x": 0.65 + (0.45 * _seeded_unit(f"{model_seed}:i_x")),
+            "i_h": 0.35 + (0.35 * _seeded_unit(f"{model_seed}:i_h")),
+            "f_h": 0.50 + (0.40 * _seeded_unit(f"{model_seed}:f_h")),
+            "f_bias": 0.10 + (0.50 * graph_density),
+            "o_x": 0.55 + (0.35 * _seeded_unit(f"{model_seed}:o_x")),
+            "o_g": 0.25 + (0.35 * transition_energy),
+            "cand_x": 1.0 + (0.55 * _seeded_unit(f"{model_seed}:cand_x")),
+            "cand_h": 0.35 + (0.45 * _seeded_unit(f"{model_seed}:cand_h")),
+        }
 
         def token_to_bits(token: str) -> list[float]:
             digest = hashlib.sha1(token.encode("utf-8", errors="ignore")).digest()
@@ -848,16 +886,18 @@ class HegemonControlPlane:
         c = [0.0] * bit_width
         states: list[list[float]] = []
 
-        graph_bias = min(0.35, (graph_features.get("call_edges", 0.0) / 3000.0) + (graph_features.get("functions", 0.0) / 12000.0))
+        graph_bias = min(0.4, (graph_features.get("call_edges", 0.0) / 2800.0) + (graph_features.get("functions", 0.0) / 10000.0) + (graph_features.get("modules", 0.0) / 4500.0))
         for token in sequence_tokens:
             x = token_to_bits(token)
             x_mean = sum(x) / bit_width
             h_mean = sum(h) / bit_width
-            i_gate = sigmoid(0.9 * x_mean + 0.6 * h_mean + graph_bias)
-            f_gate = sigmoid(0.7 * h_mean + 0.2)
-            o_gate = sigmoid(0.8 * x_mean + 0.4 * graph_bias)
+            token_freq = token_counts.get(token, 1) / max(1, len(sequence_tokens))
+            structural_boost = graph_bias + (token_freq * 0.2)
+            i_gate = sigmoid((gate_bases["i_x"] * x_mean) + (gate_bases["i_h"] * h_mean) + structural_boost)
+            f_gate = sigmoid((gate_bases["f_h"] * h_mean) + gate_bases["f_bias"])
+            o_gate = sigmoid((gate_bases["o_x"] * x_mean) + (gate_bases["o_g"] * transition_energy) + (0.3 * structural_boost))
             for j in range(bit_width):
-                candidate = math.tanh((x[j] * 1.3) + (h[j] * 0.5) + graph_bias)
+                candidate = math.tanh((x[j] * gate_bases["cand_x"]) + (h[j] * gate_bases["cand_h"]) + structural_boost)
                 c[j] = (f_gate * c[j]) + (i_gate * candidate)
                 h[j] = o_gate * math.tanh(c[j])
             states.append(h[:])
@@ -895,6 +935,8 @@ class HegemonControlPlane:
             "temporal_stability": round(temporal_stability, 5),
             "predicted_next_stages": predictions,
             "confidence": confidence,
+            "dynamic_weights": {k: round(v, 5) for k, v in gate_bases.items()},
+            "observed_transition_pairs": len(transition_counts),
             "notes": "Self-building binary token model fused with Markov-MTRE transitions and graph features.",
         }
 
@@ -1856,6 +1898,7 @@ class HegemonControlPlane:
         scopes: list[dict[str, bool]] = [{}]
         function_profiles: dict[str, dict[str, Any]] = {}
         function_stack: list[str] = []
+        pending_destructure_vars: list[str] | None = None
 
         def get_taint(var_name: str) -> bool:
             for scope in reversed(scopes):
@@ -1914,11 +1957,62 @@ class HegemonControlPlane:
             ("js-dom-xss", r"\$\([^)]*\)\.(?:html|append|prepend|before|after)\s*\((.+)\)", "Avoid jQuery HTML sink APIs with untrusted content."),
         ]
 
+        def strip_inline_js_comment(raw_line: str) -> str:
+            in_single = False
+            in_double = False
+            in_template = False
+            escaped = False
+            out: list[str] = []
+            for idx, ch in enumerate(raw_line):
+                nxt = raw_line[idx + 1] if idx + 1 < len(raw_line) else ""
+                if escaped:
+                    out.append(ch)
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    out.append(ch)
+                    escaped = True
+                    continue
+                if not in_double and not in_template and ch == "'":
+                    in_single = not in_single
+                    out.append(ch)
+                    continue
+                if not in_single and not in_template and ch == '"':
+                    in_double = not in_double
+                    out.append(ch)
+                    continue
+                if not in_single and not in_double and ch == "`":
+                    in_template = not in_template
+                    out.append(ch)
+                    continue
+                if not in_single and not in_double and not in_template and ch == "/" and nxt == "/":
+                    break
+                out.append(ch)
+            return "".join(out)
+
         sink_seen: set[tuple[str, int, str]] = set()
         for i, l in enumerate(lines, 1):
-            line = re.sub(r"//.*$", "", l)
+            line = strip_inline_js_comment(l)
             stripped = line.strip()
             if not stripped:
+                continue
+
+            destructure_start = re.match(r"\s*(?:const|let|var)\s*\{\s*$", stripped)
+            if destructure_start:
+                pending_destructure_vars = []
+                continue
+
+            if pending_destructure_vars is not None:
+                destructure_close = re.match(r"\s*}\s*=\s*(.+?)\s*;?\s*$", stripped)
+                if destructure_close:
+                    rhs_expr = destructure_close.group(1)
+                    tainted, _detail = expr_taint(rhs_expr)
+                    for var_name in pending_destructure_vars:
+                        set_taint(var_name, tainted, declared=True)
+                    pending_destructure_vars = None
+                    continue
+                names = re.findall(r"[A-Za-z_$][\w$]*", stripped)
+                pending_destructure_vars.extend([name for name in names if name not in {"const", "let", "var"}])
                 continue
 
             fn_decl = re.match(r"\s*function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)", stripped)
@@ -1934,8 +2028,10 @@ class HegemonControlPlane:
                 fn_name = arrow_decl.group(1)
                 params = [p.strip() for p in arrow_decl.group(2).split(",") if p.strip()]
                 function_profiles.setdefault(fn_name, {"params": params, "returns_from_tainted_arg": False})
-                function_stack.append(fn_name)
-                scopes.append({p: True for p in params})
+                arrow_tail = stripped.split("=>", 1)[1] if "=>" in stripped else ""
+                if "{" in arrow_tail:
+                    function_stack.append(fn_name)
+                    scopes.append({p: True for p in params})
 
             assignment = re.match(r"\s*(?:(let|const|var)\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*=\s*(.+?)\s*;?\s*$", line)
             if assignment:
@@ -1979,8 +2075,8 @@ class HegemonControlPlane:
                 confidence = 0.9 if "user_input_source" in taint_vars else 0.82
                 issues.append({"issue_id":issue_id,"lang":"javascript","severity":"critical" if issue_id == "js-dynamic-exec" else "high","kill_chain_stage":"execution","reconstructed_kill_chain":["initial_access","execution","impact"],"techniques":["T1059.007"],"file":rel,"line":i,"confidence":confidence,"reasoning":reasoning,"reasoning_details":["taint-propagation","scope-aware-js","sink-context"],"tags":["js","taint","dataflow"],"patch_hint":patch_hint,"dataflow_path":["source",*(taint_vars[:4] or ["derived_var"]),"sink"],"call_path":function_stack[-2:],"binary_offset":None,"section_name":None,"entropy":None})
 
-            open_count = line.count("{")
-            close_count = line.count("}")
+            leading_closers = re.match(r"^\}+(?=\s*(?:else\b|catch\b|finally\b|;|$))", stripped)
+            close_count = len(leading_closers.group(0)) if leading_closers else 0
             if close_count:
                 for _ in range(close_count):
                     if function_stack and len(scopes) > 1:
@@ -1988,8 +2084,6 @@ class HegemonControlPlane:
                         scopes.pop()
                     elif len(scopes) > 1:
                         scopes.pop()
-            if open_count > close_count and not (fn_decl or arrow_decl):
-                scopes.append({})
 
         return issues
 
