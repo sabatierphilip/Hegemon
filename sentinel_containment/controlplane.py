@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import os
 import secrets
 import shelve
+import socket
 import sre_parse
 import subprocess
 import threading
@@ -22,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from nacl import signing
 
@@ -260,6 +263,61 @@ class Endpoint:
 
 
 @dataclass
+class DroneNode:
+    """Single node in a drone behaviour graph."""
+    node_id: str
+    node_type: str
+    kind: str
+    label: str
+    params: dict[str, Any]
+    position: dict[str, float]
+    edges_out: list[str]
+    edge_labels: dict[str, str]
+
+
+@dataclass
+class DroneBehaviour:
+    """Complete assembled behaviour graph."""
+    behaviour_id: str
+    name: str
+    nodes: list[DroneNode]
+    created_at: str
+    author: str
+    description: str
+    is_brain_preset: bool = False
+
+
+@dataclass
+class Drone:
+    drone_id: str
+    name: str
+    tier: str
+    status: str
+    mission: str
+    behaviour: DroneBehaviour
+    target_endpoint_id: str | None
+    target_host: str | None
+    target_network: str | None
+    autonomy_level: str
+    ttl_seconds: int
+    checkin_interval_seconds: int
+    launched_at: str | None
+    last_checkin_at: str | None
+    return_at: str | None
+    keypair_public: str | None
+    findings: list[str]
+    telemetry: list[dict[str, Any]]
+    health: dict[str, Any]
+    live_output: list[str]
+    current_node_id: str | None
+    stats: dict[str, Any]
+    error: str | None
+    created_at: str
+    actor: str
+    pending_commands: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class VulnerabilityFinding:
     finding_id: str
     endpoint_id: str
@@ -379,6 +437,13 @@ class HegemonControlPlane:
         self._seed_self_endpoint()
         self.auto_patch_policy = AutoPatchPolicy()
         self.human_review_queue: list[str] = []
+        self.drones: dict[str, Drone] = {}
+        self.drone_brains: dict[str, DroneBehaviour] = {}
+        self._drone_threads: dict[str, threading.Thread] = {}
+        self._drone_stop_events: dict[str, threading.Event] = {}
+        self._drone_command_locks: dict[str, threading.Lock] = {}
+        self._drone_private_keys: dict[str, signing.SigningKey] = {}
+        self._seed_drone_brains()
         self._proposal_approved_at: dict[str, float] = {}
         self.scan_history: dict[str, list[ScanResult]] = {}
         self.scan_results_by_id: dict[str, ScanResult] = {}
@@ -3112,6 +3177,513 @@ class HegemonControlPlane:
                 epss, perc = self._query_epss(cve)
                 discovered.append(VulnerabilityFinding(finding_id=f"vuln-{secrets.token_hex(4)}", endpoint_id=endpoint.endpoint_id, cve=cve, cvss=self._cvss_from_vuln(vuln), exploit_availability=round(min(10.0, 3.0 + chain * 2.1 + epss * 3.5), 2), topological_impact=6.0, asset_value=endpoint.asset_value, trust_level=endpoint.trust_level, evidence=[{"type": "unfriendly-scan"}], suggested_remediations=["manual remediation only"], risk_score=6.0, source="unfriendly-scan", patch_eligible=False, epss_score=epss, epss_percentile=perc))
         return discovered
+
+    def _make_brain(self, behaviour_id: str, name: str, description: str, nodes: list[dict[str, Any]]) -> DroneBehaviour:
+        now = datetime.now(timezone.utc).isoformat()
+        drone_nodes = [
+            DroneNode(
+                node_id=str(n["node_id"]),
+                node_type=str(n.get("node_type", "action")),
+                kind=str(n.get("kind", "noop")),
+                label=str(n.get("label", n.get("kind", "Node"))),
+                params=dict(n.get("params", {})),
+                position={"x": float(n.get("position", {}).get("x", 0.0)), "y": float(n.get("position", {}).get("y", 0.0))},
+                edges_out=[str(x) for x in n.get("edges_out", [])],
+                edge_labels={str(k): str(v) for k, v in dict(n.get("edge_labels", {})).items()},
+            )
+            for n in nodes
+        ]
+        return DroneBehaviour(
+            behaviour_id=behaviour_id,
+            name=name,
+            nodes=drone_nodes,
+            created_at=now,
+            author="system",
+            description=description,
+            is_brain_preset=True,
+        )
+
+    def _seed_drone_brains(self) -> None:
+        self.drone_brains = {
+            "brain-pinger-basic": self._make_brain(
+                "brain-pinger-basic",
+                "pinger-basic",
+                "Launches parallel pings then reports and terminates.",
+                [
+                    {"node_id": "n1", "node_type": "trigger", "kind": "on_launch", "label": "On Launch", "edges_out": ["n2"]},
+                    {"node_id": "n2", "node_type": "control", "kind": "parallel", "label": "Parallel", "edges_out": ["n3", "n4", "n5"]},
+                    {"node_id": "n3", "node_type": "action", "kind": "ping_host", "label": "Ping A", "params": {"host": "{target_a}"}, "edges_out": ["n6"]},
+                    {"node_id": "n4", "node_type": "action", "kind": "ping_host", "label": "Ping B", "params": {"host": "{target_b}"}, "edges_out": ["n6"]},
+                    {"node_id": "n5", "node_type": "action", "kind": "ping_host", "label": "Ping C", "params": {"host": "{target_c}"}, "edges_out": ["n6"]},
+                    {"node_id": "n6", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": 600}, "edges_out": ["n7"]},
+                    {"node_id": "n7", "node_type": "action", "kind": "establish_contact", "label": "Establish Contact", "edges_out": ["n8"]},
+                    {"node_id": "n8", "node_type": "action", "kind": "send_report", "label": "Send Report", "edges_out": ["n9"]},
+                    {"node_id": "n9", "node_type": "control", "kind": "self_terminate", "label": "Self Terminate", "edges_out": []},
+                ],
+            ),
+            "brain-scout-passive": self._make_brain(
+                "brain-scout-passive", "scout-passive", "Passive scout loop.",
+                [
+                    {"node_id": "s1", "node_type": "trigger", "kind": "on_launch", "label": "On Launch", "edges_out": ["s2"]},
+                    {"node_id": "s2", "node_type": "action", "kind": "port_scan", "label": "Port Scan", "params": {"host": "{target}", "port_range": "1-1024"}, "edges_out": ["s3"]},
+                    {"node_id": "s3", "node_type": "action", "kind": "fingerprint_hosts", "label": "Fingerprint Hosts", "edges_out": ["s4"]},
+                    {"node_id": "s4", "node_type": "action", "kind": "send_report", "label": "Send Report", "edges_out": ["s5"]},
+                    {"node_id": "s5", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": "{checkin_interval}"}, "edges_out": ["s6"]},
+                    {"node_id": "s6", "node_type": "control", "kind": "repeat", "label": "Repeat", "params": {"target_node_id": "s3", "max_iterations": 100}, "edges_out": ["s3"]},
+                ],
+            ),
+            "brain-sentinel-honeypot": self._make_brain(
+                "brain-sentinel-honeypot", "sentinel-honeypot", "Deploys honeypot and reacts to contact.",
+                [
+                    {"node_id": "h1", "node_type": "trigger", "kind": "on_launch", "label": "On Launch", "edges_out": ["h2"]},
+                    {"node_id": "h2", "node_type": "action", "kind": "deploy_honeypot", "label": "Deploy Honeypot", "params": {"port": 2222, "service": "ssh"}, "edges_out": ["h3"]},
+                    {"node_id": "h3", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": 60}, "edges_out": ["h4"]},
+                    {"node_id": "h4", "node_type": "condition", "kind": "if_ttl_expired", "label": "If TTL Expired", "edges_out": ["h8", "h5"], "edge_labels": {"h8": "yes", "h5": "no"}},
+                    {"node_id": "h5", "node_type": "action", "kind": "send_report", "label": "Send Report Critical", "params": {"severity": "critical"}, "edges_out": ["h6"]},
+                    {"node_id": "h6", "node_type": "condition", "kind": "if_severity", "label": "If autonomy=enforce", "params": {"min_findings": 0}, "edges_out": ["h7", "h8"]},
+                    {"node_id": "h7", "node_type": "action", "kind": "isolate_source_ip", "label": "Isolate Source", "edges_out": ["h9"]},
+                    {"node_id": "h8", "node_type": "action", "kind": "send_report", "label": "Send Clean Report", "params": {"status": "clean"}, "edges_out": ["h9"]},
+                    {"node_id": "h9", "node_type": "control", "kind": "self_terminate", "label": "Self Terminate", "edges_out": []},
+                ],
+            ),
+            "brain-probe-and-report": self._make_brain(
+                "brain-probe-and-report", "probe-and-report", "Runs unfriendly scan and optional patching.",
+                [
+                    {"node_id": "p1", "node_type": "trigger", "kind": "on_launch", "label": "On Launch", "edges_out": ["p2"]},
+                    {"node_id": "p2", "node_type": "action", "kind": "run_vuln_scan", "label": "Run Vuln Scan", "params": {"mode": "unfriendly"}, "edges_out": ["p3"]},
+                    {"node_id": "p3", "node_type": "condition", "kind": "if_severity", "label": "If Findings >= 1", "params": {"operator": ">=", "value": 1}, "edges_out": ["p4", "p8"]},
+                    {"node_id": "p4", "node_type": "action", "kind": "send_report", "label": "Send Report", "params": {"include_findings": True}, "edges_out": ["p5"]},
+                    {"node_id": "p5", "node_type": "condition", "kind": "if_severity", "label": "If critical findings > 0", "params": {"operator": ">=", "value": 1}, "edges_out": ["p6", "p8"]},
+                    {"node_id": "p6", "node_type": "control", "kind": "wait", "label": "Await Patch Approval", "params": {"seconds": 300}, "edges_out": ["p7"]},
+                    {"node_id": "p7", "node_type": "action", "kind": "apply_approved_patches", "label": "Apply Approved", "edges_out": ["p8"]},
+                    {"node_id": "p8", "node_type": "control", "kind": "self_terminate", "label": "Self Terminate", "edges_out": []},
+                ],
+            ),
+            "brain-ghost-hunter": self._make_brain(
+                "brain-ghost-hunter", "ghost-hunter", "Searches for clone signatures.",
+                [
+                    {"node_id": "g1", "node_type": "trigger", "kind": "on_launch", "label": "On Launch", "edges_out": ["g2"]},
+                    {"node_id": "g2", "node_type": "action", "kind": "fingerprint_hosts", "label": "Scan Network", "edges_out": ["g3"]},
+                    {"node_id": "g3", "node_type": "condition", "kind": "if_severity", "label": "If Clone Detected", "params": {"operator": ">=", "value": 1}, "edges_out": ["g4", "g6"]},
+                    {"node_id": "g4", "node_type": "action", "kind": "send_report", "label": "Send Alert", "params": {"severity": "critical"}, "edges_out": ["g5"]},
+                    {"node_id": "g5", "node_type": "action", "kind": "sinkhole_clone", "label": "Sinkhole Clone", "edges_out": ["g6"]},
+                    {"node_id": "g6", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": "{checkin_interval}"}, "edges_out": ["g7"]},
+                    {"node_id": "g7", "node_type": "control", "kind": "repeat", "label": "Repeat", "params": {"target_node_id": "g2", "max_iterations": 100}, "edges_out": ["g2"]},
+                ],
+            ),
+            "brain-watcher": self._make_brain(
+                "brain-watcher", "watcher", "Continuously ingests telemetry and alerts anomalies.",
+                [
+                    {"node_id": "w1", "node_type": "trigger", "kind": "on_launch", "label": "On Launch", "edges_out": ["w2"]},
+                    {"node_id": "w2", "node_type": "action", "kind": "ingest_telemetry", "label": "Ingest Telemetry", "edges_out": ["w3"]},
+                    {"node_id": "w3", "node_type": "action", "kind": "send_report", "label": "Feed to Kill Chain Model", "edges_out": ["w4"]},
+                    {"node_id": "w4", "node_type": "condition", "kind": "if_severity", "label": "If Anomaly >= 0.7", "params": {"operator": ">=", "value": 1}, "edges_out": ["w5", "w6"]},
+                    {"node_id": "w5", "node_type": "action", "kind": "send_report", "label": "Send Alert", "edges_out": ["w6"]},
+                    {"node_id": "w6", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": "{checkin_interval}"}, "edges_out": ["w7"]},
+                    {"node_id": "w7", "node_type": "control", "kind": "repeat", "label": "Repeat", "params": {"target_node_id": "w2", "max_iterations": 100}, "edges_out": ["w2"]},
+                ],
+            ),
+        }
+
+    def _registered_hosts(self) -> set[str]:
+        return {ep.host_name for ep in self.endpoints.values()} | set(self.endpoints.keys())
+
+    def _resolve_behaviour(self, behaviour: DroneBehaviour | str) -> DroneBehaviour:
+        if isinstance(behaviour, str):
+            if behaviour not in self.drone_brains:
+                raise ValueError("unknown behaviour brain")
+            return copy.deepcopy(self.drone_brains[behaviour])
+        return copy.deepcopy(behaviour)
+
+    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, actor: str = "user") -> Drone:
+        if tier not in {"controlled", "tethered", "autonomous"}:
+            raise ValueError("invalid tier")
+        if autonomy_level not in {"observe", "contain", "enforce"}:
+            raise ValueError("invalid autonomy_level")
+        active_count = len([d for d in self.drones.values() if d.status == "active"])
+        if active_count >= 10:
+            raise ValueError("max active drone thread cap reached")
+        if target_host and target_host not in self._registered_hosts() and autonomy_level != "observe":
+            raise ValueError("unregistered external host requires observe autonomy")
+        behaviour_obj = self._resolve_behaviour(behaviour)
+        drone_id = f"drone-{uuid4().hex[:8]}"
+        keypair = signing.SigningKey.generate()
+        self._drone_private_keys[drone_id] = keypair
+        workdir = Path("data") / "drones" / drone_id
+        workdir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc).isoformat()
+        drone = Drone(
+            drone_id=drone_id,
+            name=name,
+            tier=tier,
+            status="ready",
+            mission=mission,
+            behaviour=behaviour_obj,
+            target_endpoint_id=target_endpoint_id,
+            target_host=target_host,
+            target_network=target_network,
+            autonomy_level=autonomy_level,
+            ttl_seconds=int(ttl_seconds),
+            checkin_interval_seconds=int(checkin_interval_seconds),
+            launched_at=None,
+            last_checkin_at=None,
+            return_at=None,
+            keypair_public=keypair.verify_key.encode().hex(),
+            findings=[],
+            telemetry=[],
+            health={},
+            live_output=[],
+            current_node_id=None,
+            stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0},
+            error=None,
+            created_at=now,
+            actor=actor,
+        )
+        self.drones[drone_id] = drone
+        self._drone_command_locks[drone_id] = threading.Lock()
+        self._record("drone.assembled", {"actor": actor, "drone_id": drone_id, "tier": tier, "mission": mission})
+        return drone
+
+    def auto_assemble_drone(self, endpoint_id: str, actor: str) -> Drone | None:
+        endpoint = self.endpoints.get(endpoint_id)
+        if endpoint is None:
+            return None
+        endpoint_findings = [f for f in self.findings.values() if f.endpoint_id == endpoint_id]
+        critical = [f for f in endpoint_findings if f.cvss >= 8.0 or f.risk_score >= 8.0]
+        graph = self._build_lateral_movement_graph()
+        edges = graph.get("edges", []) if isinstance(graph, dict) else []
+        has_lateral_hop = any(str(e.get("source")) == endpoint_id or str(e.get("target")) == endpoint_id for e in edges)
+        approved_patch = any(
+            p.endpoint_id == endpoint_id and p.status == "approved"
+            for p in self.patch_proposals.values()
+        )
+        if endpoint.network_exposure == "internet" and critical:
+            return self.assemble_drone(
+                name=f"Probe-{endpoint.host_name}", tier="tethered", mission="probe", behaviour="brain-probe-and-report",
+                target_endpoint_id=endpoint_id, target_host=endpoint.host_name, autonomy_level="contain", actor=actor,
+            )
+        if has_lateral_hop and not endpoint.telemetry_events:
+            return self.assemble_drone(
+                name=f"Watcher-{endpoint.host_name}", tier="autonomous", mission="watcher", behaviour="brain-watcher",
+                target_endpoint_id=endpoint_id, target_host=endpoint.host_name, autonomy_level="observe", actor=actor,
+            )
+        if endpoint.network_exposure == "internet" and not endpoint_findings:
+            return self.assemble_drone(
+                name=f"Sentinel-{endpoint.host_name}", tier="tethered", mission="sentinel", behaviour="brain-sentinel-honeypot",
+                target_endpoint_id=endpoint_id, target_host=endpoint.host_name, autonomy_level="observe", actor=actor,
+            )
+        if critical and approved_patch:
+            return self.assemble_drone(
+                name=f"PatchRunner-{endpoint.host_name}", tier="tethered", mission="patch_runner", behaviour="brain-probe-and-report",
+                target_endpoint_id=endpoint_id, target_host=endpoint.host_name, autonomy_level="contain", actor=actor,
+            )
+        return None
+
+    def _has_enforce_approval(self, drone_id: str) -> bool:
+        friend_ok = {f.friend_id for f in self.friends.values() if f.status == "active" and "approve_patches" in f.capabilities}
+        if not friend_ok:
+            return False
+        for entry in self.audit_log():
+            if entry.get("event_type") != "drone.enforce_approved":
+                continue
+            payload = entry.get("payload", {})
+            if payload.get("drone_id") == drone_id and payload.get("approver") in friend_ok:
+                return True
+        return False
+
+    def launch_drone(self, drone_id: str, actor: str) -> Drone:
+        drone = self.drones[drone_id]
+        if drone.status != "ready":
+            raise ValueError("drone must be ready")
+        if drone.autonomy_level == "enforce" and not self._has_enforce_approval(drone_id):
+            token = f"drone-launch:{drone_id}"
+            if token not in self.human_review_queue:
+                self.human_review_queue.append(token)
+            self._record("drone.human_review_required", {"drone_id": drone_id, "priority": "p0", "actor": actor})
+            raise PermissionError("human approval required")
+        drone.status = "launched"
+        drone.launched_at = datetime.now(timezone.utc).isoformat()
+        if drone.ttl_seconds > 0 and drone.tier == "autonomous":
+            drone.return_at = datetime.fromtimestamp(time.time() + drone.ttl_seconds, tz=timezone.utc).isoformat()
+        stop_event = threading.Event()
+        self._drone_stop_events[drone_id] = stop_event
+        t = threading.Thread(target=self._drone_execution_loop, args=(drone_id,), daemon=True)
+        self._drone_threads[drone_id] = t
+        drone.status = "active"
+        t.start()
+        self._record("drone.launched", {"actor": actor, "drone_id": drone_id})
+        return drone
+
+    def _next_node(self, node: DroneNode, decision: str | None = None) -> str | None:
+        if not node.edges_out:
+            return None
+        if decision:
+            for out in node.edges_out:
+                if node.edge_labels.get(out) == decision:
+                    return out
+        return node.edges_out[0]
+
+    def _append_signed_telemetry(self, drone: Drone, message: str, **extra: Any) -> None:
+        private = self._drone_private_keys.get(drone.drone_id)
+        if private is None:
+            return
+        payload = {"ts": datetime.now(timezone.utc).isoformat(), "message": message, **extra}
+        blob = json.dumps(payload, sort_keys=True).encode("utf-8")
+        sig = private.sign(blob).signature.hex()
+        signed_payload = {**payload, "signature": sig}
+        if self._verify_telemetry_signature(drone, signed_payload):
+            drone.telemetry.append(signed_payload)
+
+    def _verify_telemetry_signature(self, drone: Drone, payload: dict[str, Any]) -> bool:
+        sig = payload.get("signature")
+        if not isinstance(sig, str) or not drone.keypair_public:
+            return False
+        body = dict(payload)
+        body.pop("signature", None)
+        blob = json.dumps(body, sort_keys=True).encode("utf-8")
+        try:
+            verify_key = signing.VerifyKey(bytes.fromhex(drone.keypair_public))
+            verify_key.verify(blob, bytes.fromhex(sig))
+            return True
+        except Exception:
+            return False
+
+    def _execute_node(self, drone: Drone, node: DroneNode, node_map: dict[str, DroneNode], repeat_count: dict[str, int], stop_event: threading.Event, launch_time: float) -> str | None:
+        kind = node.kind
+        drone.current_node_id = node.node_id
+        drone.stats["nodes_executed"] = int(drone.stats.get("nodes_executed", 0)) + 1
+        if kind == "on_launch":
+            return self._next_node(node)
+        if kind == "ping_host":
+            host = str(node.params.get("host", drone.target_host or "127.0.0.1")).format(target=drone.target_host or "127.0.0.1")
+            proc = subprocess.run(["ping", "-c", "1", "-W", "2", host], capture_output=True, text=True)
+            ok = proc.returncode == 0
+            drone.stats["hosts_pinged"] = int(drone.stats.get("hosts_pinged", 0)) + 1
+            line = f"Ping {host} -> {'ALIVE' if ok else 'TIMEOUT'}"
+            drone.live_output.append(line)
+            self._append_signed_telemetry(drone, line, node_id=node.node_id, success=ok)
+            return self._next_node(node)
+        if kind == "port_scan":
+            host = str(node.params.get("host", drone.target_host or "127.0.0.1")).format(target=drone.target_host or "127.0.0.1")
+            p_range = str(node.params.get("port_range", "1-1024"))
+            start, end = 1, 1024
+            if "-" in p_range:
+                a, b = p_range.split("-", 1)
+                start, end = max(1, int(a)), min(65535, int(b))
+            end = min(end, start + 1023)
+            open_ports = []
+            for port in range(start, end + 1):
+                if stop_event.is_set():
+                    break
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                try:
+                    if sock.connect_ex((host, port)) == 0:
+                        open_ports.append(port)
+                finally:
+                    sock.close()
+            drone.stats["ports_scanned"] = int(drone.stats.get("ports_scanned", 0)) + (end - start + 1)
+            msg = f"Port scan {host}:{start}-{end} -> {len(open_ports)} open"
+            drone.live_output.append(msg)
+            self._append_signed_telemetry(drone, msg, open_ports=open_ports)
+            return self._next_node(node)
+        if kind == "fingerprint_hosts":
+            host = drone.target_host or "127.0.0.1"
+            banners = {}
+            for port in (80, 443, 22):
+                try:
+                    with socket.create_connection((host, port), timeout=0.5) as sock:
+                        sock.settimeout(0.5)
+                        data = sock.recv(256)
+                        banners[str(port)] = data.decode(errors="ignore")
+                except Exception:
+                    continue
+            self._append_signed_telemetry(drone, f"Fingerprint {host}", banners=banners)
+            return self._next_node(node)
+        if kind == "deploy_honeypot":
+            if hasattr(self, "_runtime") and getattr(self, "_runtime", None) is not None and hasattr(self._runtime, "detection") and hasattr(self._runtime.detection, "honeypot"):
+                self._append_signed_telemetry(drone, "Honeypot deployed via runtime")
+            else:
+                self._append_signed_telemetry(drone, "Honeypot simulated deployment")
+            return self._next_node(node)
+        if kind == "run_vuln_scan":
+            target = drone.target_endpoint_id or drone.target_host or HEGEMON_SELF_ENDPOINT_ID
+            result = self.scan(target, mode="unfriendly", include_external_intel=False, actor=f"drone:{drone.drone_id}")
+            for f in result.new_findings:
+                drone.findings.append(f.finding_id)
+            drone.stats["findings_count"] = len(drone.findings)
+            self._append_signed_telemetry(drone, f"Vuln scan complete findings={len(result.new_findings)}")
+            return self._next_node(node)
+        if kind == "send_report":
+            self._append_signed_telemetry(drone, "Report sent", findings=len(drone.findings), stats=drone.stats)
+            return self._next_node(node)
+        if kind == "establish_contact":
+            if drone.tier == "autonomous":
+                drone.status = "returning"
+            self._append_signed_telemetry(drone, "Contact established")
+            return self._next_node(node)
+        if kind == "self_terminate":
+            drone.status = "terminated"
+            stop_event.set()
+            return None
+        if kind == "wait":
+            total = node.params.get("seconds", 0)
+            if isinstance(total, str) and total == "{checkin_interval}":
+                total = drone.checkin_interval_seconds
+            total = int(total)
+            elapsed_wait = 0
+            while elapsed_wait < total and not stop_event.is_set():
+                time.sleep(min(5, total - elapsed_wait))
+                elapsed_wait += min(5, total - elapsed_wait)
+                if drone.ttl_seconds > 0 and time.time() > launch_time + drone.ttl_seconds:
+                    drone.status = "terminated"
+                    self._record("drone.ttl_expired", {"drone_id": drone.drone_id})
+                    stop_event.set()
+                    return None
+            return self._next_node(node)
+        if kind == "parallel":
+            children = [node_map[c] for c in node.edges_out if c in node_map]
+            def run_child(child: DroneNode):
+                self._execute_node(drone, child, node_map, repeat_count, stop_event, launch_time)
+            workers = [threading.Thread(target=run_child, args=(c,), daemon=True) for c in children]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+            return None
+        if kind == "if_severity":
+            val = int(node.params.get("value", node.params.get("min_findings", 1)))
+            op = str(node.params.get("operator", ">="))
+            cur = len(drone.findings)
+            ok = ((op == ">=" and cur >= val) or (op == "<=" and cur <= val) or (op == "==" and cur == val) or (op == "!=" and cur != val))
+            decision = "yes" if ok else "no"
+            return self._next_node(node, decision)
+        if kind == "if_ttl_expired":
+            expired = drone.ttl_seconds > 0 and time.time() > launch_time + drone.ttl_seconds
+            return self._next_node(node, "yes" if expired else "no")
+        if kind == "repeat":
+            mx = int(node.params.get("max_iterations", 1))
+            cnt = repeat_count.get(node.node_id, 0)
+            if cnt >= mx:
+                return None
+            repeat_count[node.node_id] = cnt + 1
+            return str(node.params.get("target_node_id", self._next_node(node) or "")) or None
+        if kind == "ingest_telemetry":
+            endpoint = self.endpoints.get(drone.target_endpoint_id or "")
+            events = endpoint.telemetry_events if endpoint else []
+            score = min(1.0, len(events) / 10)
+            if score >= 0.7:
+                drone.findings.append(f"anomaly-{uuid4().hex[:8]}")
+            self._append_signed_telemetry(drone, "Telemetry ingested", anomaly_score=score)
+            return self._next_node(node)
+        if kind == "apply_approved_patches":
+            for proposal in self.patch_proposals.values():
+                if proposal.endpoint_id == (drone.target_endpoint_id or proposal.endpoint_id) and proposal.status == "approved":
+                    self.apply_patch(proposal.proposal_id, f"drone:{drone.drone_id}")
+            self._append_signed_telemetry(drone, "Approved patches applied")
+            return self._next_node(node)
+        if kind == "sinkhole_clone":
+            if drone.autonomy_level == "enforce":
+                self._append_signed_telemetry(drone, "Sinkhole clone executed")
+            return self._next_node(node)
+        if kind == "isolate_source_ip":
+            if drone.autonomy_level == "enforce":
+                self._append_signed_telemetry(drone, "Source IP isolated")
+            return self._next_node(node)
+        self._append_signed_telemetry(drone, f"Unknown node kind {kind}")
+        return self._next_node(node)
+
+    def _drone_execution_loop(self, drone_id: str) -> None:
+        drone = self.drones.get(drone_id)
+        if drone is None:
+            return
+        node_map = {n.node_id: n for n in drone.behaviour.nodes}
+        if not node_map:
+            drone.status = "error"
+            drone.error = "empty behaviour"
+            return
+        start_node = next((n for n in drone.behaviour.nodes if n.kind == "on_launch"), drone.behaviour.nodes[0])
+        current_id: str | None = start_node.node_id
+        launch_time = time.time()
+        last_checkin = launch_time
+        stop_event = self._drone_stop_events.get(drone_id, threading.Event())
+        repeat_count: dict[str, int] = {}
+        while current_id and not stop_event.is_set():
+            now = time.time()
+            elapsed = int(now - launch_time)
+            if drone.ttl_seconds > 0 and now > launch_time + drone.ttl_seconds:
+                drone.status = "terminated"
+                self._record("drone.ttl_expired", {"drone_id": drone_id})
+                break
+            if now - last_checkin >= max(1, drone.checkin_interval_seconds):
+                drone.last_checkin_at = datetime.now(timezone.utc).isoformat()
+                drone.health = {"cpu_pct": None, "reachable": True, "uptime_seconds": elapsed, "nodes_executed": drone.stats.get("nodes_executed", 0), "last_node": drone.current_node_id}
+                last_checkin = now
+            if drone.tier == "controlled":
+                with self._drone_command_locks[drone_id]:
+                    pending = list(drone.pending_commands)
+                    drone.pending_commands.clear()
+                for cmd in pending:
+                    c = cmd.get("command")
+                    if c == "pause":
+                        drone.status = "dark"
+                        time.sleep(1)
+                        drone.status = "active"
+                    elif c == "terminate":
+                        drone.status = "terminated"
+                        stop_event.set()
+                        break
+                    elif c == "report":
+                        self._append_signed_telemetry(drone, "On-demand report", command=True)
+                    elif c == "inject_node":
+                        raw_node = cmd.get("params", {}).get("node", {})
+                        node = DroneNode(node_id=raw_node.get("node_id", f"n-{uuid4().hex[:6]}"), node_type=raw_node.get("node_type", "action"), kind=raw_node.get("kind", "send_report"), label=raw_node.get("label", "Injected Node"), params=dict(raw_node.get("params", {})), position={"x": 0.0, "y": 0.0}, edges_out=[], edge_labels={})
+                        drone.behaviour.nodes.append(node)
+                        node_map[node.node_id] = node
+            node = node_map.get(current_id)
+            if node is None:
+                break
+            current_id = self._execute_node(drone, node, node_map, repeat_count, stop_event, launch_time)
+        if drone.status not in {"terminated", "error"}:
+            drone.status = "terminated"
+        try:
+            shutil.rmtree(Path("data") / "drones" / drone_id, ignore_errors=True)
+        except Exception:
+            pass
+
+    def send_drone_command(self, drone_id: str, command: str, params: dict[str, Any], actor: str) -> dict[str, Any]:
+        drone = self.drones[drone_id]
+        if drone.tier != "controlled":
+            raise ValueError("commands only valid for controlled drones")
+        if command not in {"ping", "scan", "report", "pause", "resume", "terminate", "inject_node"}:
+            raise ValueError("invalid command")
+        with self._drone_command_locks[drone_id]:
+            drone.pending_commands.append({"command": command, "params": params, "actor": actor, "at": datetime.now(timezone.utc).isoformat()})
+        self._record("drone.command_sent", {"drone_id": drone_id, "command": command, "actor": actor})
+        return {"queued": True, "command": command}
+
+    def recall_drone(self, drone_id: str, actor: str) -> Drone:
+        drone = self.drones[drone_id]
+        if drone.tier not in {"controlled", "tethered", "autonomous"}:
+            raise ValueError("invalid drone tier")
+        ev = self._drone_stop_events.get(drone_id)
+        if ev:
+            ev.set()
+        th = self._drone_threads.get(drone_id)
+        if th:
+            th.join(timeout=10)
+        drone.status = "returning"
+        self._record("drone.recalled", {"drone_id": drone_id, "actor": actor})
+        return drone
+
+    def terminate_drone(self, drone_id: str, actor: str) -> Drone:
+        drone = self.drones[drone_id]
+        drone.status = "terminated"
+        ev = self._drone_stop_events.get(drone_id)
+        if ev:
+            ev.set()
+        self._record("drone.terminated", {"drone_id": drone_id, "actor": actor})
+        return drone
 
     class SelfScanLoop:
         def __init__(self, cp: "HegemonControlPlane"):

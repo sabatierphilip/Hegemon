@@ -237,6 +237,7 @@ HTML = """
     <button class="tab-btn active" data-tab="overview">Overview</button>
     <button class="tab-btn" data-tab="control-plane">Control Plane</button>
     <button class="tab-btn" data-tab="kernel-telemetry">Kernel Telemetry</button>
+    <button class="tab-btn" data-tab="drones">Drones</button>
   </div>
 
   <div id="tab-overview" class="tab-panel active">
@@ -438,6 +439,16 @@ HTML = """
       <div class="json" style="margin-top:8px;"><pre id="kernel-telemetry-terminal">No kernel telemetry reports yet.</pre></div>
     </div>
   </div>
+
+  <div id="tab-drones" class="tab-panel">
+    <div class="panel">
+      <h3>🚁 DRONES <button id="new-drone-btn" class="tab-btn" style="float:right;">+ New Drone</button></h3>
+      <div style="display:grid;grid-template-columns:1fr 1.6fr;gap:10px;">
+        <div id="drone-fleet"></div>
+        <div id="drone-detail" class="json">Select a drone to see details.</div>
+      </div>
+    </div>
+  </div>
 </div>
 <script nonce="{{ csp_nonce }}">
 async function startWithPermission(){
@@ -561,7 +572,7 @@ async function updateHumanGate(required){
 
 
 const tabButtons=[...document.querySelectorAll('.tab-btn')];
-const tabPanels={overview:document.getElementById('tab-overview'),'control-plane':document.getElementById('tab-control-plane'),'kernel-telemetry':document.getElementById('tab-kernel-telemetry')};
+const tabPanels={overview:document.getElementById('tab-overview'),'control-plane':document.getElementById('tab-control-plane'),'kernel-telemetry':document.getElementById('tab-kernel-telemetry'),'drones':document.getElementById('tab-drones')};
 for(const btn of tabButtons){
   btn.addEventListener('click',()=>{
     for(const b of tabButtons){b.classList.remove('active');}
@@ -854,6 +865,54 @@ document.getElementById("kernel-telemetry-mode-toggle")?.addEventListener("chang
   updateKernelTelemetryMode(Boolean(target && target.checked));
 });
 window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); loadStoreFilters(); loadControlPlane(); runAutonomousScan(); loadKernelTelemetryStatus(); window.setInterval(runAutonomousScan, 60000); window.setInterval(loadKernelTelemetryStatus, 5000);});
+
+let selectedDroneId=null;
+async function refreshDrones(){
+  try{
+    const resp=await fetch('/api/drones');
+    if(!resp.ok){return;}
+    const drones=await resp.json();
+    const fleet=document.getElementById('drone-fleet');
+    if(!fleet)return;
+    fleet.innerHTML='';
+    drones.forEach(d=>{
+      const card=document.createElement('div');
+      card.className='card';
+      card.innerHTML=`<div><strong>🚁 ${d.name}</strong> ${d.tier}</div><div>Status: ${d.status}</div><div>Mission: ${d.mission}</div><div>TTL: ${d.ttl_seconds}</div><button data-id='${d.drone_id}' class='dr-detail'>Details ▶</button> <button data-id='${d.drone_id}' class='dr-recall'>Recall</button> <button data-id='${d.drone_id}' class='dr-term'>Terminate</button>`;
+      fleet.appendChild(card);
+    });
+    fleet.querySelectorAll('.dr-detail').forEach(b=>b.onclick=()=>loadDroneDetail(b.dataset.id));
+    fleet.querySelectorAll('.dr-recall').forEach(b=>b.onclick=()=>droneAction(b.dataset.id,'recall'));
+    fleet.querySelectorAll('.dr-term').forEach(b=>b.onclick=()=>droneAction(b.dataset.id,'terminate'));
+  }catch(e){}
+}
+async function loadDroneDetail(droneId){
+  selectedDroneId=droneId;
+  const resp=await fetch(`/api/drones/${droneId}`);
+  if(!resp.ok)return;
+  const d=await resp.json();
+  const panel=document.getElementById('drone-detail');
+  panel.innerHTML=`<div><strong>${d.name}</strong> (${d.tier}) - ${d.status}</div><div>Mission: ${d.mission} Target: ${d.target_host||d.target_network||d.target_endpoint_id||'-'}</div><div>Current Node: ${d.current_node_id||'-'}</div><div>Telemetry:</div><pre>${(d.telemetry||[]).map(t=>`[${t.ts}] ${t.message}`).join('\n')}</pre>${d.tier==='controlled'?`<div><input id='dr-cmd' placeholder='command'/><button id='dr-send'>Send</button></div>`:`<div style='opacity:.6'>🌑 DARK MODE Autonomous drone controls limited.</div>`}`;
+  const send=document.getElementById('dr-send');
+  if(send){send.onclick=()=>sendDroneCommand(droneId);}
+}
+async function sendDroneCommand(droneId){
+  const v=document.getElementById('dr-cmd').value.trim();
+  if(!v)return;
+  await fetch(`/api/drones/${droneId}/command`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:v,params:{},actor:'dashboard'})});
+  await loadDroneDetail(droneId);
+}
+async function droneAction(droneId,action){
+  await fetch(`/api/drones/${droneId}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor:'dashboard'})});
+  await refreshDrones();
+  if(selectedDroneId===droneId)await loadDroneDetail(droneId);
+}
+document.getElementById('new-drone-btn')?.addEventListener('click', async ()=>{
+  await fetch('/api/drones/assemble',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'Scout-Beta',tier:'controlled',mission:'scout',brain_id:'brain-pinger-basic',autonomy_level:'observe',ttl_seconds:3600,checkin_interval_seconds:60,actor:'dashboard'})});
+  await refreshDrones();
+});
+setInterval(()=>{if(document.getElementById('tab-drones')?.classList.contains('active')){refreshDrones(); if(selectedDroneId) loadDroneDetail(selectedDroneId);}},3000);
+
 </script>
 </body>
 </html>
@@ -1753,3 +1812,209 @@ def api_scan_suppressed():
     if unauthorized:
         return unauthorized
     return jsonify(_control_plane.suppressed_findings)
+
+@app.get("/api/drones")
+def api_drones_list():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    rows = []
+    for drone in _control_plane.drones.values():
+        rows.append({
+            "drone_id": drone.drone_id,
+            "name": drone.name,
+            "tier": drone.tier,
+            "status": drone.status,
+            "mission": drone.mission,
+            "target_endpoint_id": drone.target_endpoint_id,
+            "target_host": drone.target_host,
+            "target_network": drone.target_network,
+            "ttl_seconds": drone.ttl_seconds,
+            "last_checkin_at": drone.last_checkin_at,
+            "stats": drone.stats,
+        })
+    return jsonify(rows)
+
+
+@app.get("/api/drones/<drone_id>")
+def api_drones_get(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    drone = _control_plane.drones.get(drone_id)
+    if drone is None:
+        return jsonify({"error": "not_found"}), 404
+    payload = _control_plane.as_dict(drone)
+    payload["telemetry"] = payload.get("telemetry", [])[-50:]
+    return jsonify(payload)
+
+
+@app.post("/api/drones/assemble")
+def api_drones_assemble():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    behaviour = payload.get("behaviour")
+    if behaviour and isinstance(behaviour, dict):
+        behaviour = _control_plane._make_brain(
+            behaviour_id=str(behaviour.get("behaviour_id", f"brain-{secrets.token_hex(4)}")),
+            name=str(behaviour.get("name", "custom")),
+            description=str(behaviour.get("description", "custom behaviour")),
+            nodes=list(behaviour.get("nodes", [])),
+        )
+    else:
+        behaviour = payload.get("brain_id") or "brain-pinger-basic"
+    try:
+        drone = _control_plane.assemble_drone(
+            name=str(payload.get("name", "Drone")),
+            tier=str(payload.get("tier", "controlled")),
+            mission=str(payload.get("mission", "custom")),
+            behaviour=behaviour,
+            target_endpoint_id=payload.get("target_endpoint_id"),
+            target_host=payload.get("target_host"),
+            target_network=payload.get("target_network"),
+            autonomy_level=str(payload.get("autonomy_level", "observe")),
+            ttl_seconds=int(payload.get("ttl_seconds", 3600)),
+            checkin_interval_seconds=int(payload.get("checkin_interval_seconds", 60)),
+            actor=str(payload.get("actor", "user")),
+        )
+    except ValueError as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(_control_plane.as_dict(drone))
+
+
+@app.post("/api/drones/<drone_id>/launch")
+def api_drones_launch(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    try:
+        drone = _control_plane.launch_drone(drone_id, str(payload.get("actor", "user")))
+    except PermissionError as exc:
+        return jsonify({"error": "approval_required", "message": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(_control_plane.as_dict(drone))
+
+
+@app.post("/api/drones/<drone_id>/command")
+def api_drones_command(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    try:
+        queued = _control_plane.send_drone_command(
+            drone_id,
+            command=str(payload.get("command", "")),
+            params=dict(payload.get("params", {})),
+            actor=str(payload.get("actor", "user")),
+        )
+    except ValueError as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(queued)
+
+
+@app.post("/api/drones/<drone_id>/recall")
+def api_drones_recall(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    drone = _control_plane.recall_drone(drone_id, str(payload.get("actor", "user")))
+    return jsonify(_control_plane.as_dict(drone))
+
+
+@app.post("/api/drones/<drone_id>/terminate")
+def api_drones_terminate(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    drone = _control_plane.terminate_drone(drone_id, str(payload.get("actor", "user")))
+    return jsonify(_control_plane.as_dict(drone))
+
+
+@app.get("/api/drones/<drone_id>/telemetry")
+def api_drones_telemetry(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    drone = _control_plane.drones.get(drone_id)
+    if drone is None:
+        return jsonify({"error": "not_found"}), 404
+    limit = int(request.args.get("limit", 100))
+    since = request.args.get("since", "").strip()
+    rows = drone.telemetry
+    if since:
+        rows = [r for r in rows if str(r.get("ts", "")) >= since]
+    return jsonify({"telemetry": rows[-limit:], "live_output": drone.live_output[-limit:]})
+
+
+@app.post("/api/drones/auto-assemble")
+def api_drones_auto_assemble():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    drone = _control_plane.auto_assemble_drone(str(payload.get("endpoint_id", "")), str(payload.get("actor", "user")))
+    if drone is None:
+        return jsonify({"error": "no_drone_applicable"})
+    return jsonify(_control_plane.as_dict(drone))
+
+
+@app.get("/api/drones/brains")
+def api_drones_brains():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify([_control_plane.as_dict(b) for b in _control_plane.drone_brains.values()])
+
+
+@app.post("/api/drones/brains")
+def api_drones_brains_create():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    behaviour_id = f"brain-{secrets.token_hex(4)}"
+    brain = _control_plane._make_brain(
+        behaviour_id=behaviour_id,
+        name=str(payload.get("name", "custom-brain")),
+        description=str(payload.get("description", "user saved brain")),
+        nodes=list(payload.get("nodes", [])),
+    )
+    brain.is_brain_preset = False
+    brain.author = "user"
+    _control_plane.drone_brains[behaviour_id] = brain
+    return jsonify(_control_plane.as_dict(brain))
+
+
+@app.delete("/api/drones/brains/<behaviour_id>")
+def api_drones_brains_delete(behaviour_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    brain = _control_plane.drone_brains.get(behaviour_id)
+    if brain is None:
+        return jsonify({"error": "not_found"}), 404
+    if brain.is_brain_preset:
+        return jsonify({"error": "forbidden"}), 403
+    _control_plane.drone_brains.pop(behaviour_id, None)
+    return jsonify({"deleted": True})
