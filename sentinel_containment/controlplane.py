@@ -809,6 +809,138 @@ class HegemonControlPlane:
             return {}
         return out
 
+
+    def _build_lightweight_lstm_rnn_binary_model(
+        self,
+        sequence_tokens: list[str],
+        markov_matrix: dict[str, dict[str, float]],
+        graph_features: dict[str, float],
+    ) -> dict[str, Any]:
+        if not sequence_tokens:
+            return {
+                "model": "lightweight-lstm-rnn-binary-v1",
+                "vocab_size": 0,
+                "timesteps": 0,
+                "hidden_state_norm": 0.0,
+                "sequence_anomaly": 0.0,
+                "predicted_next_stages": [],
+                "confidence": 0.0,
+                "notes": "insufficient sequence tokens",
+            }
+
+        vocab = sorted(set(sequence_tokens))
+        vocab_index = {tok: i for i, tok in enumerate(vocab)}
+        bit_width = 20
+
+        def token_to_bits(token: str) -> list[float]:
+            digest = hashlib.sha1(token.encode("utf-8", errors="ignore")).digest()
+            bits: list[float] = []
+            for idx in range(bit_width):
+                byte = digest[idx % len(digest)]
+                bits.append(1.0 if (byte >> (idx % 8)) & 1 else 0.0)
+            return bits
+
+        def sigmoid(x: float) -> float:
+            x = max(-30.0, min(30.0, x))
+            return 1.0 / (1.0 + math.exp(-x))
+
+        h = [0.0] * bit_width
+        c = [0.0] * bit_width
+        states: list[list[float]] = []
+
+        graph_bias = min(0.35, (graph_features.get("call_edges", 0.0) / 3000.0) + (graph_features.get("functions", 0.0) / 12000.0))
+        for token in sequence_tokens:
+            x = token_to_bits(token)
+            x_mean = sum(x) / bit_width
+            h_mean = sum(h) / bit_width
+            i_gate = sigmoid(0.9 * x_mean + 0.6 * h_mean + graph_bias)
+            f_gate = sigmoid(0.7 * h_mean + 0.2)
+            o_gate = sigmoid(0.8 * x_mean + 0.4 * graph_bias)
+            for j in range(bit_width):
+                candidate = math.tanh((x[j] * 1.3) + (h[j] * 0.5) + graph_bias)
+                c[j] = (f_gate * c[j]) + (i_gate * candidate)
+                h[j] = o_gate * math.tanh(c[j])
+            states.append(h[:])
+
+        hidden_norm = math.sqrt(sum(v * v for v in h) / max(1, len(h)))
+
+        surprise_terms: list[float] = []
+        for a, b in zip(sequence_tokens, sequence_tokens[1:]):
+            if a in KILL_CHAIN_STAGES and b in KILL_CHAIN_STAGES:
+                prob = float(markov_matrix.get(a, {}).get(b, 0.01))
+                surprise_terms.append(-math.log(max(1e-6, prob)))
+        sequence_anomaly = min(1.0, (sum(surprise_terms) / max(1, len(surprise_terms))) / 4.5) if surprise_terms else 0.0
+
+        last_stage = next((tok for tok in reversed(sequence_tokens) if tok in KILL_CHAIN_STAGES), None)
+        predictions: list[dict[str, Any]] = []
+        if last_stage:
+            ranked = sorted(markov_matrix.get(last_stage, {}).items(), key=lambda kv: kv[1], reverse=True)[:4]
+            for stage, prob in ranked:
+                predictions.append({"stage": stage, "probability": round(float(prob), 4)})
+
+        temporal_stability = 0.0
+        if len(states) >= 2:
+            deltas = []
+            for prev, cur in zip(states, states[1:]):
+                deltas.append(sum(abs(a - b) for a, b in zip(prev, cur)) / bit_width)
+            temporal_stability = max(0.0, 1.0 - min(1.0, sum(deltas) / max(1, len(deltas))))
+
+        confidence = min(0.98, round(0.42 + (0.35 * temporal_stability) + (0.23 * (1.0 - sequence_anomaly)), 4))
+        return {
+            "model": "lightweight-lstm-rnn-binary-v1",
+            "vocab_size": len(vocab_index),
+            "timesteps": len(sequence_tokens),
+            "hidden_state_norm": round(hidden_norm, 5),
+            "sequence_anomaly": round(sequence_anomaly, 5),
+            "temporal_stability": round(temporal_stability, 5),
+            "predicted_next_stages": predictions,
+            "confidence": confidence,
+            "notes": "Self-building binary token model fused with Markov-MTRE transitions and graph features.",
+        }
+
+    def _integrated_markov_mtre_graph_model(
+        self,
+        telemetry_events: list[str],
+        structural_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        markov_matrix, chain_risk = self._kill_chain_transition_markov(telemetry_events)
+        graph = structural_report.get("program_graph", {}) if isinstance(structural_report, dict) else {}
+        call_edges = float(graph.get("call_edges", 0.0))
+        functions = float(graph.get("functions", 0.0))
+        tainted_returns = float(graph.get("tainted_return_functions", 0.0))
+
+        lstm_model = dict(structural_report.get("lstm_rnn_binary_model", {}) if isinstance(structural_report, dict) else {})
+        if not lstm_model:
+            seq = [e for e in telemetry_events if isinstance(e, str)]
+            seq.extend(str(i.get("issue_id", "")) for i in (structural_report.get("issues", []) if isinstance(structural_report, dict) else [])[:80] if i.get("issue_id"))
+            lstm_model = self._build_lightweight_lstm_rnn_binary_model(seq, markov_matrix, {"call_edges": call_edges, "functions": functions, "modules": float(graph.get("modules", 0.0))})
+
+        stage_focus = sorted(
+            [(stage, prob) for stage, row in markov_matrix.items() for prob in [sum(row.values()) / max(1, len(row))] if row],
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:4]
+        top_stage_pressure = [{"stage": s, "pressure": round(float(p), 4)} for s, p in stage_focus]
+
+        anomaly = float(lstm_model.get("sequence_anomaly", 0.0))
+        rnn_conf = float(lstm_model.get("confidence", 0.0))
+        graph_pressure = min(1.0, (call_edges / 1800.0) + (tainted_returns / 400.0) + (functions / 5000.0))
+        chain_pressure = min(1.0, max(0.0, chain_risk / 3.0))
+        fusion_risk = min(0.99, round((0.32 * chain_pressure) + (0.25 * graph_pressure) + (0.28 * anomaly) + (0.15 * (1.0 - rnn_conf)), 4))
+        fusion_conf = min(0.99, round(0.45 + (0.3 * rnn_conf) + (0.15 * (1.0 - anomaly)) + (0.1 * min(1.0, call_edges / 1200.0)), 4))
+
+        return {
+            "model": "markov-mtre-graph-rnn-fusion-v1",
+            "chain_risk": round(chain_risk, 4),
+            "graph_pressure": round(graph_pressure, 4),
+            "sequence_anomaly": round(anomaly, 4),
+            "rnn_confidence": round(rnn_conf, 4),
+            "fusion_risk": fusion_risk,
+            "fusion_confidence": fusion_conf,
+            "top_stage_pressure": top_stage_pressure,
+            "cross_language_hint_count": len(structural_report.get("potential_cross_language_hints", []) if isinstance(structural_report, dict) else []),
+        }
+
     def _build_attack_path(self, endpoint: Endpoint, cve: str, chain_risk: float) -> list[dict[str, Any]]:
         perimeter = "external_attacker" if endpoint.network_exposure == "internet" else "partner_network"
         return [
@@ -965,6 +1097,15 @@ class HegemonControlPlane:
                 "graph_alignment": 0.0,
                 "markov_kill_chain": 0.0,
                 "program_graph": {"modules": 0, "functions": 0, "call_edges": 0, "entrypoints": []},
+                "lang_breakdown": {},
+                "binary_artefacts_scanned": 0,
+                "binary_packed_sections": 0,
+                "cross_language_chains": [],
+                "potential_cross_language_hints": [],
+                "cross_language_analysis_note": "potential cross-language hints (not confirmed taint chains)",
+                "disassembly_backend": None,
+                "lstm_rnn_binary_model": {},
+                "integrated_flow_model": {},
             }
 
         root = Path(program_root).resolve()
@@ -986,7 +1127,11 @@ class HegemonControlPlane:
                     "binary_artefacts_scanned": 0,
                     "binary_packed_sections": 0,
                     "cross_language_chains": [],
+                    "potential_cross_language_hints": [],
+                    "cross_language_analysis_note": "potential cross-language hints (not confirmed taint chains)",
                     "disassembly_backend": None,
+                    "lstm_rnn_binary_model": {},
+                    "integrated_flow_model": {},
                 }
         if not root.exists() or not root.is_dir():
             return {
@@ -996,6 +1141,15 @@ class HegemonControlPlane:
                 "graph_alignment": 0.0,
                 "markov_kill_chain": 0.0,
                 "program_graph": {"modules": 0, "functions": 0, "call_edges": 0, "entrypoints": []},
+                "lang_breakdown": {},
+                "binary_artefacts_scanned": 0,
+                "binary_packed_sections": 0,
+                "cross_language_chains": [],
+                "potential_cross_language_hints": [],
+                "cross_language_analysis_note": "potential cross-language hints (not confirmed taint chains)",
+                "disassembly_backend": None,
+                "lstm_rnn_binary_model": {},
+                "integrated_flow_model": {},
             }
 
         skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache"}
@@ -1539,9 +1693,20 @@ class HegemonControlPlane:
             all_stages.extend([str(s) for s in issue.get("reconstructed_kill_chain", [])])
         if not all_stages:
             all_stages = [str(i.get("kill_chain_stage", "execution")) for i in issues]
-        _markov, markov_score = self._kill_chain_transition_markov(all_stages)
+        markov_matrix, markov_score = self._kill_chain_transition_markov(all_stages)
 
         entrypoints = sorted([fn for fn, p in function_profiles.items() if p.get("sources")])[:12]
+        cross_language_hints = self._build_cross_language_taint_chains(issues)
+        sequence_tokens = list(all_stages)
+        sequence_tokens.extend(str(i.get("issue_id", "")) for i in issues[:120] if i.get("issue_id"))
+        sequence_tokens.extend(str(i.get("lang", "")) for i in issues[:120] if i.get("lang"))
+        model_features = {
+            "call_edges": float(sum(len(v) for v in call_graph.values())),
+            "functions": float(len(function_profiles)),
+            "modules": float(len(module_trees)),
+        }
+        lstm_rnn_binary_model = self._build_lightweight_lstm_rnn_binary_model(sequence_tokens, markov_matrix, model_features)
+        integrated_flow_model = self._integrated_markov_mtre_graph_model(all_stages, {"program_graph": {"call_edges": model_features["call_edges"], "functions": model_features["functions"], "modules": model_features["modules"], "tainted_return_functions": float(len(tainted_return_functions))}, "lstm_rnn_binary_model": lstm_rnn_binary_model, "potential_cross_language_hints": cross_language_hints})
         return {
             "files_scanned": len(py_files),
             "issues": issues,
@@ -1558,8 +1723,12 @@ class HegemonControlPlane:
             "lang_breakdown": dict(lang_breakdown),
             "binary_artefacts_scanned": binary_artefacts_scanned,
             "binary_packed_sections": binary_packed_sections,
-            "cross_language_chains": self._build_cross_language_taint_chains(issues),
+            "cross_language_chains": cross_language_hints,
+            "potential_cross_language_hints": cross_language_hints,
+            "cross_language_analysis_note": "potential cross-language hints (not confirmed taint chains)",
             "disassembly_backend": disassembly_backend,
+            "lstm_rnn_binary_model": lstm_rnn_binary_model,
+            "integrated_flow_model": integrated_flow_model,
         }
 
     def _detect_program_root(self, package_name: str, store_id: str) -> str | None:
@@ -1656,18 +1825,172 @@ class HegemonControlPlane:
         self._record("store.endpoint_registered", {"actor": actor, "endpoint_id": endpoint.endpoint_id, "store_id": store_id, "program_root": detected, "scan_triggered": triggered, "scan_id": scan_id})
         return {"endpoint": endpoint, "friendly_app": app, "program_root_detected": detected, "store_metadata": meta, "scan_triggered": triggered, "scan_id": scan_id}
 
+    def _extract_js_identifiers(self, expr: str) -> set[str]:
+        reserved = {
+            "if", "for", "while", "return", "const", "let", "var", "function", "new", "class",
+            "await", "async", "true", "false", "null", "undefined", "this", "window", "document",
+        }
+        ids = set(re.findall(r"\b[A-Za-z_$][\w$]*\b", expr or ""))
+        return {token for token in ids if token not in reserved}
+
+    def _js_member_name(self, expr: str) -> str | None:
+        cleaned = (expr or "").strip()
+        m = re.match(r"([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)$", cleaned)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}"
+        return None
+
     def _analyze_js_file(self, path: Path, rel: str) -> list[dict[str, Any]]:
         issues=[]
         try:
             lines=path.read_text(encoding='utf-8', errors='ignore').splitlines()
         except OSError:
             return issues
-        for i,l in enumerate(lines,1):
-            ll=l.lower()
-            if 'eval(' in ll or 'function(' in ll and 'user' in ll:
-                issues.append({"issue_id":"js-dynamic-exec","lang":"javascript","severity":"high","kill_chain_stage":"execution","reconstructed_kill_chain":["initial_access","execution","impact"],"techniques":["T1059.007"],"file":rel,"line":i,"confidence":0.78,"reasoning":"Dynamic JS execution pattern.","reasoning_details":[],"tags":["js"],"patch_hint":"Avoid eval/Function; use safe parser.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
-            if 'innerhtml' in ll or 'document.write(' in ll:
-                issues.append({"issue_id":"js-dom-xss","lang":"javascript","severity":"high","kill_chain_stage":"execution","reconstructed_kill_chain":["initial_access","execution","impact"],"techniques":["T1059.007"],"file":rel,"line":i,"confidence":0.74,"reasoning":"Potential DOM XSS sink.","reasoning_details":[],"tags":["js"],"patch_hint":"Use textContent and sanitize HTML.","dataflow_path":[],"call_path":[],"binary_offset":None,"section_name":None,"entropy":None})
+
+        js_sources = (
+            "document.cookie", "window.location", "location.search", "location.hash", "location.href",
+            "localstorage", "sessionstorage", "urlsearchparams", "req.query", "req.params", "req.body",
+            "postmessage", "process.env", "document.referrer", "window.name", "location.pathname",
+        )
+        sanitizer_regex = re.compile(r"\b(?:dompurify\.)?sanitize\s*\(|\bescape(?:html)?\s*\(|\bencodeuricomponent\s*\(|\btextcontent\b")
+        scopes: list[dict[str, bool]] = [{}]
+        function_profiles: dict[str, dict[str, Any]] = {}
+        function_stack: list[str] = []
+
+        def get_taint(var_name: str) -> bool:
+            for scope in reversed(scopes):
+                if var_name in scope:
+                    return bool(scope[var_name])
+            return False
+
+        def set_taint(var_name: str, tainted: bool, declared: bool) -> None:
+            if declared:
+                scopes[-1][var_name] = tainted
+                return
+            for scope in reversed(scopes):
+                if var_name in scope:
+                    scope[var_name] = tainted
+                    return
+            scopes[-1][var_name] = tainted
+
+        def expr_taint(expr: str) -> tuple[bool, list[str]]:
+            raw_expr = expr or ""
+            lowered = raw_expr.lower()
+            details: list[str] = []
+            if any(src in lowered for src in js_sources):
+                details.append("user_input_source")
+            if sanitizer_regex.search(lowered):
+                return False, ["sanitized"]
+
+            ids = sorted(self._extract_js_identifiers(raw_expr))
+            tainted_vars = [token for token in ids if get_taint(token)]
+            member_tokens = re.findall(r"\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]+)+\b", raw_expr)
+            for token in member_tokens:
+                parts = token.split('.')
+                for idx in range(len(parts), 1, -1):
+                    candidate = '.'.join(parts[:idx])
+                    if get_taint(candidate):
+                        tainted_vars.append(candidate)
+                        break
+            if tainted_vars:
+                details.extend(sorted(set(tainted_vars)))
+
+            call_match = re.match(r"\s*([A-Za-z_$][\w$]*)\s*\((.*)\)\s*$", raw_expr)
+            if call_match:
+                fn_name = call_match.group(1)
+                args = [a.strip() for a in re.split(r",(?![^()]*\))", call_match.group(2)) if a.strip()]
+                arg_tainted = any(expr_taint(a)[0] for a in args)
+                prof = function_profiles.get(fn_name)
+                if prof and prof.get("returns_from_tainted_arg") and arg_tainted:
+                    details.append(f"function:{fn_name}")
+
+            return bool(details), details
+
+        sink_patterns = [
+            ("js-dynamic-exec", r"\b(?:eval|Function|setTimeout|setInterval)\s*\((.+)\)", "Avoid eval/Function on untrusted input; use safe parser or callbacks."),
+            ("js-dom-xss", r"\b(?:innerHTML|outerHTML)\s*=\s*(.+?);?$", "Use textContent or trusted templates and sanitize untrusted HTML."),
+            ("js-dom-xss", r"\binsertAdjacentHTML\s*\([^,]+,\s*(.+)\)", "Avoid insertAdjacentHTML with user input; sanitize before rendering."),
+            ("js-dom-xss", r"\bdocument\.write\s*\((.+)\)", "Avoid document.write with untrusted content."),
+            ("js-dom-xss", r"\$\([^)]*\)\.(?:html|append|prepend|before|after)\s*\((.+)\)", "Avoid jQuery HTML sink APIs with untrusted content."),
+        ]
+
+        sink_seen: set[tuple[str, int, str]] = set()
+        for i, l in enumerate(lines, 1):
+            line = re.sub(r"//.*$", "", l)
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            fn_decl = re.match(r"\s*function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)", stripped)
+            if fn_decl:
+                fn_name = fn_decl.group(1)
+                params = [p.strip() for p in fn_decl.group(2).split(",") if p.strip()]
+                function_profiles.setdefault(fn_name, {"params": params, "returns_from_tainted_arg": False})
+                function_stack.append(fn_name)
+                scopes.append({p: True for p in params})
+
+            arrow_decl = re.match(r"\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\(([^)]*)\)\s*=>", stripped)
+            if arrow_decl:
+                fn_name = arrow_decl.group(1)
+                params = [p.strip() for p in arrow_decl.group(2).split(",") if p.strip()]
+                function_profiles.setdefault(fn_name, {"params": params, "returns_from_tainted_arg": False})
+                function_stack.append(fn_name)
+                scopes.append({p: True for p in params})
+
+            assignment = re.match(r"\s*(?:(let|const|var)\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*=\s*(.+?)\s*;?\s*$", line)
+            if assignment:
+                declared = bool(assignment.group(1))
+                lhs = assignment.group(2)
+                rhs = assignment.group(3)
+                tainted, _detail = expr_taint(rhs)
+                member = self._js_member_name(lhs)
+                if member:
+                    set_taint(member, tainted, declared=False)
+                else:
+                    set_taint(lhs, tainted, declared)
+
+            return_match = re.match(r"\s*return\s+(.+?)\s*;?\s*$", stripped)
+            if return_match and function_stack:
+                fn_name = function_stack[-1]
+                return_expr = return_match.group(1)
+                tainted, taint_vars = expr_taint(return_expr)
+                prof = function_profiles.setdefault(fn_name, {"params": [], "returns_from_tainted_arg": False})
+                param_names = set(prof.get("params", []))
+                if tainted and any(v in param_names for v in taint_vars):
+                    prof["returns_from_tainted_arg"] = True
+
+            for issue_id, sink_regex, patch_hint in sink_patterns:
+                match = re.search(sink_regex, line)
+                if not match:
+                    continue
+                argument = match.group(1)
+                tainted, taint_vars = expr_taint(argument)
+                if not tainted:
+                    continue
+                key = (issue_id, i, argument.strip())
+                if key in sink_seen:
+                    continue
+                sink_seen.add(key)
+                reasoning = (
+                    "Probable dynamic execution path: tainted JavaScript data reaches executable sink."
+                    if issue_id == "js-dynamic-exec"
+                    else "Probable DOM XSS path: tainted data reaches HTML rendering sink."
+                )
+                confidence = 0.9 if "user_input_source" in taint_vars else 0.82
+                issues.append({"issue_id":issue_id,"lang":"javascript","severity":"critical" if issue_id == "js-dynamic-exec" else "high","kill_chain_stage":"execution","reconstructed_kill_chain":["initial_access","execution","impact"],"techniques":["T1059.007"],"file":rel,"line":i,"confidence":confidence,"reasoning":reasoning,"reasoning_details":["taint-propagation","scope-aware-js","sink-context"],"tags":["js","taint","dataflow"],"patch_hint":patch_hint,"dataflow_path":["source",*(taint_vars[:4] or ["derived_var"]),"sink"],"call_path":function_stack[-2:],"binary_offset":None,"section_name":None,"entropy":None})
+
+            open_count = line.count("{")
+            close_count = line.count("}")
+            if close_count:
+                for _ in range(close_count):
+                    if function_stack and len(scopes) > 1:
+                        function_stack.pop()
+                        scopes.pop()
+                    elif len(scopes) > 1:
+                        scopes.pop()
+            if open_count > close_count and not (fn_decl or arrow_decl):
+                scopes.append({})
+
         return issues
 
     def _analyze_shell_file(self, path: Path, rel: str) -> list[dict[str, Any]]:
@@ -1744,15 +2067,104 @@ class HegemonControlPlane:
                 issues.append({"issue_id":iid,"lang":"binary","severity":sev,"kill_chain_stage":"credential_access","reconstructed_kill_chain":["initial_access","credential_access","impact"],"techniques":["T1552"],"file":rel,"line":1,"confidence":0.72,"reasoning":"Sensitive string found in binary.","reasoning_details":[],"tags":["binary"],"patch_hint":"Remove embedded secrets from binary artifacts.","dataflow_path":[],"call_path":[],"binary_offset":m.start(),"section_name":"strings","entropy":round(entropy,3)})
         if shutil.which('objdump'):
             backend='objdump'
+            try:
+                sym = subprocess.run(['objdump', '-T', str(path)], capture_output=True, text=True, timeout=8)
+                disasm = subprocess.run(['objdump', '-d', str(path)], capture_output=True, text=True, timeout=15)
+                symbol_lines = sym.stdout.splitlines() if sym.returncode == 0 else []
+                disasm_lines = disasm.stdout.splitlines() if disasm.returncode == 0 else []
+                sink_markers = {
+                    "system": ("binary-command-exec-sink", "critical", "Execution sink exposed in binary symbols/disassembly (system-like call).", "T1059"),
+                    "execve": ("binary-command-exec-sink", "critical", "Execution sink exposed in binary symbols/disassembly (execve-like call).", "T1059"),
+                    "popen": ("binary-command-exec-sink", "high", "Execution sink exposed in binary symbols/disassembly (popen-like call).", "T1059"),
+                    "strcpy": ("binary-unsafe-memory-copy", "high", "Unsafe memory-copy primitive referenced in binary symbols/disassembly.", "T1068"),
+                    "gets": ("binary-unsafe-memory-copy", "critical", "Unsafe input primitive referenced in binary symbols/disassembly.", "T1068"),
+                    "memcpy": ("binary-unsafe-memory-copy", "medium", "Memory-copy primitive present; review destination bounds and tainted sizes.", "T1068"),
+                }
+                added: set[tuple[str, str]] = set()
+                combined = [("symbol", ln) for ln in symbol_lines] + [("disassembly", ln) for ln in disasm_lines]
+                for section, line in combined:
+                    lowered = line.lower()
+                    for marker, (issue_id, sev, reasoning, technique) in sink_markers.items():
+                        if marker not in lowered:
+                            continue
+                        key = (issue_id, marker)
+                        if key in added:
+                            continue
+                        added.add(key)
+                        addr_match = re.search(r"^\s*([0-9a-f]+):", line)
+                        offset = int(addr_match.group(1), 16) if addr_match else None
+                        issues.append({"issue_id":issue_id,"lang":"binary","severity":sev,"kill_chain_stage":"execution" if "exec" in issue_id else "privilege_escalation","reconstructed_kill_chain":["execution","privilege_escalation","impact"],"techniques":[technique],"file":rel,"line":1,"confidence":0.73 if section == "symbol" else 0.69,"reasoning":reasoning,"reasoning_details":["objdump-disassembly", f"source:{section}"],"tags":["binary","disassembly","heuristic"],"patch_hint":"Review callsites and replace unsafe routines with hardened alternatives.","dataflow_path":["binary_symbol", marker],"call_path":[],"binary_offset":offset,"section_name":section,"entropy":round(entropy,3)})
+
+                call_edges = sum(1 for ln in disasm_lines if '	call' in ln.lower())
+                if call_edges > 1000:
+                    issues.append({"issue_id":"binary-high-call-density","lang":"binary","severity":"medium","kill_chain_stage":"defense_evasion","reconstructed_kill_chain":["execution","defense_evasion"],"techniques":["T1027"],"file":rel,"line":1,"confidence":0.58,"reasoning":"Very high indirect/call instruction density; binary may be heavily optimized, obfuscated, or packed.","reasoning_details":["objdump-disassembly"],"tags":["binary","heuristic"],"patch_hint":"Inspect compiler flags and provenance; unpack/normalize before deep analysis.","dataflow_path":["call_density", str(call_edges)],"call_path":[],"binary_offset":None,"section_name":"disassembly","entropy":round(entropy,3)})
+            except Exception:
+                pass
         return issues, int(entropy>7.2), backend
 
     def _build_cross_language_taint_chains(self, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         chains=[]
-        writers=[i for i in issues if i.get('lang')=='python' and 'path' in str(i.get('issue_id',''))]
+
+        def path_signals(issue: dict[str, Any]) -> set[str]:
+            signals = set()
+            for key in ("file", "reasoning", "issue_id"):
+                raw = str(issue.get(key, ""))
+                for hit in re.findall(r"(?:/[-\w./]+|[-\w./]+\.(?:js|py|sh|bin|so|dll|exe|json|yaml|yml))", raw):
+                    signals.add(hit.lower())
+            for raw in issue.get("dataflow_path", []) or []:
+                token = str(raw).strip().lower()
+                if "/" in token or token.endswith((".js", ".py", ".sh", ".bin", ".so", ".dll", ".exe", ".json", ".yaml", ".yml")):
+                    signals.add(token)
+            basename = Path(str(issue.get("file", "unknown"))).name.lower()
+            if basename:
+                signals.add(basename)
+            return signals
+
+        def score_overlap(overlap: set[str], writer: dict[str, Any], reader: dict[str, Any]) -> float:
+            base = 0.18
+            if any("/" in o for o in overlap):
+                base += 0.1
+            if Path(str(writer.get("file", ""))).stem == Path(str(reader.get("file", ""))).stem:
+                base += 0.08
+            if writer.get("severity") in {"high", "critical"}:
+                base += 0.03
+            if reader.get("severity") in {"high", "critical"}:
+                base += 0.03
+            return min(0.6, round(base + min(0.18, len(overlap) * 0.05), 3))
+
+        writer_ids = ('path', 'tainted', 'template', 'command', 'redirect', 'ssrf', 'write', 'file')
+        writers=[i for i in issues if i.get('lang')=='python' and any(k in str(i.get('issue_id','')).lower() for k in writer_ids)]
         readers=[i for i in issues if i.get('lang') in {'shell','javascript','binary'}]
-        for w in writers[:3]:
-            for r in readers[:3]:
-                chains.append({"from": {"file": w.get("file"), "issue": w.get("issue_id")}, "to": {"file": r.get("file"), "issue": r.get("issue_id")}, "type": "cross_language_hint"})
+        for w in writers:
+            writer_signals = path_signals(w)
+            if not writer_signals:
+                continue
+            for r in readers:
+                overlap = writer_signals & path_signals(r)
+                if not overlap:
+                    continue
+                confidence = score_overlap(overlap, w, r)
+                chains.append({
+                    "from": {"file": w.get("file"), "issue": w.get("issue_id")},
+                    "to": {"file": r.get("file"), "issue": r.get("issue_id")},
+                    "type": "potential_cross_language_hint",
+                    "classification": "potential cross-language hint (not confirmed taint chain)",
+                    "confirmed": False,
+                    "confidence": confidence,
+                    "shared_indicators": sorted(overlap)[:5],
+                    "evidence": {
+                        "writer_lang": w.get("lang"),
+                        "reader_lang": r.get("lang"),
+                        "writer_severity": w.get("severity"),
+                        "reader_severity": r.get("severity"),
+                    },
+                })
+                if len(chains) >= 20:
+                    break
+            if len(chains) >= 20:
+                break
+
+        chains.sort(key=lambda c: (-float(c.get("confidence", 0.0)), len(c.get("shared_indicators", []))))
         return chains
 
     def _structural_risk_fingerprint(self, endpoint: Endpoint, package: str, version: str, chain_risk: float, structural_report: dict[str, Any]) -> dict[str, Any]:
@@ -1785,6 +2197,9 @@ class HegemonControlPlane:
         discovered: list[VulnerabilityFinding] = []
         markov, chain_risk = self._kill_chain_transition_markov(endpoint.telemetry_events)
         structural_report = self._analyze_program_structure(endpoint.program_root)
+        integrated_flow = self._integrated_markov_mtre_graph_model(endpoint.telemetry_events, structural_report)
+        flow_risk = float(integrated_flow.get("fusion_risk", 0.0))
+        flow_conf = float(integrated_flow.get("fusion_confidence", 0.0))
         for package, version in endpoint.installed_packages.items():
             candidates: dict[str, dict[str, Any]] = {}
             osv_results = self._query_osv(package, version, endpoint.os) if include_external_intel else []
@@ -1850,6 +2265,7 @@ class HegemonControlPlane:
                 )
                 evidence = list(candidate.get("evidence", []))
                 evidence.append({"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk})
+                evidence.append({"type": "integrated_flow_model", "model": integrated_flow, "flow_risk": flow_risk, "flow_confidence": flow_conf})
                 evidence.append(
                     {
                         "type": "ast_graph_double_check",
@@ -2326,6 +2742,9 @@ class HegemonControlPlane:
         discovered: list[VulnerabilityFinding] = []
         markov, chain_risk = self._kill_chain_transition_markov(endpoint.telemetry_events)
         structural_report = self._analyze_program_structure(endpoint.program_root)
+        integrated_flow = self._integrated_markov_mtre_graph_model(endpoint.telemetry_events, structural_report)
+        flow_risk = float(integrated_flow.get("fusion_risk", 0.0))
+        flow_conf = float(integrated_flow.get("fusion_confidence", 0.0))
         for package, version in endpoint.installed_packages.items():
             candidates: dict[str, dict[str, Any]] = {}
             for vuln in (self._query_osv(package, version, endpoint.os) if include_external_intel else []):
@@ -2355,19 +2774,23 @@ class HegemonControlPlane:
                     continue
                 age_days = float(candidate.get("age_days", 365.0))
                 epss_score, epss_percentile = self._query_epss(candidate["cve"])
-                exploit_availability = min(10.0, round(3.0 + max(0.0, (365 - min(age_days, 365))) / 120 + chain_risk * 2.1 + epss_score * 3.5, 2))
+                exploit_availability = min(10.0, round(3.0 + max(0.0, (365 - min(age_days, 365))) / 120 + chain_risk * 2.1 + epss_score * 3.5 + flow_risk * 1.2, 2))
                 evidence = list(candidate.get("evidence", []))
                 if self._query_exploitdb_confirmed(candidate["cve"]):
                     exploit_availability = max(exploit_availability, 9.2)
                     evidence.append({"type": "public-exploit-confirmed", "tag": "public-exploit-confirmed"})
                 evidence.append({"type": "kill_chain_markov", "transitions": markov, "chain_risk": chain_risk})
+                evidence.append({"type": "integrated_flow_model", "model": integrated_flow, "flow_risk": flow_risk, "flow_confidence": flow_conf})
                 finding = self.create_finding({"endpoint_id": endpoint_id, "cve": candidate["cve"], "cvss": float(candidate.get("cvss", 7.0)), "exploit_availability": exploit_availability, "topological_impact": 6.8 if endpoint.network_exposure == "internet" else 5.2, "asset_value": endpoint.asset_value, "trust_level": endpoint.trust_level, "evidence": evidence, "suggested_remediations": [f"Upgrade {package} to {candidate.get('target_version', 'latest')}"]}, actor=actor)
                 finding.epss_score = epss_score
                 finding.epss_percentile = epss_percentile
                 discovered.append(finding)
         for issue in structural_report.get("issues", []):
             cve = f"HEGEMON-AST-{str(issue.get('issue_id', 'unknown')).upper()}"
-            finding = self.create_finding({"endpoint_id": endpoint_id, "cve": cve, "cvss": 8.8 if issue.get("severity") == "critical" else 7.0, "exploit_availability": 7.5, "topological_impact": 6.1, "asset_value": endpoint.asset_value, "trust_level": endpoint.trust_level, "evidence": [{"type": "ast_issue", **issue}], "suggested_remediations": [issue.get("patch_hint", "Apply secure coding controls")], "reasoning": issue.get("reasoning", "")}, actor=actor)
+            ast_evidence = [{"type": "ast_issue", **issue}, {"type": "integrated_flow_model", "model": integrated_flow, "flow_risk": flow_risk, "flow_confidence": flow_conf}]
+            base_cvss = 8.8 if issue.get("severity") == "critical" else 7.0
+            boosted_cvss = min(9.9, round(base_cvss + (flow_risk * 0.7), 2))
+            finding = self.create_finding({"endpoint_id": endpoint_id, "cve": cve, "cvss": boosted_cvss, "exploit_availability": min(9.8, 7.5 + flow_risk), "topological_impact": 6.1 + (flow_risk * 0.6), "asset_value": endpoint.asset_value, "trust_level": endpoint.trust_level, "evidence": ast_evidence, "suggested_remediations": [issue.get("patch_hint", "Apply secure coding controls")], "reasoning": issue.get("reasoning", "")}, actor=actor)
             finding.techniques = issue.get("techniques", ISSUE_TO_TECHNIQUES.get(str(issue.get("issue_id", "")), []))
             discovered.append(finding)
         return discovered
@@ -2549,7 +2972,7 @@ class HegemonControlPlane:
                 resolved_mode = "unfriendly" if mode == "auto" else mode
                 endpoint = Endpoint(endpoint_id=endpoint_id, host_name=endpoint_id, endpoint_type="external", os=str(target.get("os", "unknown")), kernel="unknown", hypervisor=None, firmware_baseline=None, sbom_status="unknown", enrollment_method="manual", network_exposure=str(target.get("network_exposure", "internet")), installed_packages=dict(target.get("packages", {})), program_root=str(target.get("program_root") or program_root or "") or None)
 
-        structural_report = self._analyze_program_structure(endpoint.program_root) if include_ast else {"files_scanned": 0, "issues": [], "lang_breakdown": {}, "binary_artefacts_scanned": 0, "binary_packed_sections": 0, "cross_language_chains": [], "disassembly_backend": None}
+        structural_report = self._analyze_program_structure(endpoint.program_root) if include_ast else {"files_scanned": 0, "issues": [], "lang_breakdown": {}, "binary_artefacts_scanned": 0, "binary_packed_sections": 0, "cross_language_chains": [], "potential_cross_language_hints": [], "cross_language_analysis_note": "potential cross-language hints (not confirmed taint chains)", "disassembly_backend": None, "lstm_rnn_binary_model": {}, "integrated_flow_model": {}}
         findings = self.run_vulnerability_scan(endpoint.endpoint_id, actor=actor, include_external_intel=include_external_intel) if resolved_mode == "friendly" else self._scan_unfriendly(endpoint, actor=actor, include_external_intel=include_external_intel, include_ast=include_ast)
         new_findings, _resolved, _escalated = self._diff_scan_results(endpoint.endpoint_id, findings)
         graph = self._build_lateral_movement_graph()
@@ -2557,7 +2980,9 @@ class HegemonControlPlane:
             reachable = [e["target"] for e in graph.get("edges", []) if e["source"] == endpoint.endpoint_id]
             f.poc_attack_map.setdefault("blast_radius_estimate", {})["reachable_endpoints"] = reachable
         mk = self._markov_tree_project(endpoint.telemetry_events if hasattr(endpoint, "telemetry_events") else [])
-        result = ScanResult(scan_id=f"scan-{secrets.token_hex(4)}", target_id=endpoint.endpoint_id, mode=resolved_mode, actor=actor, started_at=started.isoformat(), completed_at=datetime.now(timezone.utc).isoformat(), duration_seconds=round((datetime.now(timezone.utc)-started).total_seconds(), 3), findings=findings, new_findings=new_findings, suppressed=len(self.suppressed_findings), intel_sources=["osv", "nvd", "ghsa", "epss"], ast_files_scanned=int(structural_report.get("files_scanned", 0)), ast_issues_raw=len(structural_report.get("issues", [])), ast_issues_confirmed=len(structural_report.get("issues", [])), markov_tree=mk, bayesian_posteriors={}, attack_surface_delta={"new": len(new_findings)}, scan_confidence=0.8, lateral_graph=graph, lang_breakdown=dict(structural_report.get("lang_breakdown", {})), binary_artefacts_scanned=int(structural_report.get("binary_artefacts_scanned", 0)), binary_packed_sections=int(structural_report.get("binary_packed_sections", 0)), cross_language_chains=list(structural_report.get("cross_language_chains", [])), disassembly_backend=structural_report.get("disassembly_backend"))
+        integrated_flow = self._integrated_markov_mtre_graph_model(endpoint.telemetry_events if hasattr(endpoint, "telemetry_events") else [], structural_report)
+        scan_confidence = min(0.99, round(0.52 + (0.28 * float(integrated_flow.get("fusion_confidence", 0.0))) + (0.20 * float(structural_report.get("ast_confidence", 0.0))), 4))
+        result = ScanResult(scan_id=f"scan-{secrets.token_hex(4)}", target_id=endpoint.endpoint_id, mode=resolved_mode, actor=actor, started_at=started.isoformat(), completed_at=datetime.now(timezone.utc).isoformat(), duration_seconds=round((datetime.now(timezone.utc)-started).total_seconds(), 3), findings=findings, new_findings=new_findings, suppressed=len(self.suppressed_findings), intel_sources=["osv", "nvd", "ghsa", "epss"], ast_files_scanned=int(structural_report.get("files_scanned", 0)), ast_issues_raw=len(structural_report.get("issues", [])), ast_issues_confirmed=len(structural_report.get("issues", [])), markov_tree=mk, bayesian_posteriors={"markov_rnn_sequence_anomaly": float(structural_report.get("lstm_rnn_binary_model", {}).get("sequence_anomaly", 0.0)), "markov_rnn_confidence": float(structural_report.get("lstm_rnn_binary_model", {}).get("confidence", 0.0)), "fusion_risk": float(integrated_flow.get("fusion_risk", 0.0)), "fusion_confidence": float(integrated_flow.get("fusion_confidence", 0.0))}, attack_surface_delta={"new": len(new_findings), "fusion_risk": float(integrated_flow.get("fusion_risk", 0.0))}, scan_confidence=scan_confidence, lateral_graph=graph, lang_breakdown=dict(structural_report.get("lang_breakdown", {})), binary_artefacts_scanned=int(structural_report.get("binary_artefacts_scanned", 0)), binary_packed_sections=int(structural_report.get("binary_packed_sections", 0)), cross_language_chains=list(structural_report.get("cross_language_chains", [])), disassembly_backend=structural_report.get("disassembly_backend"))
         with self._state_lock:
             self.scan_results_by_id[result.scan_id] = result
             self.scan_history.setdefault(endpoint.endpoint_id, []).append(result)

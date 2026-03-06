@@ -701,6 +701,10 @@ async function runAutonomousScan(){
       schema:'hegemon.scan_report.v2',
       findings,
       global_weakness_report:data.global_weakness_report || {},
+      cross_language_analysis_note:data.cross_language_analysis_note || 'potential cross-language hints (not confirmed taint chains)',
+      potential_cross_language_hints:(data.potential_cross_language_hints||[]).slice(0, 10),
+      lstm_rnn_binary_model:data.lstm_rnn_binary_model || {},
+      integrated_flow_model:data.integrated_flow_model || {},
     }, null, 2);
   }
 
@@ -1329,6 +1333,8 @@ def control_plane_scan():
     if endpoint_id not in _control_plane.endpoints:
         return jsonify({"error": "not_found", "message": "endpoint not found"}), 404
     findings = _control_plane.run_vulnerability_scan(endpoint_id, actor="dashboard_scanner")
+    endpoint = _control_plane.endpoints.get(endpoint_id)
+    structural_report = _control_plane._analyze_program_structure(endpoint.program_root) if endpoint and endpoint.program_root else {}
     proposals = [
         _control_plane.as_dict(_control_plane.generate_patch_proposal(finding.finding_id, actor="dashboard_scanner"))
         for finding in findings
@@ -1340,6 +1346,10 @@ def control_plane_scan():
             "findings": [_control_plane.as_dict(f) for f in findings],
             "proposals": proposals,
             "global_weakness_report": global_report,
+            "potential_cross_language_hints": structural_report.get("potential_cross_language_hints", []),
+            "cross_language_analysis_note": structural_report.get("cross_language_analysis_note", "potential cross-language hints (not confirmed taint chains)"),
+            "lstm_rnn_binary_model": structural_report.get("lstm_rnn_binary_model", {}),
+            "integrated_flow_model": structural_report.get("integrated_flow_model", {}),
         }
     )
 
