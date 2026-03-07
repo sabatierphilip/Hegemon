@@ -31,6 +31,7 @@ const BRAIN_NODES: Record<string, PaletteNode[]> = {
     { kind: 'dns_resolve', params: { hostname: '', record_type: 'A' }, inputType: 'hostname:string', outputType: 'records:string[]' },
     { kind: 'icmp_sweep', params: { cidr: '' }, inputType: 'cidr:string', outputType: 'responders:string[]' },
     { kind: 'lateral_move', params: { host: '', port: 445, method: 'smb_pivot' }, description: 'TCP probe lateral movement to target host. Records reachable hosts.', inputType: 'host:string', outputType: 'moved:boolean' },
+    { kind: 'pivot_host', params: { target_host: '', port: 5985, method: 'winrm' }, description: 'Designs a host pivot lane with protocol-aware fallback ports and confidence scoring.', inputType: 'host:string', outputType: 'pivot_path:object' },
     { kind: 'credential_probe', params: { host: 'local', scope: 'env' }, description: 'Sweeps env vars and credential files for secrets.', inputType: 'scope:string', outputType: 'findings:object[]' },
   ],
   Detect: [
@@ -57,6 +58,7 @@ const BRAIN_NODES: Record<string, PaletteNode[]> = {
     { kind: 'emit_alert', params: { level: 'critical', message: '' }, inputType: 'finding:object', outputType: 'alert_id:string' },
     { kind: 'exec_remediation', params: { script: '', timeout: 30 }, inputType: 'script:string', outputType: 'exit_code:number' },
     { kind: 'confront_intruder', params: { strategy: 'bidirectional_block' }, description: 'Engages active countermeasure against detected intrusion.', inputType: 'target:string', outputType: 'action_result:boolean' },
+    { kind: 'countermeasure', params: { target: '', strategy: 'counter-lateral-quarantine' }, description: 'Chains containment tactics (segment isolation, route sinkholing, forced re-auth) with autonomous guardrails.', inputType: 'intruder_profile:object', outputType: 'containment_result:object' },
   ],
   Control: [
     { kind: 'wait', params: { seconds: 60 }, inputType: 'control_signal', outputType: 'control_signal' },

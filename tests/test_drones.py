@@ -6,6 +6,7 @@ import os
 import base64
 import zlib
 import re
+import threading
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import pytest
@@ -649,3 +650,56 @@ def test_pid_persisted_to_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     pid_path = Path("data") / "drones" / drone.drone_id / "pid"
     assert pid_path.exists()
     assert int(pid_path.read_text()) == 99999
+
+
+def test_execute_node_pivot_host_records_port_intel(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Pivoter", "autonomous", "custom", _mini_behaviour(), autonomy_level="enforce", actor="tester")
+    pivot = DroneNode(
+        node_id="pivot",
+        node_type="action",
+        kind="pivot_host",
+        label="Pivot Host",
+        params={"target_host": "127.0.0.1", "port": 1, "method": "tcp_probe"},
+        position={"x": 0, "y": 0},
+        edges_out=["done"],
+        edge_labels={},
+    )
+    done = DroneNode(node_id="done", node_type="control", kind="self_terminate", label="Done", params={}, position={"x": 1, "y": 0}, edges_out=[], edge_labels={})
+    nxt = cp._execute_node(
+        drone,
+        pivot,
+        {"pivot": pivot, "done": done},
+        {},
+        threading.Event(),
+        0.0,
+    )
+    assert nxt == "done"
+    assert any(fid.startswith("pivot-") for fid in drone.findings)
+    assert any("pivot_host" in row.get("message", "") for row in drone.telemetry)
+
+
+def test_execute_node_countermeasure_adds_containment_finding(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Contain", "autonomous", "custom", _mini_behaviour(), autonomy_level="enforce", actor="tester")
+    node = DroneNode(
+        node_id="cm",
+        node_type="action",
+        kind="countermeasure",
+        label="Counter",
+        params={"target": "10.0.0.9", "strategy": "counter-lateral-quarantine"},
+        position={"x": 0, "y": 0},
+        edges_out=[],
+        edge_labels={},
+    )
+    nxt = cp._execute_node(
+        drone,
+        node,
+        {"cm": node},
+        {},
+        threading.Event(),
+        0.0,
+    )
+    assert nxt is None
+    assert any("countermeasure-counter-lateral-quarantine" in fid for fid in drone.findings)
+    assert any("Countermeasure engaged" in row.get("message", "") for row in drone.telemetry)

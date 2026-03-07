@@ -64,6 +64,11 @@ const PARAM_SCHEMAS: Record<string, ParamField[]> = {
     { key: 'port', label: 'Port', type: 'number', min: 1, max: 65535 },
     { key: 'method', label: 'Method', type: 'select', options: ['tcp_probe', 'smb_pivot', 'rdp_trace', 'ssh_hop', 'winrm'] },
   ],
+  pivot_host: [
+    { key: 'target_host', label: 'Pivot Target Host', type: 'text', placeholder: '10.0.10.24' },
+    { key: 'port', label: 'Seed Port', type: 'number', min: 1, max: 65535 },
+    { key: 'method', label: 'Pivot Method', type: 'select', options: ['winrm', 'ssh_hop', 'rdp_trace', 'smb_pivot', 'tcp_probe'] },
+  ],
   credential_probe: [
     { key: 'host', label: 'Host Context', type: 'text', placeholder: 'local' },
     { key: 'scope', label: 'Scope', type: 'select', options: ['env', 'files', 'both'] },
@@ -71,6 +76,10 @@ const PARAM_SCHEMAS: Record<string, ParamField[]> = {
   confront_intruder: [
     { key: 'ip', label: 'Target IP', type: 'text' },
     { key: 'strategy', label: 'Strategy', type: 'select', options: ['bidirectional_block', 'counter-lateral-quarantine', 'active-containment', 'sinkhole'] },
+  ],
+  countermeasure: [
+    { key: 'target', label: 'Intruder Target', type: 'text', placeholder: '10.0.0.66' },
+    { key: 'strategy', label: 'Countermeasure Strategy', type: 'select', options: ['counter-lateral-quarantine', 'active-containment', 'sinkhole', 'bidirectional_block'] },
   ],
   manage_service: [
     { key: 'service_name', label: 'Service Name', type: 'text' },
