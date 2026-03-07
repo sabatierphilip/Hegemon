@@ -27,11 +27,25 @@ export interface Drone {
   id: string;
   name: string;
   tier: 'controlled' | 'tethered' | 'autonomous';
-  autonomy: 'observe' | 'contain' | 'enforce';
-  status: 'active' | 'idle' | 'error' | 'offline';
+  autonomy_level: 'observe' | 'contain' | 'enforce';
+  status: 'ready' | 'active' | 'terminated' | 'error';
   ttl_seconds: number;
-  phase?: string;
-  confidence?: number;
+  checkin_interval_seconds: number;
+  launched_at: string | null;
+  return_at: string | null;
+  pid: number | null;
+  blob_hash: string;
+  blob_size_bytes: number;
+  deadrop_path: string;
+  findings: string[];
+  stats: {
+    hosts_pinged: number;
+    ports_scanned: number;
+    findings_count: number;
+    nodes_executed: number;
+  };
+  live_output: string[];
+  current_node_id: string | null;
 }
 
 export interface Endpoint {
