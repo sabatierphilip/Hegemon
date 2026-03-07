@@ -2261,13 +2261,28 @@ def api_drones_assemble():
     payload, error = _safe_json_payload()
     if error:
         return error
+
+    ignored_fields: list[str] = []
+    runtime_payload = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
+    artifact_format = str(payload.get("artifact_format", "binary_blob") or "binary_blob")
+
     behaviour = payload.get("behaviour")
+    graph_nodes = list(payload.get("nodes", [])) if isinstance(payload.get("nodes"), list) else []
+    graph_edges = list(payload.get("edges", [])) if isinstance(payload.get("edges"), list) else []
     if behaviour and isinstance(behaviour, dict):
         behaviour = _control_plane._make_brain(
             behaviour_id=str(behaviour.get("behaviour_id", f"brain-{secrets.token_hex(4)}")),
             name=str(behaviour.get("name", "custom")),
             description=str(behaviour.get("description", "custom behaviour")),
             nodes=list(behaviour.get("nodes", [])),
+        )
+    elif graph_nodes:
+        behaviour = _control_plane._compose_behaviour_from_graph(
+            graph_nodes,
+            graph_edges,
+            behaviour_id=str(payload.get("behaviour_id", f"brain-{secrets.token_hex(4)}")),
+            name=str(payload.get("name", "composed-drone")),
+            description="composer graph",
         )
     else:
         behaviour = payload.get("brain_id") or "brain-pinger-basic"
@@ -2285,10 +2300,20 @@ def api_drones_assemble():
             checkin_interval_seconds=int(payload.get("checkin_interval_seconds", 60)),
             payload=payload.get("payload", {}),
             actor=str(payload.get("actor", "user")),
+            artifact_format=artifact_format,
+            runtime=runtime_payload,
         )
     except ValueError as exc:
         return jsonify({"error": "invalid_request", "message": str(exc)}), 400
-    return jsonify(_control_plane.as_dict(drone))
+
+    response = _control_plane.as_dict(drone)
+    if ignored_fields:
+        response["warnings"] = [{
+            "code": "ignored_fields",
+            "message": "Some payload fields are accepted but not yet consumed by /api/drones/assemble.",
+            "fields": ignored_fields,
+        }]
+    return jsonify(response)
 
 
 
