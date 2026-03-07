@@ -220,6 +220,10 @@ HTML = """
     .cp-subtab h4{margin:0;display:flex;align-items:center;justify-content:space-between;font-size:13px;}
     .cp-icon-btn{border:1px solid #4b67a8;background:#223666;color:#d8e2ff;border-radius:8px;cursor:pointer;padding:1px 8px;font-weight:700;}
     .cp-arrow{cursor:pointer;margin-left:6px;}
+    .drone-network-grid{display:grid;grid-template-columns:220px 1fr;gap:8px;margin-top:8px;}
+    .drone-chip{padding:6px 8px;border:1px solid #345098;background:#17213c;border-radius:8px;cursor:pointer;margin-bottom:6px;}
+    .drone-link-card{padding:8px;border:1px solid #2f4383;border-radius:8px;background:#131d35;margin-bottom:6px;}
+    .drone-link-pill{display:inline-block;padding:2px 6px;border-radius:999px;background:#243868;border:1px solid #38559a;font-size:11px;margin-right:4px;}
   </style>
 </head>
 <body>
@@ -450,6 +454,10 @@ HTML = """
             <strong>Fleet</strong>
             <button id="new-drone-btn" class="tab-btn">+ New Drone</button>
           </div>
+          <select id="sample-drone-select" class="tab-btn" style="margin-top:8px;width:100%;padding:8px;">
+            <option value="">Load Sample Drone ▾</option>
+          </select>
+          <button id="apply-sample-drone-btn" class="tab-btn" style="margin-top:8px;width:100%;">Apply Sample to Builder</button>
           <button id="auto-assemble-drone-btn" class="tab-btn" style="margin-top:8px;width:100%;">Auto-Assemble</button>
           <div id="drone-fleet" style="margin-top:8px;"></div>
         </div>
@@ -469,6 +477,31 @@ HTML = """
             </div>
           </div>
           <div id="graph-errors" class="small" style="color:#ff9f9f;margin-top:8px;"></div>
+          <div class="json" style="margin-top:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+              <strong>Adaptive Drone Link Builder</strong>
+              <div style="display:flex;gap:8px;">
+                <button id="squad-assemble-btn" class="tab-btn">Assemble Squad</button>
+                <button id="squad-clear-btn" class="tab-btn">Clear Links</button>
+              </div>
+            </div>
+            <div class="small" style="margin:6px 0 8px;">Select sample drones, connect them visually, and adjust route destinations for each member.</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+              <select id="squad-sample-select" class="tab-btn" style="padding:8px;min-width:220px;"><option value="">Select Sample Drone ▾</option></select>
+              <input id="squad-drone-destination" placeholder="Destination (host/network/endpoint)" style="padding:8px;border-radius:8px;background:#0f1528;color:#d8e2ff;border:1px solid #2f4383;min-width:280px;" />
+              <button id="squad-add-btn" class="tab-btn">Add to Squad</button>
+            </div>
+            <div class="drone-network-grid">
+              <div>
+                <div id="squad-drone-list" class="small" style="margin-top:8px;"></div>
+                <div id="squad-links" class="small" style="margin-top:8px;"></div>
+              </div>
+              <div id="squad-canvas-wrap" style="position:relative;height:220px;overflow:hidden;border:1px solid #2f4383;border-radius:8px;background:#0f1528;">
+                <svg id="squad-edge-svg" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;"></svg>
+                <div id="squad-canvas" style="position:absolute;inset:0;"></div>
+              </div>
+            </div>
+          </div>
           <div class="json" style="margin-top:8px;">
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
               <input id="drone-name" placeholder="Name" value="Scout-Alpha" />
@@ -912,7 +945,31 @@ window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveSt
 let selectedDroneId=null;
 let droneActionMatrix=[];
 const graphState={nodes:{},edges:[],selected:null,dragging:null,connecting:null,pan:{x:0,y:0},zoom:1.0};
+const squadState={nodes:[],links:[],selectedNodeId:null,linkingFrom:null};
 let _brainsCache=[];
+
+let SAMPLE_DRONES=[];
+
+async function loadSampleDrones(){
+  try{
+    const resp=await fetch('/api/drones/samples');
+    if(!resp.ok){return;}
+    const rows=await resp.json();
+    SAMPLE_DRONES=(rows||[]).map(r=>({
+      sample_id:r.sample_id,
+      name:r.name,
+      tier:r.tier,
+      mission:r.mission,
+      autonomy_level:r.autonomy_level,
+      ttl_seconds:r.ttl_seconds,
+      checkin_interval_seconds:r.checkin_interval_seconds,
+      target:r.target,
+      behaviour_id:r.behaviour_id,
+      brain_name:r.brain_name,
+      description:r.description,
+    }));
+  }catch(_e){}
+}
 
 const NODE_LIBRARY=[
   {kind:'on_launch',type:'trigger',label:'On Launch'},
@@ -936,7 +993,7 @@ const NODE_LIBRARY=[
   {kind:'self_terminate',type:'control',label:'Self Terminate'},
 ];
 const NODE_SCHEMAS={
-  ping_host:[{key:'host',type:'text',label:'Host',default:''}],
+  ping_host:[{key:'host',type:'text',label:'Host',default:''},{key:'message',type:'text',label:'Message payload',default:''},{key:'fallback_port',type:'number',label:'Fallback TCP port',default:443}],
   port_scan:[{key:'host',type:'text',label:'Host',default:''},{key:'port_range',type:'text',label:'Port range',default:'1-1024'},{key:'timeout_ms',type:'number',label:'Timeout ms',default:500}],
   subnet_scan:[{key:'cidr',type:'text',label:'CIDR',default:'10.0.0.0/24'}],
   banner_grab:[{key:'host',type:'text',label:'Host',default:''}],
@@ -1033,11 +1090,83 @@ function validateGraph(){
 function graphToBehaviourNodes(){
   return Object.values(graphState.nodes).map(n=>({node_id:n.id,node_type:n.type,kind:n.kind,label:n.label,params:n.params,position:{x:n.x,y:n.y},edges_out:n.edges_out||[],edge_labels:n.edge_labels||{}}));
 }
+
+function fillSampleDroneDropdowns(){
+  const opts=SAMPLE_DRONES.map(s=>`<option value='${s.sample_id}'>${s.name}</option>`).join('');
+  const fleetSel=document.getElementById('sample-drone-select');
+  if(fleetSel){fleetSel.innerHTML=`<option value=''>Load Sample Drone ▾</option>${opts}`;}
+  const squadSel=document.getElementById('squad-sample-select');
+  if(squadSel){squadSel.innerHTML=`<option value=''>Select Sample Drone ▾</option>${opts}`;}
+}
+
+function renderSquadBuilder(){
+  const list=document.getElementById('squad-drone-list');
+  const links=document.getElementById('squad-links');
+  const canvas=document.getElementById('squad-canvas');
+  const svg=document.getElementById('squad-edge-svg');
+  if(list){
+    list.innerHTML=squadState.nodes.length? squadState.nodes.map(n=>`<div class='drone-chip' data-node='${n.id}' style='${squadState.selectedNodeId===n.id?'border-color:#6da2ff;background:#1a2a50;':''}'><strong>${n.name}</strong><div class='small'>dest: ${n.destination||'-'}</div><div class='small'>${n.tier.toUpperCase()} / ${n.mission}</div></div>`).join('') : '<div class="small">No sample drones linked yet.</div>';
+    list.querySelectorAll('[data-node]').forEach(el=>el.addEventListener('click',()=>{squadState.selectedNodeId=el.dataset.node; renderSquadBuilder();}));
+  }
+  if(links){
+    links.innerHTML=squadState.links.length? squadState.links.map((l,idx)=>`<div class='drone-link-card'><span class='drone-link-pill'>${idx+1}</span>${l.from_name} → ${l.to_name}</div>`).join('') : '<div class="small">No links yet. Click source drone then destination drone to create one.</div>';
+  }
+  if(canvas && svg){
+    canvas.innerHTML=''; svg.innerHTML='';
+    squadState.nodes.forEach(n=>{
+      const el=document.createElement('button');
+      el.className='tab-btn';
+      el.style.position='absolute';
+      el.style.left=`${n.x}px`;
+      el.style.top=`${n.y}px`;
+      el.style.padding='6px 10px';
+      el.style.borderColor=squadState.selectedNodeId===n.id?'#7daeff':'#2f4383';
+      el.textContent=n.name;
+      el.onclick=()=>{
+        if(squadState.linkingFrom && squadState.linkingFrom!==n.id){
+          const from=squadState.nodes.find(x=>x.id===squadState.linkingFrom);
+          squadState.links.push({from_id:squadState.linkingFrom,to_id:n.id,from_name:from?.name||squadState.linkingFrom,to_name:n.name});
+          squadState.linkingFrom=null;
+        }else{
+          squadState.selectedNodeId=n.id;
+          squadState.linkingFrom=n.id;
+        }
+        renderSquadBuilder();
+      };
+      canvas.appendChild(el);
+    });
+    squadState.links.forEach(link=>{
+      const from=squadState.nodes.find(n=>n.id===link.from_id);
+      const to=squadState.nodes.find(n=>n.id===link.to_id);
+      if(!from||!to) return;
+      const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+      line.setAttribute('x1',String(from.x+80)); line.setAttribute('y1',String(from.y+16));
+      line.setAttribute('x2',String(to.x+8)); line.setAttribute('y2',String(to.y+16));
+      line.setAttribute('stroke','#80aaff'); line.setAttribute('stroke-width','2');
+      svg.appendChild(line);
+    });
+  }
+}
+
+function applySampleDroneToBuilder(sample){
+  if(!sample) return;
+  document.getElementById('drone-name').value=sample.name;
+  document.getElementById('drone-tier').value=sample.tier;
+  document.getElementById('drone-mission').value=sample.mission;
+  document.getElementById('drone-autonomy').value=sample.autonomy_level;
+  document.getElementById('drone-ttl').value=String(sample.ttl_seconds);
+  document.getElementById('drone-checkin').value=String(sample.checkin_interval_seconds);
+  document.getElementById('drone-target').value=sample.target;
+  const brain=(_brainsCache||[]).find(b=>b.behaviour_id===sample.behaviour_id) || (_brainsCache||[]).find(b=>String(b.name||'').toLowerCase()===String(sample.brain_name||'').toLowerCase());
+  if(brain) loadBrainIntoCanvas(brain);
+}
+
 async function loadBrains(){
   const resp=await fetch('/api/drones/brains'); if(!resp.ok)return;
   _brainsCache=await resp.json();
   const sel=document.getElementById('graph-load-brain');
   if(sel){sel.innerHTML='<option value="">Load Brain ▾</option>'+_brainsCache.map(b=>`<option value='${b.behaviour_id}'>${b.name}</option>`).join('');}
+  fillSampleDroneDropdowns();
 }
 function loadBrainIntoCanvas(brain){
   graphState.nodes={}; graphState.edges=[]; graphState.selected=null;
@@ -1096,7 +1225,44 @@ function wireCanvasEvents(){
 }
 
 document.getElementById('new-drone-btn')?.addEventListener('click',()=>{document.getElementById('drone-name').value=`Drone-${Math.random().toString(16).slice(2,6).toUpperCase()}`;});
+document.getElementById('apply-sample-drone-btn')?.addEventListener('click',()=>{
+  const id=document.getElementById('sample-drone-select')?.value||'';
+  const sample=SAMPLE_DRONES.find(s=>s.sample_id===id);
+  if(sample) applySampleDroneToBuilder(sample);
+});
 document.getElementById('auto-assemble-drone-btn')?.addEventListener('click', async ()=>{const ep=window.prompt('Endpoint ID for auto-assemble','ep-default-linux')||''; if(!ep)return; await fetch('/api/drones/auto-assemble',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint_id:ep,actor:'dashboard'})}); await refreshDrones();});
+document.getElementById('squad-add-btn')?.addEventListener('click',()=>{
+  const sampleId=document.getElementById('squad-sample-select')?.value||'';
+  const destination=(document.getElementById('squad-drone-destination')?.value||'').trim();
+  const sample=SAMPLE_DRONES.find(s=>s.sample_id===sampleId);
+  if(!sample) return;
+  const id='sq-'+Math.random().toString(16).slice(2,8);
+  const idx=squadState.nodes.length;
+  squadState.nodes.push({id,sample_id:sample.sample_id,name:sample.name,tier:sample.tier,mission:sample.mission,destination:destination||sample.target,x:12+(idx%3)*150,y:14+Math.floor(idx/3)*60});
+  squadState.selectedNodeId=id;
+  squadState.linkingFrom=null;
+  renderSquadBuilder();
+});
+document.getElementById('squad-clear-btn')?.addEventListener('click',()=>{
+  squadState.nodes=[];
+  squadState.links=[];
+  squadState.selectedNodeId=null;
+  squadState.linkingFrom=null;
+  renderSquadBuilder();
+});
+document.getElementById('squad-assemble-btn')?.addEventListener('click', async()=>{
+  if(!squadState.nodes.length){return;}
+  const payload={
+    nodes:squadState.nodes.map(n=>({id:n.id,sample_id:n.sample_id,name:n.name,destination:n.destination})),
+    links:squadState.links.map(l=>({from_id:l.from_id,to_id:l.to_id})),
+    actor:'dashboard',
+  };
+  const resp=await fetch('/api/drones/squad/assemble',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data=await resp.json();
+  const panel=document.getElementById('drone-build-result');
+  if(panel){panel.textContent=resp.ok?`Squad assembled: ${(data.built||[]).map(b=>b.name).join(', ')}`:`Squad assemble failed: ${data.message||data.error||'unknown error'}`;}
+  if(resp.ok){await refreshDrones();}
+});
 document.getElementById('graph-validate')?.addEventListener('click', validateGraph);
 document.getElementById('graph-load-brain')?.addEventListener('change',()=>{const id=document.getElementById('graph-load-brain').value; const brain=_brainsCache.find(b=>b.behaviour_id===id); if(brain)loadBrainIntoCanvas(brain);});
 document.getElementById('graph-save-brain')?.addEventListener('click', async ()=>{
@@ -1128,8 +1294,8 @@ document.getElementById('graph-compile')?.addEventListener('click', async ()=>{
   }else{panel.textContent=`Assemble failed: ${data.message||data.error||'unknown error'}`;}
 });
 
-function initDroneBuilder(){
-  renderPalette(); wireCanvasEvents(); loadBrains();
+async function initDroneBuilder(){
+  renderPalette(); wireCanvasEvents(); await loadSampleDrones(); await loadBrains(); fillSampleDroneDropdowns(); renderSquadBuilder();
   const a=_newNode('on_launch',40,40), b=_newNode('ping_host',280,40), c=_newNode('send_report',520,40), d=_newNode('self_terminate',760,40);
   graphState.nodes[b].params.host='127.0.0.1';
   graphState.edges.push({id:'edge-a',from_id:a,to_id:b,label:''},{id:'edge-b',from_id:b,to_id:c,label:''},{id:'edge-c',from_id:c,to_id:d,label:''});
@@ -2204,6 +2370,54 @@ def api_drones_actions():
     if unauthorized:
         return unauthorized
     return jsonify(_control_plane.available_drone_actions())
+
+
+@app.get("/api/drones/samples")
+def api_drones_samples():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify(_control_plane.drone_sample_catalog())
+
+
+@app.post("/api/drones/samples/<sample_id>/assemble")
+def api_drones_samples_assemble(sample_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    try:
+        drone = _control_plane.assemble_sample_drone(
+            sample_id,
+            destination=str(payload.get("destination", "")).strip() or None,
+            actor=str(payload.get("actor", "user")),
+            name_override=str(payload.get("name", "")).strip() or None,
+            payload=payload.get("payload"),
+        )
+    except ValueError as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify(_control_plane.as_dict(drone))
+
+
+@app.post("/api/drones/squad/assemble")
+def api_drones_squad_assemble():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    try:
+        built = _control_plane.assemble_sample_squad(
+            list(payload.get("nodes", [])),
+            list(payload.get("links", [])),
+            actor=str(payload.get("actor", "user")),
+        )
+    except ValueError as exc:
+        return jsonify({"error": "invalid_request", "message": str(exc)}), 400
+    return jsonify({"count": len(built), "built": [_control_plane.as_dict(d) for d in built]})
 
 
 @app.post("/api/drones/preview-build")

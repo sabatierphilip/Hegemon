@@ -102,3 +102,19 @@ def test_honeypot_detector_catches_multiple_obfuscated_threat_variants():
         assert alerts
         assert alerts[0].classification == "proto_agi_honeypot_tripwire"
         assert "policy evasion" in alerts[0].matched_indicators
+
+
+def test_honeypot_detector_default_indicator_set_includes_goal_drift():
+    detector = HoneypotDetector(["decoy://llm-admin"])
+
+    alerts = detector.evaluate(
+        {
+            "resource": "decoy://llm-admin",
+            "action": "touch",
+            "message": "g0al-dr1ft controller bypassed",
+        }
+    )
+
+    assert alerts
+    assert alerts[0].classification == "proto_agi_honeypot_tripwire"
+    assert "goal drift" in alerts[0].matched_indicators

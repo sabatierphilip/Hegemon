@@ -4,6 +4,7 @@ import json
 import pytest
 
 from sentinel_containment.controlplane import DroneBehaviour, DroneNode, HegemonControlPlane
+from sentinel_containment.drone_compiler import DroneBlobCompiler
 
 
 def _mini_behaviour() -> DroneBehaviour:
@@ -197,3 +198,71 @@ def test_compiled_drone_source_supports_looping_constructs(tmp_path: Path):
     source = cp.decode_drone_source(drone.drone_id)
     assert "if kind in ('repeat', 'loop'):" in source
     assert "if kind in ('loop_until', 'while_condition'):" in source
+
+
+def test_compiler_embedded_intel_uses_python_literals_for_booleans(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("BoolIntel", "controlled", "custom", _mini_behaviour(), actor="tester")
+    key_hex = cp._drone_private_keys[drone.drone_id]
+
+    source = DroneBlobCompiler()._render_script(
+        drone,
+        key_hex,
+        {
+            "vuln_sigs": [{"id": "sig-1", "enabled": True}],
+            "attack_patterns": [{"pattern": "dns tunnel", "active": False}],
+            "port_risk": {"443": {"critical": True}},
+        },
+    )
+
+    assert "EMBEDDED_VULN_SIGS = [{'id': 'sig-1', 'enabled': True}]" in source
+    assert "EMBEDDED_ATTACK_PATTERNS = [{'pattern': 'dns tunnel', 'active': False}]" in source
+    assert "EMBEDDED_PORT_RISK = {'443': {'critical': True}}" in source
+
+
+def test_compiled_ping_host_supports_payload_and_tcp_fallback(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    ping_behaviour = DroneBehaviour(
+        behaviour_id="ping-msg",
+        name="ping-msg",
+        nodes=[
+            DroneNode(node_id="a", node_type="trigger", kind="on_launch", label="On Launch", params={}, position={"x": 0.0, "y": 0.0}, edges_out=["b"], edge_labels={}),
+            DroneNode(node_id="b", node_type="action", kind="ping_host", label="Ping", params={"host": "127.0.0.1", "message": "HEGEMON:TEST_1:RALDORONESQUE", "fallback_port": 443}, position={"x": 1.0, "y": 1.0}, edges_out=["c"], edge_labels={}),
+            DroneNode(node_id="c", node_type="control", kind="self_terminate", label="Stop", params={}, position={"x": 2.0, "y": 2.0}, edges_out=[], edge_labels={}),
+        ],
+        created_at="2026-01-01T00:00:00+00:00",
+        author="tester",
+        description="ping msg",
+        is_brain_preset=False,
+    )
+    drone = cp.assemble_drone("PingMsg", "controlled", "custom", ping_behaviour, actor="tester")
+    source = cp.decode_drone_source(drone.drone_id)
+
+    assert "message = str(params.get('message', '') or '')" in source
+    assert "ping_cmd.extend(['-p', hex_payload])" in source
+    assert "socket.create_connection((host, fallback_port), timeout=2)" in source
+
+
+def test_sample_drone_catalog_and_assemble(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    catalog = cp.drone_sample_catalog()
+    assert any(row["sample_id"] == "gnat-light" for row in catalog)
+
+    drone = cp.assemble_sample_drone("gnat-light", destination="10.10.10.0/24", actor="tester")
+    assert drone.target_network == "10.10.10.0/24"
+    assert drone.behaviour.behaviour_id == "brain-pinger-basic"
+
+
+def test_assemble_sample_squad_routes_are_embedded(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    built = cp.assemble_sample_squad(
+        nodes=[
+            {"id": "n1", "sample_id": "carrier-relay", "destination": "10.0.1.0/24"},
+            {"id": "n2", "sample_id": "gnat-light", "destination": "10.0.2.0/24"},
+        ],
+        links=[{"from_id": "n1", "to_id": "n2"}],
+        actor="tester",
+    )
+    assert len(built) == 2
+    source = next(d for d in built if d.payload.get("squad_node_id") == "n1")
+    assert source.payload.get("route_targets")

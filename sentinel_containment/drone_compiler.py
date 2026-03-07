@@ -44,6 +44,10 @@ class DroneBlobCompiler:
         start_node = next((n.node_id for n in drone.behaviour.nodes if n.kind == "on_launch"), drone.behaviour.nodes[0].node_id if drone.behaviour.nodes else "")
         deadrop = f"/tmp/.hg_drop_{drone.drone_id.replace('drone-', '')}"
         report_endpoint = "http://127.0.0.1:5000/api/drones/report"
+        payload_literal = repr(getattr(drone, 'payload', {}) or {})
+        vuln_sigs_literal = repr(embedded_intel.get('vuln_sigs', []) or [])
+        attack_patterns_literal = repr(embedded_intel.get('attack_patterns', []) or [])
+        port_risk_literal = repr(embedded_intel.get('port_risk', {}) or {})
         script = f'''
 import os, sys, socket, time, json, hashlib, hmac, zlib, base64, threading, subprocess, pathlib, datetime, math, re, struct, shutil, ipaddress
 
@@ -62,11 +66,11 @@ LAUNCH_TIME = 0.0
 SCRIPT_HASH = {hashlib.sha256((drone.drone_id + drone.name).encode()).hexdigest()!r}
 CHILD_DRONE_BLOB = ""
 PAYLOAD_BIN = {str(getattr(drone, 'payload_binary', '') or '')!r}
-PAYLOAD_JSON = {json.dumps(getattr(drone, 'payload', {}), ensure_ascii=False)}
+PAYLOAD_JSON = {payload_literal}
 
-EMBEDDED_VULN_SIGS = {json.dumps(embedded_intel.get('vuln_sigs', []), ensure_ascii=False)}
-EMBEDDED_ATTACK_PATTERNS = {json.dumps(embedded_intel.get('attack_patterns', []), ensure_ascii=False)}
-EMBEDDED_PORT_RISK = {json.dumps(embedded_intel.get('port_risk', {}), ensure_ascii=False)}
+EMBEDDED_VULN_SIGS = {vuln_sigs_literal}
+EMBEDDED_ATTACK_PATTERNS = {attack_patterns_literal}
+EMBEDDED_PORT_RISK = {port_risk_literal}
 
 _state = {{
     "status": "active",
@@ -180,16 +184,32 @@ def _execute(node_id):
         return _next_node(node)
     if kind == 'ping_host':
         host = str(params.get('host', '127.0.0.1'))
+        message = str(params.get('message', '') or '')
+        fallback_port = max(1, min(65535, int(params.get('fallback_port', 443) or 443)))
+        method = 'icmp'
         ok = False
+        ping_cmd = ['ping', '-c', '1', '-W', '2', host]
+        if message:
+            hex_payload = message.encode('utf-8', errors='ignore').hex()[:32]
+            if hex_payload:
+                ping_cmd.extend(['-p', hex_payload])
         try:
-            proc = subprocess.run(['ping','-c','1','-W','2',host], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.run(ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             ok = proc.returncode == 0
         except Exception:
             ok = False
+        if message and not ok:
+            method = f'tcp:{{fallback_port}}'
+            try:
+                with socket.create_connection((host, fallback_port), timeout=2) as sock:
+                    sock.sendall(message.encode('utf-8', errors='ignore'))
+                ok = True
+            except Exception:
+                ok = False
         _state['stats']['hosts_pinged'] += 1
-        if ok:
+        if ok and host not in _state['alive_hosts']:
             _state['alive_hosts'].append(host)
-        _append(f'Ping {{host}} -> {{"ALIVE" if ok else "TIMEOUT"}}')
+        _append(f'Ping {{host}} via {{method}} -> {{"ALIVE" if ok else "TIMEOUT"}}', payload=bool(message))
         return _next_node(node)
     if kind == 'subnet_scan':
         cidr = str(params.get('cidr', '10.0.0.0/24'))
