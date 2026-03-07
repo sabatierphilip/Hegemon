@@ -119,6 +119,20 @@ def test_drone_is_compiled_to_binary_blueprint(tmp_path: Path):
 
 
 
+def test_binary_blueprint_uses_random_headers(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    a = cp.assemble_drone("HdrA", "controlled", "custom", _mini_behaviour(), actor="tester")
+    b = cp.assemble_drone("HdrB", "controlled", "custom", _mini_behaviour(), actor="tester")
+
+    assert a.binary_header and set(a.binary_header).issubset({"0", "1"})
+    assert b.binary_header and set(b.binary_header).issubset({"0", "1"})
+    assert len(a.binary_header) == 16
+    assert len(b.binary_header) == 16
+    assert a.binary_blueprint.startswith(a.binary_header)
+    assert b.binary_blueprint.startswith(b.binary_header)
+    assert a.binary_header != b.binary_header
+
+
 def test_drone_payload_is_compiled_to_binary_and_embedded(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     payload = {"task": "collect", "targets": ["10.0.0.10", "10.0.0.11"], "depth": 2}
@@ -198,9 +212,8 @@ def test_binary_fields_present_for_all_sample_drone_profiles(tmp_path: Path):
 def test_blob_roundtrip_and_source_decode(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     drone = cp.assemble_drone("Blobber", "tethered", "custom", _mini_behaviour(), autonomy_level="contain", actor="tester")
-    assert drone.binary_blob == ""
-    assert drone.blob_path
-    assert Path(drone.blob_path).exists()
+    assert drone.binary_blob
+    assert drone.blob_path == ""
     source = cp.decode_drone_source(drone.drone_id)
     assert "DRONE_ID" in source
     assert drone.drone_id in source
@@ -257,12 +270,54 @@ def test_deadrop_polling_rejects_unencrypted_payload_shape(tmp_path: Path):
 def test_drone_blob_is_stored_as_separate_file(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     drone = cp.assemble_drone("FileBlob", "controlled", "custom", _mini_behaviour(), actor="tester")
-    assert drone.binary_blob == ""
-    assert drone.blob_path
-    blob_file = Path(drone.blob_path)
-    assert blob_file.exists()
-    assert blob_file.read_text(encoding="utf-8").strip()
+    assert drone.binary_blob
+    assert drone.blob_path == ""
 
+
+def test_drone_binary_state_is_fully_projected(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("BinaryAll", "controlled", "custom", _mini_behaviour(), actor="tester")
+    payload = cp.as_dict(drone)
+
+    expected_binary_fields = [
+        "drone_id_binary",
+        "name_binary",
+        "tier_binary",
+        "status_binary",
+        "mission_binary",
+        "target_endpoint_binary",
+        "target_host_binary",
+        "target_network_binary",
+        "autonomy_binary",
+        "keypair_public_binary",
+        "findings_binary",
+        "telemetry_binary",
+        "health_binary",
+        "stats_binary",
+        "error_binary",
+        "actor_binary",
+        "created_at_binary",
+        "launched_at_binary",
+        "last_checkin_at_binary",
+        "return_at_binary",
+        "payload_binary",
+        "behaviour_binary",
+        "runtime_binary",
+        "binary_header",
+        "binary_header_binary",
+        "blob_hash_binary",
+        "blob_path_binary",
+        "pid_binary",
+        "deadrop_path_binary",
+        "child_drone_ids_binary",
+        "supported_binary_actions_binary",
+        "artifact_format_binary",
+        "compiler_ring_binary",
+    ]
+
+    for field in expected_binary_fields:
+        assert isinstance(payload.get(field), str)
+        assert payload.get(field)
 
 def test_compiled_drone_source_supports_looping_constructs(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
@@ -358,7 +413,7 @@ def test_assemble_sample_squad_routes_are_embedded(tmp_path: Path):
 def test_launch_blob_locally_uses_binary_filename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     drone = cp.assemble_drone("LocalBin", "controlled", "custom", _mini_behaviour(), actor="tester")
-    blob_b64 = Path(drone.blob_path).read_text(encoding="utf-8").strip()
+    blob_b64 = drone.binary_blob
     key_hex = cp._drone_private_keys[drone.drone_id]
 
     popen_calls: list[list[str]] = []
@@ -384,7 +439,7 @@ def test_launch_blob_locally_uses_binary_filename(tmp_path: Path, monkeypatch: p
 def test_deploy_blob_remote_uses_binary_filename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     drone = cp.assemble_drone("RemoteBin", "controlled", "custom", _mini_behaviour(), actor="tester")
-    blob_b64 = Path(drone.blob_path).read_text(encoding="utf-8").strip()
+    blob_b64 = drone.binary_blob
     key_hex = cp._drone_private_keys[drone.drone_id]
 
     run_calls: list[list[str]] = []
