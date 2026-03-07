@@ -56,6 +56,8 @@ export function BrainGraphPane({
   const rfInstance = useRef<ReactFlowInstance | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const edgesRef = useRef(edges);
+  const nodesRef = useRef(nodes);
+  const edgesRef2 = useRef(edges);
 
   const graphDimensions = useMemo(() => {
     const minWidth = 700;
@@ -74,6 +76,12 @@ export function BrainGraphPane({
 
   useEffect(() => {
     edgesRef.current = edges;
+  }, [edges]);
+  useEffect(() => {
+    nodesRef.current = nodes;
+  }, [nodes]);
+  useEffect(() => {
+    edgesRef2.current = edges;
   }, [edges]);
 
   const syncUp = useCallback(
@@ -145,29 +153,33 @@ export function BrainGraphPane({
 
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
-      const next = applyNodeChanges(changes, nodes);
-      setNodes(next);
-      syncUp(next, edges);
-      if (selectedNodeId && !next.find((node) => node.id === selectedNodeId)) {
-        onSelectNode(null);
-      }
+      setNodes((currentNodes) => {
+        const next = applyNodeChanges(changes, currentNodes);
+        syncUp(next, edgesRef2.current);
+        if (selectedNodeId && !next.find((node) => node.id === selectedNodeId)) {
+          onSelectNode(null);
+        }
+        return next;
+      });
     },
-    [edges, nodes, onSelectNode, selectedNodeId, setNodes, syncUp]
+    [onSelectNode, selectedNodeId, syncUp]
   );
 
   const handleEdgesChange = useCallback(
     (changes: EdgeChange[]) => {
-      const next = applyEdgeChanges(changes, edges);
-      setEdges(next);
-      syncUp(nodes, next);
+      setEdges((currentEdges) => {
+        const next = applyEdgeChanges(changes, currentEdges);
+        syncUp(nodesRef.current, next);
+        return next;
+      });
     },
-    [edges, nodes, setEdges, syncUp]
+    [syncUp]
   );
 
   return (
     <div className="grid grid-cols-12 gap-2">
       <div className="col-span-3 overflow-auto rounded border border-border p-2">
-        <ActionPalette />
+        <ActionPalette executionRing={state.executionRing} />
       </div>
 
       <div ref={containerRef} className="col-span-6 overflow-auto rounded border border-border bg-slate-950/80">
@@ -192,7 +204,6 @@ export function BrainGraphPane({
             <Background color="#334155" gap={18} />
             <Controls />
             <MiniMap
-              bgColor="#020617"
               nodeColor={(n) =>
                 n.type === 'meta'
                   ? '#eab308'

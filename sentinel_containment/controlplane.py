@@ -8,7 +8,6 @@ import hmac
 import json
 import os
 import secrets
-import shelve
 import socket
 import sre_parse
 import subprocess
@@ -428,6 +427,24 @@ class PatchProposal:
 
 
 class HegemonControlPlane:
+    NODE_AUTONOMY_FLOOR: dict[str, str] = {
+        "isolate_source_ip": "contain",
+        "block_ip": "contain",
+        "kill_process": "contain",
+        "quarantine_file": "contain",
+        "exec_remediation": "enforce",
+        "rotate_credentials": "enforce",
+        "spawn_child_drone": "enforce",
+        "lateral_move": "enforce",
+        "pivot_host": "enforce",
+        "credential_probe": "enforce",
+        "credential_harvest": "enforce",
+        "confront_intruder": "enforce",
+        "countermeasure": "enforce",
+        "self_destruct": "contain",
+    }
+    AUTONOMY_ORDER = {"observe": 0, "contain": 1, "enforce": 2}
+
     DRONE_BINARY_COMMANDS: dict[str, str] = {
         "00000001": "ping",
         "00000010": "scan",
@@ -536,6 +553,24 @@ class HegemonControlPlane:
         self._allow_absolute_program_roots: bool = False
         self.store_client = StoreClient()
         self._self_scan_loop = self.SelfScanLoop(self)
+        self._reconcile_drone_pids()
+
+    def _reconcile_drone_pids(self) -> None:
+        """Rebuild _drone_processes references for autonomous drones that survived a restart."""
+        for drone_id, drone in self.drones.items():
+            if drone.status != "active" or drone.tier != "autonomous":
+                continue
+            pid_path = Path("data") / "drones" / drone_id / "pid"
+            if not pid_path.exists():
+                continue
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8").strip())
+                os.kill(pid, 0)
+                drone.pid = pid
+                self._record("drone.pid_reconciled", {"drone_id": drone_id, "pid": pid})
+            except (ValueError, ProcessLookupError, PermissionError):
+                drone.status = "error"
+                drone.error = "lost after restart"
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         entry = self.ledger.append(event_type, payload)
@@ -3120,29 +3155,40 @@ class HegemonControlPlane:
         self._record("patch.self_autonomous", {"generated": generated, "applied": applied})
         return {"generated": generated, "applied": applied}
 
+    def _intel_db_path(self) -> Path:
+        return Path("data") / "intel_cache.db"
+
     def _intel_cache_get(self, key: str) -> Any | None:
-        cache_path = Path("data/intel_cache.shelve")
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        now = time.time()
+        import sqlite3
+
+        db_path = self._intel_db_path()
+        if not db_path.exists():
+            return None
         with self._state_lock:
             try:
-                with shelve.open(str(cache_path)) as db:
-                    row = db.get(key)
-                    if not row:
-                        return None
-                    if now - float(row.get("ts", 0)) > 86400:
-                        return None
-                    return row.get("value")
+                with sqlite3.connect(str(db_path)) as conn:
+                    row = conn.execute("SELECT value, ts FROM cache WHERE key = ?", (key,)).fetchone()
+                if not row:
+                    return None
+                if time.time() - float(row[1]) > 86400:
+                    return None
+                return json.loads(row[0])
             except Exception:
                 return None
 
     def _intel_cache_set(self, key: str, value: Any) -> None:
-        cache_path = Path("data/intel_cache.shelve")
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        import sqlite3
+
         with self._state_lock:
             try:
-                with shelve.open(str(cache_path)) as db:
-                    db[key] = {"ts": time.time(), "value": value}
+                db_path = self._intel_db_path()
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                with sqlite3.connect(str(db_path)) as conn:
+                    conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, ts REAL)")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO cache (key, value, ts) VALUES (?, ?, ?)",
+                        (key, json.dumps(value, default=str), time.time()),
+                    )
             except Exception:
                 return
 
@@ -3496,7 +3542,8 @@ class HegemonControlPlane:
         payload = json.dumps(meta, separators=(",", ":"), sort_keys=True)
         return header + self._text_to_bits(payload)
 
-    def _compose_behaviour_from_graph(self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]], *, behaviour_id: str, name: str, description: str = "composed graph") -> DroneBehaviour:
+    def _compose_behaviour_from_graph(self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]], *, behaviour_id: str | None = None, name: str = "composed-drone", description: str = "composed graph") -> DroneBehaviour:
+        behaviour_id = behaviour_id or f"brain-{secrets.token_hex(4)}"
         edge_map: dict[str, list[str]] = defaultdict(list)
         edge_labels: dict[str, dict[str, str]] = defaultdict(dict)
         for edge in edges:
@@ -3547,6 +3594,19 @@ class HegemonControlPlane:
             is_brain_preset=False,
         )
 
+    def _validate_brain_nodes(self, nodes: list[DroneNode], autonomy_level: str, tier: str) -> list[str]:
+        """Returns list of violation messages. Empty = valid."""
+        _ = tier
+        violations = []
+        for node in nodes:
+            floor = self.NODE_AUTONOMY_FLOOR.get(node.kind)
+            if floor and self.AUTONOMY_ORDER.get(autonomy_level, 0) < self.AUTONOMY_ORDER[floor]:
+                violations.append(
+                    f"Node '{node.kind}' requires autonomy_level >= '{floor}', "
+                    f"drone has '{autonomy_level}'"
+                )
+        return violations
+
     def _resolve_behaviour(self, behaviour: DroneBehaviour | str) -> DroneBehaviour:
         if isinstance(behaviour, str):
             if behaviour not in self.drone_brains:
@@ -3566,6 +3626,9 @@ class HegemonControlPlane:
         if target_host and target_host not in self._registered_hosts() and autonomy_level != "observe":
             raise ValueError("unregistered external host requires observe autonomy")
         behaviour_obj = self._resolve_behaviour(behaviour)
+        violations = self._validate_brain_nodes(behaviour_obj.nodes, autonomy_level, tier)
+        if violations:
+            raise ValueError(f"Brain validation failed: {'; '.join(violations)}")
         drone_id = f"drone-{uuid4().hex[:8]}"
         keypair = signing.SigningKey.generate()
         private_key_hex = keypair.encode().hex()
@@ -3875,6 +3938,8 @@ class HegemonControlPlane:
         )
         self._drone_processes[drone_id] = proc
         drone.pid = proc.pid
+        pid_path = workdir / "pid"
+        pid_path.write_text(str(proc.pid), encoding="utf-8")
         drone.status = "active"
         drone.launched_at = datetime.now(timezone.utc).isoformat()
         if drone.ttl_seconds > 0 and drone.tier == "autonomous":

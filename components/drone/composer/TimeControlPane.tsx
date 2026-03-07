@@ -88,23 +88,25 @@ export function TimeControlPane({ state, setState }: { state: ComposerState; set
         </div>
         <div className="flex flex-wrap gap-1">
           {TIMER_NODES.map((t) => (
-            <div key={t.label} className="flex items-center gap-1 rounded border border-info/40 px-1 py-1 text-xs text-info hover:bg-info/10">
-              <div
-                draggable
-                onDragStart={(e) => {
-                  e.dataTransfer.setData('application/hegemon-node', JSON.stringify({ kind: t.kind, nodeType: 'timer', defaultParams: t.params }));
-                }}
-                className="cursor-grab"
-              >
-                <Clock size={8} className="mr-1 inline" />
-                {t.label}
+            <div key={t.label} className="relative rounded border border-info/40 px-1 py-1 text-xs text-info hover:bg-info/10">
+              <div className="flex items-center gap-1">
+                <div
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData('application/hegemon-node', JSON.stringify({ kind: t.kind, nodeType: 'timer', defaultParams: t.params }));
+                  }}
+                  className="cursor-grab"
+                >
+                  <Clock size={8} className="mr-1 inline" />
+                  {t.label}
+                </div>
+                <button type="button" className="rounded bg-info/10 px-1 py-0.5" onClick={() => setOpenInfo((v) => (v === t.label ? null : t.label))} title="Info">
+                  <Info size={10} />
+                </button>
               </div>
-              <button type="button" className="rounded bg-info/10 px-1 py-0.5" onClick={() => setOpenInfo((v) => (v === t.label ? null : t.label))} title="Info">
-                <Info size={10} />
-              </button>
               {openInfo === t.label && (
-                <div className="max-w-44 text-[10px] text-textSecondary">
-                  Input: {t.inputType}<br />Output: {t.outputType}
+                <div className="absolute left-0 top-6 z-50 w-56 rounded border border-border bg-card p-2 shadow-lg text-[10px] text-textSecondary">
+                  In: <span className="text-text">{t.inputType}</span><br />Out: <span className="text-text">{t.outputType}</span>
                 </div>
               )}
             </div>

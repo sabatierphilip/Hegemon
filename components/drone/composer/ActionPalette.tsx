@@ -30,6 +30,8 @@ const BRAIN_NODES: Record<string, PaletteNode[]> = {
     { kind: 'tls_check', params: { host: '', port: 443 }, inputType: 'host:string', outputType: 'tls_valid:boolean' },
     { kind: 'dns_resolve', params: { hostname: '', record_type: 'A' }, inputType: 'hostname:string', outputType: 'records:string[]' },
     { kind: 'icmp_sweep', params: { cidr: '' }, inputType: 'cidr:string', outputType: 'responders:string[]' },
+    { kind: 'lateral_move', params: { host: '', port: 445, method: 'smb_pivot' }, description: 'TCP probe lateral movement to target host. Records reachable hosts.', inputType: 'host:string', outputType: 'moved:boolean' },
+    { kind: 'credential_probe', params: { host: 'local', scope: 'env' }, description: 'Sweeps env vars and credential files for secrets.', inputType: 'scope:string', outputType: 'findings:object[]' },
   ],
   Detect: [
     { kind: 'deploy_honeypot', params: { port: 2222, service: 'ssh' }, inputType: 'port:number', outputType: 'trap_events:object[]' },
@@ -54,6 +56,7 @@ const BRAIN_NODES: Record<string, PaletteNode[]> = {
     { kind: 'rotate_credentials', params: { service: '' }, inputType: 'service:string', outputType: 'rotation_status:boolean' },
     { kind: 'emit_alert', params: { level: 'critical', message: '' }, inputType: 'finding:object', outputType: 'alert_id:string' },
     { kind: 'exec_remediation', params: { script: '', timeout: 30 }, inputType: 'script:string', outputType: 'exit_code:number' },
+    { kind: 'confront_intruder', params: { strategy: 'bidirectional_block' }, description: 'Engages active countermeasure against detected intrusion.', inputType: 'target:string', outputType: 'action_result:boolean' },
   ],
   Control: [
     { kind: 'wait', params: { seconds: 60 }, inputType: 'control_signal', outputType: 'control_signal' },
@@ -68,6 +71,17 @@ const BRAIN_NODES: Record<string, PaletteNode[]> = {
     { kind: 'rate_limit', params: { max_per_minute: 10 }, inputType: 'event_rate:number', outputType: 'throttle:boolean' },
   ],
 };
+
+const RING2_NODES: PaletteNode[] = [
+  { kind: 'manage_service', params: { service_name: '', action: 'status' }, description: 'Start/stop/create/delete system service.', inputType: 'service_name:string', outputType: 'result:boolean' },
+  { kind: 'manage_systemd_unit', params: { unit: '', action: 'status' }, description: 'Manage systemd units (Linux).', inputType: 'unit:string', outputType: 'active:boolean' },
+  { kind: 'ptrace_inspect', params: { pid: 0 }, description: 'Attach ptrace to process, dump memory maps.', inputType: 'pid:number', outputType: 'maps:string' },
+  { kind: 'inotify_watch', params: { path: '/etc', flags: 'CLOSE_WRITE' }, description: 'Kernel-level file watch via inotify.', inputType: 'path:string', outputType: 'events:object[]' },
+  { kind: 'read_proc_mem', params: { pid: 0 }, description: 'Read /proc/{pid}/mem directly.', inputType: 'pid:number', outputType: 'data:bytes' },
+  { kind: 'inspect_namespaces', params: {}, description: 'Enumerate process namespace memberships.', inputType: 'none', outputType: 'namespaces:object[]' },
+  { kind: 'snapshot_vss', params: { volume: 'C:\\' }, description: 'VSS snapshot for forensic capture (Windows).', inputType: 'volume:string', outputType: 'snapshot_path:string' },
+  { kind: 'load_driver', params: { driver_path: '', driver_name: '' }, description: 'Load kernel driver via insmod/sc.', inputType: 'driver_path:string', outputType: 'loaded:boolean' },
+];
 
 const TIMER_NODES: PaletteNode[] = [
   { kind: 'wait', params: { seconds: 30 }, label: 'Wait 30s', description: 'Fixed wait interval.', inputType: 'control_signal', outputType: 'delayed_control_signal' },
@@ -117,33 +131,35 @@ function DraggableNode({
   const [showInfo, setShowInfo] = useState(false);
 
   return (
-    <div className={`flex items-center gap-1 rounded ${className}`}>
-      <div
-        draggable
-        onDragStart={(e) => {
-          e.dataTransfer.setData('application/hegemon-node', JSON.stringify({ kind, nodeType, defaultParams }));
-          e.dataTransfer.effectAllowed = 'move';
-        }}
-        className="cursor-grab px-2 py-1 font-mono text-xs active:cursor-grabbing"
-      >
-        {label ?? kind}
+    <div className={`relative rounded ${className}`}>
+      <div className="flex items-center gap-1">
+        <div
+          draggable
+          onDragStart={(e) => {
+            e.dataTransfer.setData('application/hegemon-node', JSON.stringify({ kind, nodeType, defaultParams }));
+            e.dataTransfer.effectAllowed = 'move';
+          }}
+          className="cursor-grab px-2 py-1 font-mono text-xs active:cursor-grabbing"
+        >
+          {label ?? kind}
+        </div>
+        <button type="button" onClick={() => setShowInfo((s) => !s)} className="rounded bg-border px-1 py-0.5 text-[10px]" title="Info">
+          <Info size={12} />
+        </button>
       </div>
-      <button type="button" onClick={() => setShowInfo((s) => !s)} className="rounded bg-border px-1 py-0.5 text-[10px]" title="Info">
-        <Info size={12} />
-      </button>
       {showInfo && (
-        <div className="ml-1 max-w-56 space-y-0.5 text-[10px] text-textSecondary">
+        <div className="absolute left-0 top-6 z-50 w-56 rounded border border-border bg-card p-2 shadow-lg space-y-0.5 text-[10px] text-textSecondary">
           <div>{description ?? `${kind} node used in graph orchestration and can accept multiple incoming links.`}</div>
-          <div>Input: {inputType ?? 'n/a'}</div>
-          <div>Output: {outputType ?? 'n/a'}</div>
-          {!inputType && !outputType && <div>Action: {action ?? 'graph_action'}</div>}
+          <div>In: <span className="text-text">{inputType ?? 'n/a'}</span></div>
+          <div>Out: <span className="text-text">{outputType ?? 'n/a'}</span></div>
+          {action && <div>Action: <span className="text-text">{action}</span></div>}
         </div>
       )}
     </div>
   );
 }
 
-export function ActionPalette() {
+export function ActionPalette({ executionRing = 3 }: { executionRing?: 1 | 2 | 3 }) {
   return (
     <div className="space-y-3 text-xs">
       <div>
@@ -161,6 +177,17 @@ export function ActionPalette() {
           ))}
         </div>
       </div>
+
+      {executionRing <= 2 && (
+        <div>
+          <div className="mb-1 flex items-center gap-2 font-medium text-amber-300">Ring 2 Nodes <span className="rounded border border-amber-500/50 px-1 py-0.5 text-[10px] text-amber-200">Requires elevated privileges</span></div>
+          <div className="flex flex-wrap gap-1">
+            {RING2_NODES.map((node) => (
+              <DraggableNode key={node.kind} kind={node.kind} defaultParams={node.params} nodeType="brain" description={node.description} inputType={node.inputType} outputType={node.outputType} className="border border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20" />
+            ))}
+          </div>
+        </div>
+      )}
 
       <div>
         <div className="mb-1 flex items-center gap-1 font-medium text-text">

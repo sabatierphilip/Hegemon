@@ -24,11 +24,15 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
   const [previewOpen, setPreviewOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [brainsOpen, setBrainsOpen] = useState(false);
+  const [savedBrains, setSavedBrains] = useState<{ name: string; nodes: any[]; edges: any[] }[]>([]);
+  const [selectedChildNodeId, setSelectedChildNodeId] = useState<string | null>(null);
 
   const [state, setState] = useState<ComposerState>({
     droneName: 'new-drone',
     tier: 'controlled',
     autonomy: 'observe',
+    executionRing: 3,
     ttlSeconds: 3600,
     checkinSeconds: 30,
     nodes: [
@@ -46,6 +50,14 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
     meta: metaBehaviourDefaults,
   });
 
+  const [childGraphState, setChildGraphState] = useState<ComposerState>({
+    ...state,
+    droneName: 'child-drone',
+    executionRing: 3,
+    nodes: [{ id: 'on_launch', position: { x: 100, y: 100 }, sourcePosition: Position.Bottom, targetPosition: Position.Top, data: { label: 'on_launch', kind: 'on_launch', params: {} }, type: 'brain' }],
+    edges: [],
+  });
+
   const buildPayload = (composer: ComposerState) => ({
     name: composer.droneName,
     tier: composer.tier,
@@ -61,14 +73,19 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
     payload: composer.payload,
     meta: composer.meta,
     artifact_format: 'binary_blob',
-    runtime: {
+      runtime: {
+      execution: { ring_level: composer.executionRing ?? 3 },
       telemetry: {
         kernel_feed: {
-          provider: 'ebpf',
+          provider: (composer.executionRing ?? 3) <= 1 ? 'ebpf' : 'userland',
           auto_setup: true,
-          mode: 'advanced',
+          mode: (composer.executionRing ?? 3) <= 1 ? 'advanced' : 'standard',
           fallback: 'kernel_webhook',
         },
+      },
+      child_graph: {
+        nodes: composer.childGraph?.nodes ?? childGraphState.nodes,
+        edges: composer.childGraph?.edges ?? childGraphState.edges,
       },
     },
   });
@@ -100,6 +117,21 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Save brain failed');
     }
+  };
+
+  const handleLoadBrains = async () => {
+    try {
+      const data = await apiRequest<{ brains: typeof savedBrains }>('/api/drones/brains', token);
+      setSavedBrains(data.brains ?? []);
+      setBrainsOpen(true);
+    } catch {
+      setError('Failed to load saved brains');
+    }
+  };
+
+  const handleSelectBrain = (brain: (typeof savedBrains)[number]) => {
+    setState((s) => ({ ...s, nodes: brain.nodes, edges: brain.edges, droneName: brain.name }));
+    setBrainsOpen(false);
   };
 
   const handleAssemble = async () => {
@@ -143,6 +175,23 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
     { id: 'payload', title: 'Pane 4 — Payload', content: <PayloadPane state={state} setState={setState} /> },
     { id: 'meta', title: 'Pane 5 — Meta-Behaviour', content: <MetaBehaviourPane /> },
     { id: 'logic', title: 'Pane 6 — Logical Operators', content: <LogicalOperatorsPane /> },
+    {
+      id: 'child',
+      title: 'Pane 7 — Child Drone Graph',
+      content: (
+        <div className="space-y-2">
+          <div className="text-xs text-textSecondary">
+            Define the brain graph for drones spawned by <code>spawn_child_drone</code>. Only used when tier=autonomous and autonomy=enforce. Child inherits parent TTL and checkin interval.
+          </div>
+          <BrainGraphPane
+            state={childGraphState}
+            setState={setChildGraphState}
+            selectedNodeId={selectedChildNodeId}
+            onSelectNode={setSelectedChildNodeId}
+          />
+        </div>
+      ),
+    },
   ];
 
   const toggle = (id: string) => {
@@ -159,6 +208,9 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
         </Button>
         <Button size="sm" variant="outline" onClick={handleSaveBrain}>
           Save Brain
+        </Button>
+        <Button size="sm" variant="outline" onClick={handleLoadBrains}>
+          Load Brain
         </Button>
         <Button size="sm" onClick={handleAssemble}>
           Assemble Drone
@@ -194,6 +246,25 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
               </Button>
             </div>
             <pre className="h-96 overflow-auto font-mono text-xs">{previewSource}</pre>
+          </Card>
+        </div>
+      )}
+
+      {brainsOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <Card className="w-full max-w-xl space-y-2 p-3">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm">Load Saved Brain</h4>
+              <Button size="sm" variant="outline" onClick={() => setBrainsOpen(false)}>Close</Button>
+            </div>
+            <div className="space-y-2">
+              {savedBrains.map((brain) => (
+                <div key={brain.name} className="flex items-center justify-between rounded border border-border p-2 text-xs">
+                  <div>{brain.name}</div>
+                  <Button size="sm" onClick={() => handleSelectBrain(brain)}>Load</Button>
+                </div>
+              ))}
+            </div>
           </Card>
         </div>
       )}

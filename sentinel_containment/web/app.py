@@ -2320,6 +2320,73 @@ def api_drones_assemble():
 
 
 
+
+@app.post("/api/drones/<drone_id>/approve-ring1")
+def api_drones_approve_ring1(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    approver = str(payload.get("approver", "")).strip()
+    if not approver:
+        return jsonify({"error": "approver required"}), 400
+    drone = _control_plane.drones.get(drone_id)
+    if not drone:
+        return jsonify({"error": "drone not found"}), 404
+    if getattr(drone, "compiler_ring", 3) != 1:
+        return jsonify({"error": "not a ring 1 drone"}), 400
+    _control_plane._record("drone.enforce_approved", {
+        "drone_id": drone_id, "approver": approver, "ring": 1
+    })
+    return jsonify({"approved": True, "drone_id": drone_id})
+
+
+@app.get("/api/drones/ring-capabilities")
+def api_drones_ring_capabilities():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify({
+        "node_autonomy_floor": HegemonControlPlane.NODE_AUTONOMY_FLOOR,
+        "autonomy_order": HegemonControlPlane.AUTONOMY_ORDER,
+    })
+
+
+@app.post("/api/drones/<drone_id>/child-graph")
+def api_drones_set_child_graph(drone_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    drone = _control_plane.drones.get(drone_id)
+    if not drone:
+        return jsonify({"error": "drone not found"}), 404
+    if drone.status != "ready":
+        return jsonify({"error": "drone must be in ready status"}), 400
+    nodes = list(payload.get("nodes", []))
+    edges = list(payload.get("edges", []))
+    child_behaviour = _control_plane._compose_behaviour_from_graph(
+        nodes, edges,
+        behaviour_id=f"{drone_id}-child",
+        name=f"{drone.name}-child",
+    )
+    key_hex = _control_plane._drone_private_keys.get(drone_id, "")
+    import copy
+    child_drone = copy.deepcopy(drone)
+    child_drone.behaviour = child_behaviour
+    child_source = _control_plane._drone_compiler._render_script(
+        child_drone, key_hex, {"vuln_sigs": [], "attack_patterns": [], "port_risk": {}}
+    )
+    import zlib, base64
+    drone.runtime["child_drone_blob"] = base64.b64encode(
+        zlib.compress(child_source.encode("utf-8"), level=9)
+    ).decode("ascii")
+    return jsonify({"ok": True, "child_nodes": len(nodes)})
+
 @app.get("/api/drones/<drone_id>/blob")
 def api_drones_blob(drone_id: str):
     unauthorized = _require_auth()
@@ -2596,7 +2663,7 @@ def api_drones_brains():
     unauthorized = _require_auth()
     if unauthorized:
         return unauthorized
-    return jsonify([_control_plane.as_dict(b) for b in _control_plane.drone_brains.values()])
+    return jsonify({"brains": [_control_plane.as_dict(b) for b in _control_plane.drone_brains.values()]})
 
 
 @app.post("/api/drones/brains")
