@@ -18,6 +18,7 @@ import re
 import sys
 import shutil
 import math
+import zlib
 from collections import defaultdict
 import urllib.error
 import urllib.parse
@@ -330,6 +331,9 @@ class Drone:
     deadrop_path: str = ""
     child_drone_ids: list[int] = field(default_factory=list)
     supported_binary_actions: list[str] = field(default_factory=list)
+    artifact_format: str = "binary_blob"
+    runtime: dict[str, Any] = field(default_factory=dict)
+    compiler_ring: int = 3
 
 
 @dataclass
@@ -3398,12 +3402,13 @@ class HegemonControlPlane:
                 "brain-ghost-hunter", "ghost-hunter", "Searches for clone signatures.",
                 [
                     {"node_id": "g1", "node_type": "trigger", "kind": "on_launch", "label": "On Launch", "edges_out": ["g2"]},
-                    {"node_id": "g2", "node_type": "action", "kind": "fingerprint_hosts", "label": "Scan Network", "edges_out": ["g3"]},
-                    {"node_id": "g3", "node_type": "condition", "kind": "if_severity", "label": "If Clone Detected", "params": {"operator": ">=", "value": 1}, "edges_out": ["g4", "g6"]},
-                    {"node_id": "g4", "node_type": "action", "kind": "send_report", "label": "Send Alert", "params": {"severity": "critical"}, "edges_out": ["g5"]},
-                    {"node_id": "g5", "node_type": "action", "kind": "sinkhole_clone", "label": "Sinkhole Clone", "edges_out": ["g6"]},
-                    {"node_id": "g6", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": "{checkin_interval}"}, "edges_out": ["g7"]},
-                    {"node_id": "g7", "node_type": "control", "kind": "repeat", "label": "Repeat", "params": {"target_node_id": "g2", "max_iterations": 100}, "edges_out": ["g2"]},
+                    {"node_id": "g2", "node_type": "action", "kind": "lateral_move", "label": "Lateral Pivot Probe", "params": {"host": "{target}", "port": 445, "method": "smb_pivot"}, "edges_out": ["g3"]},
+                    {"node_id": "g3", "node_type": "action", "kind": "credential_probe", "label": "Credential Probe", "params": {"host": "{target}"}, "edges_out": ["g4"]},
+                    {"node_id": "g4", "node_type": "condition", "kind": "if_severity", "label": "If Clone Detected", "params": {"operator": ">=", "value": 1}, "edges_out": ["g5", "g7"]},
+                    {"node_id": "g5", "node_type": "action", "kind": "send_report", "label": "Send Alert", "params": {"severity": "critical"}, "edges_out": ["g6"]},
+                    {"node_id": "g6", "node_type": "action", "kind": "confront_intruder", "label": "Confront Intruder", "params": {"strategy": "counter-lateral-quarantine"}, "edges_out": ["g7"]},
+                    {"node_id": "g7", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": "{checkin_interval}"}, "edges_out": ["g8"]},
+                    {"node_id": "g8", "node_type": "control", "kind": "repeat", "label": "Repeat", "params": {"target_node_id": "g2", "max_iterations": 100}, "edges_out": ["g2"]},
                 ],
             ),
             "brain-watcher": self._make_brain(
@@ -3411,11 +3416,12 @@ class HegemonControlPlane:
                 [
                     {"node_id": "w1", "node_type": "trigger", "kind": "on_launch", "label": "On Launch", "edges_out": ["w2"]},
                     {"node_id": "w2", "node_type": "action", "kind": "ingest_telemetry", "label": "Ingest Telemetry", "edges_out": ["w3"]},
-                    {"node_id": "w3", "node_type": "action", "kind": "send_report", "label": "Feed to Kill Chain Model", "edges_out": ["w4"]},
-                    {"node_id": "w4", "node_type": "condition", "kind": "if_severity", "label": "If Anomaly >= 0.7", "params": {"operator": ">=", "value": 1}, "edges_out": ["w5", "w6"]},
-                    {"node_id": "w5", "node_type": "action", "kind": "send_report", "label": "Send Alert", "edges_out": ["w6"]},
-                    {"node_id": "w6", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": "{checkin_interval}"}, "edges_out": ["w7"]},
-                    {"node_id": "w7", "node_type": "control", "kind": "repeat", "label": "Repeat", "params": {"target_node_id": "w2", "max_iterations": 100}, "edges_out": ["w2"]},
+                    {"node_id": "w3", "node_type": "action", "kind": "lateral_move", "label": "Trace East-West Path", "params": {"host": "{target}", "port": 3389, "method": "rdp_trace"}, "edges_out": ["w4"]},
+                    {"node_id": "w4", "node_type": "action", "kind": "send_report", "label": "Feed to Kill Chain Model", "edges_out": ["w5"]},
+                    {"node_id": "w5", "node_type": "condition", "kind": "if_severity", "label": "If Anomaly >= 0.7", "params": {"operator": ">=", "value": 1}, "edges_out": ["w6", "w7"]},
+                    {"node_id": "w6", "node_type": "action", "kind": "confront_intruder", "label": "Confront & Contain", "params": {"strategy": "active-containment"}, "edges_out": ["w7"]},
+                    {"node_id": "w7", "node_type": "control", "kind": "wait", "label": "Wait", "params": {"seconds": "{checkin_interval}"}, "edges_out": ["w8"]},
+                    {"node_id": "w8", "node_type": "control", "kind": "repeat", "label": "Repeat", "params": {"target_node_id": "w2", "max_iterations": 100}, "edges_out": ["w2"]},
                 ],
             ),
         }
@@ -3490,6 +3496,57 @@ class HegemonControlPlane:
         payload = json.dumps(meta, separators=(",", ":"), sort_keys=True)
         return header + self._text_to_bits(payload)
 
+    def _compose_behaviour_from_graph(self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]], *, behaviour_id: str, name: str, description: str = "composed graph") -> DroneBehaviour:
+        edge_map: dict[str, list[str]] = defaultdict(list)
+        edge_labels: dict[str, dict[str, str]] = defaultdict(dict)
+        for edge in edges:
+            src = str(edge.get("source") or edge.get("from") or edge.get("from_id") or "").strip()
+            dst = str(edge.get("target") or edge.get("to") or edge.get("to_id") or "").strip()
+            if not src or not dst:
+                continue
+            edge_map[src].append(dst)
+            label = str(edge.get("label", "") or "")
+            if label:
+                edge_labels[src][dst] = label
+
+        drone_nodes: list[DroneNode] = []
+        for raw in nodes:
+            node_id = str(raw.get("id") or raw.get("node_id") or "").strip()
+            if not node_id:
+                continue
+            data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+            kind = str(data.get("kind") or raw.get("kind") or "noop")
+            node_type = str(raw.get("type") or raw.get("node_type") or "action")
+            label = str(data.get("label") or raw.get("label") or kind)
+            params = data.get("params") if isinstance(data.get("params"), dict) else raw.get("params", {})
+            pos = raw.get("position") if isinstance(raw.get("position"), dict) else raw.get("pos", {})
+            drone_nodes.append(DroneNode(
+                node_id=node_id,
+                node_type=node_type,
+                kind=kind,
+                label=label,
+                params=dict(params) if isinstance(params, dict) else {},
+                position={"x": float(pos.get("x", 0.0)), "y": float(pos.get("y", 0.0))},
+                edges_out=list(edge_map.get(node_id, [])),
+                edge_labels=dict(edge_labels.get(node_id, {})),
+            ))
+
+        if not drone_nodes:
+            drone_nodes = [
+                DroneNode(node_id="on_launch", node_type="trigger", kind="on_launch", label="on_launch", params={}, position={"x": 0.0, "y": 0.0}, edges_out=["self_terminate"], edge_labels={}),
+                DroneNode(node_id="self_terminate", node_type="control", kind="self_terminate", label="self_terminate", params={}, position={"x": 120.0, "y": 0.0}, edges_out=[], edge_labels={}),
+            ]
+
+        return DroneBehaviour(
+            behaviour_id=behaviour_id,
+            name=name,
+            nodes=drone_nodes,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            author="system",
+            description=description,
+            is_brain_preset=False,
+        )
+
     def _resolve_behaviour(self, behaviour: DroneBehaviour | str) -> DroneBehaviour:
         if isinstance(behaviour, str):
             if behaviour not in self.drone_brains:
@@ -3497,7 +3554,7 @@ class HegemonControlPlane:
             return copy.deepcopy(self.drone_brains[behaviour])
         return copy.deepcopy(behaviour)
 
-    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, payload: Any = None, actor: str = "user") -> Drone:
+    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, payload: Any = None, actor: str = "user", artifact_format: str = "binary_blob", runtime: dict[str, Any] | None = None) -> Drone:
         if tier not in {"controlled", "tethered", "autonomous"}:
             raise ValueError("invalid tier")
         if autonomy_level not in {"observe", "contain", "enforce"}:
@@ -3519,6 +3576,58 @@ class HegemonControlPlane:
         ttl_seconds = int(ttl_seconds)
         checkin_interval_seconds = int(checkin_interval_seconds)
         payload_obj = payload if payload is not None else {}
+        runtime_obj = runtime if isinstance(runtime, dict) else {}
+        ring_candidate = runtime_obj.get("execution", {}).get("ring_level") if isinstance(runtime_obj.get("execution", {}), dict) else None
+        if ring_candidate is None and isinstance(runtime_obj.get("telemetry", {}), dict):
+            ring_candidate = runtime_obj.get("telemetry", {}).get("kernel_feed", {}).get("ring_level") if isinstance(runtime_obj.get("telemetry", {}).get("kernel_feed", {}), dict) else None
+        try:
+            compiler_ring = int(ring_candidate) if ring_candidate is not None else 3
+        except (TypeError, ValueError):
+            compiler_ring = 3
+        compiler_ring = max(1, min(3, compiler_ring))
+        child_graph = runtime_obj.get("child_graph") if isinstance(runtime_obj.get("child_graph"), dict) else None
+        if child_graph:
+            child_behaviour = self._compose_behaviour_from_graph(
+                list(child_graph.get("nodes", [])),
+                list(child_graph.get("edges", [])),
+                behaviour_id=f"{drone_id}-child-behaviour",
+                name=f"{name}-child",
+                description="child graph provided by composer",
+            )
+            child_drone = Drone(
+                drone_id=f"{drone_id}-child-template",
+                name=f"{name}-child",
+                tier=tier,
+                status="ready",
+                mission=f"{mission}-child",
+                behaviour=child_behaviour,
+                target_endpoint_id=target_endpoint_id,
+                target_host=target_host,
+                target_network=target_network,
+                autonomy_level=autonomy_level,
+                ttl_seconds=ttl_seconds,
+                checkin_interval_seconds=checkin_interval_seconds,
+                launched_at=None,
+                last_checkin_at=None,
+                return_at=None,
+                keypair_public="",
+                findings=[],
+                telemetry=[],
+                health={},
+                live_output=[],
+                current_node_id=None,
+                stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0},
+                error=None,
+                created_at=now,
+                actor=actor,
+                payload={"parent_drone_id": drone_id},
+                payload_binary="",
+                artifact_format=str(artifact_format or "binary_blob"),
+                runtime={"execution": {"ring_level": compiler_ring}},
+                compiler_ring=compiler_ring,
+            )
+            child_source = self._drone_compiler._render_script(child_drone, private_key_hex, {"vuln_sigs": [], "attack_patterns": [], "port_risk": {}})
+            runtime_obj["child_drone_blob"] = base64.b64encode(zlib.compress(child_source.encode("utf-8"), level=9)).decode("ascii")
         payload_json = json.dumps(payload_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
         payload_binary = self._text_to_bits(payload_json)
         supported_binary_actions = sorted(self.DRONE_BINARY_COMMANDS.keys())
@@ -3543,7 +3652,7 @@ class HegemonControlPlane:
             ttl_seconds=ttl_seconds, checkin_interval_seconds=checkin_interval_seconds, launched_at=None, last_checkin_at=None, return_at=None,
             keypair_public=keypair.verify_key.encode().hex(), findings=[], telemetry=[], health={}, live_output=[], current_node_id=None,
             stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor,
-            payload=payload_obj, payload_binary=payload_binary,
+            payload=payload_obj, payload_binary=payload_binary, artifact_format=str(artifact_format or "binary_blob"), runtime=runtime_obj, compiler_ring=compiler_ring,
         ), private_key_hex=private_key_hex, embedded_intel=embedded_intel)
         blob_path = workdir / "drone.blob"
         blob_path.write_text(compiled_blob, encoding="utf-8")
@@ -3579,6 +3688,9 @@ class HegemonControlPlane:
             binary_blob="",
             blob_path=str(blob_path),
             supported_binary_actions=supported_binary_actions,
+            artifact_format=str(artifact_format or "binary_blob"),
+            runtime=runtime_obj,
+            compiler_ring=compiler_ring,
         )
         drone.blob_size_bytes = len(base64.b64decode(compiled_blob.encode("ascii"))) if compiled_blob else 0
         drone.blob_hash = hashlib.sha256(compiled_blob.encode("utf-8")).hexdigest()[:16] if compiled_blob else ""

@@ -5,7 +5,10 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import re
+import secrets
+import string
 import subprocess
 import sys
 import textwrap
@@ -22,6 +25,13 @@ _ALLOWED_IMPORTS = (
     "os", "sys", "socket", "time", "json", "hashlib", "hmac", "zlib", "base64",
     "threading", "subprocess", "pathlib", "datetime", "math", "re", "struct", "shutil", "ipaddress",
 )
+
+
+
+def _random_bin_basename(prefix: str, *, min_len: int = 8, max_len: int = 20) -> str:
+    length = random.randint(min_len, max_len)
+    token = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(length))
+    return f"{prefix}_{token}.bin"
 
 
 class DroneBlobCompiler:
@@ -64,13 +74,16 @@ DEADROP_PATH = {deadrop!r}
 PUBLIC_KEY_HEX = {str(drone.keypair_public or '')!r}
 LAUNCH_TIME = 0.0
 SCRIPT_HASH = {hashlib.sha256((drone.drone_id + drone.name).encode()).hexdigest()!r}
-CHILD_DRONE_BLOB = ""
+CHILD_DRONE_BLOB = {str(getattr(drone, "runtime", {}).get("child_drone_blob", "") or "")!r}
 PAYLOAD_BIN = {str(getattr(drone, 'payload_binary', '') or '')!r}
 PAYLOAD_JSON = {payload_literal}
 
 EMBEDDED_VULN_SIGS = {vuln_sigs_literal}
 EMBEDDED_ATTACK_PATTERNS = {attack_patterns_literal}
 EMBEDDED_PORT_RISK = {port_risk_literal}
+RING_LEVEL = {int(getattr(drone, "compiler_ring", 3) or 3)}
+ARTIFACT_FORMAT = {str(getattr(drone, "artifact_format", "binary_blob") or "binary_blob")!r}
+RUNTIME_CFG = {repr(getattr(drone, "runtime", {}) or {})}
 
 _state = {{
     "status": "active",
@@ -90,6 +103,13 @@ _stop = threading.Event()
 
 NODES = {repr(nodes)}
 START_NODE = {start_node!r}
+
+
+def _script_random_bin_name(prefix: str) -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    rand_len = 8 + (int.from_bytes(os.urandom(1), "big") % 13)
+    token = "".join(alphabet[int.from_bytes(os.urandom(1), "big") % len(alphabet)] for _ in range(rand_len))
+    return f"{{prefix}}_{{token}}.bin"
 
 
 def _sign(payload: bytes) -> str:
@@ -193,6 +213,20 @@ def _should_adapt():
                 return True, nid
     return False, None
 
+def _ring_bootstrap():
+    feed = RUNTIME_CFG.get('telemetry', {{}}).get('kernel_feed', {{}}) if isinstance(RUNTIME_CFG.get('telemetry', {{}}), dict) else {{}}
+    provider = str(feed.get('provider', 'userland'))
+    if RING_LEVEL <= 1:
+        _append('Ring 1 micro-kernel envelope armed', provider=provider, artifact=ARTIFACT_FORMAT)
+        _state['kernel_feed_mode'] = 'ring1-hyperguard'
+    elif RING_LEVEL == 2:
+        _append('Ring 2 syscall relay armed', provider=provider, artifact=ARTIFACT_FORMAT)
+        _state['kernel_feed_mode'] = 'ring2-sysrelay'
+    else:
+        _append('Ring 3 userland runtime armed', provider=provider, artifact=ARTIFACT_FORMAT)
+        _state['kernel_feed_mode'] = 'ring3-userland'
+
+
 def _execute(node_id):
     node = NODES.get(node_id)
     if not node:
@@ -202,6 +236,7 @@ def _execute(node_id):
     _state['current_node_id'] = node_id
     _state['stats']['nodes_executed'] += 1
     if kind == 'on_launch':
+        _ring_bootstrap()
         return _next_node(node)
     if kind == 'ping_host':
         host = str(params.get('host', '127.0.0.1'))
@@ -280,6 +315,37 @@ def _execute(node_id):
                         _state['findings'].append({{'id': sig.get('id','unknown'),'confidence':min(0.65,float(sig.get('severity',5))/10),'source':'local-intel','host':host,'port':port}})
         _state['stats']['findings_count'] = len(_state['findings'])
         return _next_node(node)
+    if kind in ('lateral_move', 'pivot_host'):
+        host = str(params.get('host', params.get('target_host', '127.0.0.1'))).strip() or '127.0.0.1'
+        port = max(1, min(65535, int(params.get('port', 22) or 22)))
+        method = str(params.get('method', 'tcp_probe'))
+        moved = False
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                moved = True
+        except Exception:
+            moved = False
+        if moved and host not in _state['alive_hosts']:
+            _state['alive_hosts'].append(host)
+        _append(f'Lateral move probe {{host}}:{{port}} via {{method}} -> {{"reachable" if moved else "blocked"}}')
+        if not moved:
+            _state['findings'].append({{'id': 'lateral-move-blocked', 'confidence': 0.5, 'source': 'lateral', 'host': host, 'port': port}})
+        _state['stats']['findings_count'] = len(_state['findings'])
+        return _next_node(node)
+    if kind in ('confront_intruder', 'countermeasure', 'block_ip'):
+        target = str(params.get('ip', params.get('target', 'unknown')) or 'unknown')
+        strategy = str(params.get('strategy', params.get('direction', 'bidirectional_block')))
+        _append(f'Confrontation action engaged for {{target}}', strategy=strategy)
+        _state['findings'].append({{'id': 'confrontation-engaged', 'confidence': 0.72, 'source': 'countermeasure', 'target': target, 'strategy': strategy}})
+        _state['stats']['findings_count'] = len(_state['findings'])
+        return _next_node(node)
+    if kind in ('credential_harvest', 'credential_probe'):
+        host = str(params.get('host', '127.0.0.1'))
+        token = hashlib.sha256(f"{{host}}:{{time.time()}}".encode()).hexdigest()[:12]
+        _append(f'Credential probe executed on {{host}}', token=token)
+        _state['findings'].append({{'id': 'credential-probe', 'confidence': 0.61, 'source': 'credential', 'host': host, 'token': token}})
+        _state['stats']['findings_count'] = len(_state['findings'])
+        return _next_node(node)
     if kind in ('send_report', 'report_to_control_plane'):
         _write_deadrop(_state['findings'], _state['telemetry']) if DRONE_TIER == 'autonomous' else None
         _append('Report generated', findings=len(_state['findings']))
@@ -318,7 +384,7 @@ def _execute(node_id):
         if AUTONOMY == 'enforce' and DRONE_TIER == 'autonomous' and CHILD_DRONE_BLOB and len(_state['child_drone_ids']) < 3:
             child_dir = pathlib.Path(__file__).resolve().parent / 'children'
             child_dir.mkdir(parents=True, exist_ok=True)
-            p = child_dir / f"child_{{int(time.time())}}.py"
+            p = child_dir / _script_random_bin_name("child")
             src = zlib.decompress(base64.b64decode(CHILD_DRONE_BLOB.encode())).decode()
             p.write_text(src, encoding='utf-8')
             os.chmod(p, 0o700)
@@ -422,8 +488,8 @@ def decode_blob(blob_b64: str, private_key_hex: str) -> str:
 
 def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, detached: bool = False) -> subprocess.Popen[bytes]:
     source = decode_blob(blob_b64, private_key_hex)
-    script_path = workdir / "drone.py"
-    script_path.write_text(source, encoding="utf-8")
+    script_path = workdir / _random_bin_basename("drone")
+    script_path.write_bytes(source.encode("utf-8"))
     os.chmod(script_path, 0o700)
     proc_env = {**os.environ, "HG_DRONE_KEY_HEX": private_key_hex}
     if detached:
@@ -444,9 +510,10 @@ def deploy_blob_remote(blob_b64: str, private_key_hex: str, host: str, ssh_key_p
     source = decode_blob(blob_b64, private_key_hex)
     did_match = re.search(r'^DRONE_ID\s*=\s*"([^"]+)"', source, re.MULTILINE)
     drone_id = did_match.group(1) if did_match else "drone"
-    local_tmp = Path("/tmp") / f"drone_{drone_id}.py"
-    local_tmp.write_text(source, encoding="utf-8")
-    remote_path = f"{remote_workdir.rstrip('/')}/drone_{drone_id}.py"
+    local_name = _random_bin_basename(f"drone_{drone_id}")
+    local_tmp = Path("/tmp") / local_name
+    local_tmp.write_bytes(source.encode("utf-8"))
+    remote_path = f"{remote_workdir.rstrip('/')}/{local_name}"
     subprocess.run(["scp", "-i", ssh_key_path, str(local_tmp), f"{host}:{remote_path}"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     cmd = f"mkdir -p {remote_workdir} && nohup python3 {remote_path} >/dev/null 2>&1 & echo $!"
     proc = subprocess.run(["ssh", "-i", ssh_key_path, host, cmd], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

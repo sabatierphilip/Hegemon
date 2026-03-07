@@ -4,12 +4,14 @@ import hashlib
 import hmac
 import os
 import base64
+import zlib
+import re
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import pytest
 
 from sentinel_containment.controlplane import DroneBehaviour, DroneNode, HegemonControlPlane
-from sentinel_containment.drone_compiler import DroneBlobCompiler
+from sentinel_containment.drone_compiler import DroneBlobCompiler, deploy_blob_remote, launch_blob_locally
 
 
 def _mini_behaviour() -> DroneBehaviour:
@@ -293,3 +295,164 @@ def test_assemble_sample_squad_routes_are_embedded(tmp_path: Path):
     assert len(built) == 2
     source = next(d for d in built if d.payload.get("squad_node_id") == "n1")
     assert source.payload.get("route_targets")
+
+
+def test_launch_blob_locally_uses_binary_filename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("LocalBin", "controlled", "custom", _mini_behaviour(), actor="tester")
+    blob_b64 = Path(drone.blob_path).read_text(encoding="utf-8").strip()
+    key_hex = cp._drone_private_keys[drone.drone_id]
+
+    popen_calls: list[list[str]] = []
+
+    class _DummyPopen:
+        def __init__(self, argv, **_kwargs):
+            popen_calls.append(list(argv))
+
+    monkeypatch.setattr("sentinel_containment.drone_compiler.subprocess.Popen", _DummyPopen)
+
+    launch_blob_locally(blob_b64, key_hex, tmp_path)
+
+    assert popen_calls
+    launched_path = Path(popen_calls[0][-1])
+    assert launched_path.suffix == ".bin"
+    assert launched_path.exists()
+    assert launched_path.name.startswith("drone_")
+    token = launched_path.stem.split("drone_", 1)[1]
+    assert 8 <= len(token) <= 20
+    assert not (tmp_path / "drone.py").exists()
+
+
+def test_deploy_blob_remote_uses_binary_filename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("RemoteBin", "controlled", "custom", _mini_behaviour(), actor="tester")
+    blob_b64 = Path(drone.blob_path).read_text(encoding="utf-8").strip()
+    key_hex = cp._drone_private_keys[drone.drone_id]
+
+    run_calls: list[list[str]] = []
+
+    class _DummyCompleted:
+        def __init__(self, stdout: str = "1234\n"):
+            self.stdout = stdout
+            self.stderr = ""
+
+    def _fake_run(cmd, **_kwargs):
+        run_calls.append(list(cmd))
+        return _DummyCompleted()
+
+    monkeypatch.setattr("sentinel_containment.drone_compiler.subprocess.run", _fake_run)
+
+    result = deploy_blob_remote(blob_b64, key_hex, "example.com", "/tmp/id_rsa", "/opt/hegemon")
+
+    assert result["remote_path"].endswith(".bin")
+    remote_name = Path(result["remote_path"]).name
+    assert remote_name.startswith("drone_")
+    random_token = remote_name.rsplit(".", 1)[0].split("_", 2)[-1]
+    assert 8 <= len(random_token) <= 20
+    assert any("drone_" in part and part.endswith(".bin") for part in run_calls[0])
+    assert any(".bin" in part for part in run_calls[1])
+
+
+
+def test_compiler_respects_runtime_ring_levels(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone(
+        "Ringed",
+        "controlled",
+        "custom",
+        _mini_behaviour(),
+        actor="tester",
+        runtime={"execution": {"ring_level": 1}, "telemetry": {"kernel_feed": {"provider": "ebpf"}}},
+    )
+    source = cp.decode_drone_source(drone.drone_id)
+
+    assert drone.compiler_ring == 1
+    assert "RING_LEVEL = 1" in source
+    assert "Ring 1 micro-kernel envelope armed" in source
+
+
+def test_spawn_child_drone_accepts_nested_child_graph(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    parent_behaviour = DroneBehaviour(
+        behaviour_id="parent-child",
+        name="parent-child",
+        nodes=[
+            DroneNode(node_id="a", node_type="trigger", kind="on_launch", label="On Launch", params={}, position={"x": 0.0, "y": 0.0}, edges_out=["b"], edge_labels={}),
+            DroneNode(node_id="b", node_type="action", kind="spawn_child_drone", label="Spawn", params={}, position={"x": 1.0, "y": 0.0}, edges_out=["c"], edge_labels={}),
+            DroneNode(node_id="c", node_type="control", kind="self_terminate", label="Stop", params={}, position={"x": 2.0, "y": 0.0}, edges_out=[], edge_labels={}),
+        ],
+        created_at="2026-01-01T00:00:00+00:00",
+        author="tester",
+        description="parent",
+        is_brain_preset=False,
+    )
+
+    runtime = {
+        "child_graph": {
+            "nodes": [
+                {"id": "ca", "type": "trigger", "data": {"kind": "on_launch", "label": "On Launch", "params": {}}, "position": {"x": 0, "y": 0}},
+                {"id": "cb", "type": "action", "data": {"kind": "emit_alert", "label": "Emit", "params": {"message": "child"}}, "position": {"x": 100, "y": 0}},
+            ],
+            "edges": [{"source": "ca", "target": "cb"}],
+        }
+    }
+
+    drone = cp.assemble_drone("Parent", "autonomous", "custom", parent_behaviour, actor="tester", runtime=runtime)
+    source = cp.decode_drone_source(drone.drone_id)
+    match = re.search(r"CHILD_DRONE_BLOB = '([^']*)'", source)
+    assert match is not None
+    child_blob = match.group(1)
+    assert child_blob
+
+    child_source = zlib.decompress(base64.b64decode(child_blob.encode())).decode()
+    assert "kind': 'emit_alert'" in child_source
+
+
+def test_compose_behaviour_from_graph_maps_edges(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    behaviour = cp._compose_behaviour_from_graph(
+        [
+            {"id": "a", "type": "trigger", "data": {"kind": "on_launch", "label": "Launch", "params": {}}},
+            {"id": "b", "type": "action", "data": {"kind": "send_report", "label": "Report", "params": {"severity": "info"}}},
+        ],
+        [{"source": "a", "target": "b", "label": "next"}],
+        behaviour_id="graph-beh",
+        name="graph-beh",
+    )
+
+    assert behaviour.behaviour_id == "graph-beh"
+    node_a = next(n for n in behaviour.nodes if n.node_id == "a")
+    assert node_a.edges_out == ["b"]
+    assert node_a.edge_labels.get("b") == "next"
+
+
+def test_spawn_child_drone_uses_randomized_bin_name(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone(
+        "ChildRun",
+        "autonomous",
+        "custom",
+        _mini_behaviour(),
+        actor="tester",
+        autonomy_level="enforce",
+        runtime={
+            "child_drone_blob": base64.b64encode(zlib.compress("print(\'child\')\n".encode("utf-8"))).decode("ascii"),
+        },
+    )
+    source = cp.decode_drone_source(drone.drone_id)
+    assert '_script_random_bin_name("child")' in source
+
+
+def test_seeded_brains_include_lateral_and_confrontation_elements(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    ghost = cp.drone_brains["brain-ghost-hunter"]
+    watcher = cp.drone_brains["brain-watcher"]
+
+    ghost_kinds = {n.kind for n in ghost.nodes}
+    watcher_kinds = {n.kind for n in watcher.nodes}
+
+    assert "lateral_move" in ghost_kinds
+    assert "credential_probe" in ghost_kinds
+    assert "confront_intruder" in ghost_kinds
+    assert "lateral_move" in watcher_kinds
+    assert "confront_intruder" in watcher_kinds
