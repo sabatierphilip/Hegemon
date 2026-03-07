@@ -76,6 +76,14 @@ LAUNCH_TIME = 0.0
 SCRIPT_HASH = {hashlib.sha256((drone.drone_id + drone.name).encode()).hexdigest()!r}
 CHILD_DRONE_BLOB = {str(getattr(drone, "runtime", {}).get("child_drone_blob", "") or "")!r}
 PAYLOAD_BIN = {str(getattr(drone, 'payload_binary', '') or '')!r}
+DRONE_NAME_BIN = {str(getattr(drone, 'name_binary', '') or '')!r}
+DRONE_TIER_BIN = {str(getattr(drone, 'tier_binary', '') or '')!r}
+MISSION_BIN = {str(getattr(drone, 'mission_binary', '') or '')!r}
+AUTONOMY_BIN = {str(getattr(drone, 'autonomy_binary', '') or '')!r}
+BEHAVIOUR_BIN = {str(getattr(drone, 'behaviour_binary', '') or '')!r}
+RUNTIME_BIN = {str(getattr(drone, 'runtime_binary', '') or '')!r}
+BINARY_BLUEPRINT = {str(getattr(drone, 'binary_blueprint', '') or '')!r}
+BINARY_MANIFEST = {str(getattr(drone, 'binary_manifest', '') or '')!r}
 PAYLOAD_JSON = {payload_literal}
 
 EMBEDDED_VULN_SIGS = {vuln_sigs_literal}

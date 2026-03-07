@@ -320,8 +320,15 @@ class Drone:
     actor: str
     payload: Any = field(default_factory=dict)
     payload_binary: str = ""
+    name_binary: str = ""
+    tier_binary: str = ""
+    mission_binary: str = ""
+    autonomy_binary: str = ""
+    behaviour_binary: str = ""
+    runtime_binary: str = ""
     pending_commands: list[dict[str, Any]] = field(default_factory=list)
     binary_blueprint: str = ""
+    binary_manifest: str = ""
     binary_blob: str = ""
     blob_size_bytes: int = 0
     blob_hash: str = ""
@@ -3515,6 +3522,10 @@ class HegemonControlPlane:
     def _text_to_bits(self, value: str) -> str:
         return "".join(format(ord(ch), "08b") for ch in value)
 
+    def _to_binary_json(self, value: Any) -> str:
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+        return self._text_to_bits(payload)
+
     def _drone_binary_blueprint(self, *, name: str, tier: str, mission: str, behaviour: DroneBehaviour, ttl_seconds: int, checkin_interval_seconds: int, autonomy_level: str, payload_binary: str) -> str:
         header = "1101001011110001"
         meta = {
@@ -3657,6 +3668,57 @@ class HegemonControlPlane:
                 name=f"{name}-child",
                 description="child graph provided by composer",
             )
+            child_payload = {"parent_drone_id": drone_id}
+            child_runtime = {"execution": {"ring_level": compiler_ring}}
+            child_payload_binary = self._to_binary_json(child_payload)
+            child_name_binary = self._text_to_bits(f"{name}-child")
+            child_tier_binary = self._text_to_bits(tier)
+            child_mission_binary = self._text_to_bits(f"{mission}-child")
+            child_autonomy_binary = self._text_to_bits(autonomy_level)
+            child_behaviour_binary = self._to_binary_json({
+                "behaviour_id": child_behaviour.behaviour_id,
+                "name": child_behaviour.name,
+                "description": child_behaviour.description,
+                "is_brain_preset": bool(child_behaviour.is_brain_preset),
+                "nodes": [
+                    {
+                        "node_id": node.node_id,
+                        "node_type": node.node_type,
+                        "kind": node.kind,
+                        "label": node.label,
+                        "params": node.params,
+                        "position": node.position,
+                        "edges_out": node.edges_out,
+                        "edge_labels": node.edge_labels,
+                    }
+                    for node in child_behaviour.nodes
+                ],
+            })
+            child_runtime_binary = self._to_binary_json(child_runtime)
+            child_binary_blueprint = self._drone_binary_blueprint(
+                name=f"{name}-child",
+                tier=tier,
+                mission=f"{mission}-child",
+                behaviour=child_behaviour,
+                ttl_seconds=ttl_seconds,
+                checkin_interval_seconds=checkin_interval_seconds,
+                autonomy_level=autonomy_level,
+                payload_binary=child_payload_binary,
+            )
+            child_supported_actions = sorted(self.DRONE_BINARY_COMMANDS.keys())
+            child_binary_manifest = self._to_binary_json({
+                "drone_id": f"{drone_id}-child-template",
+                "name_binary": child_name_binary,
+                "tier_binary": child_tier_binary,
+                "mission_binary": child_mission_binary,
+                "autonomy_binary": child_autonomy_binary,
+                "payload_binary": child_payload_binary,
+                "behaviour_binary": child_behaviour_binary,
+                "runtime_binary": child_runtime_binary,
+                "binary_blueprint": child_binary_blueprint,
+                "supported_binary_actions": child_supported_actions,
+                "artifact_format": str(artifact_format or "binary_blob"),
+            })
             child_drone = Drone(
                 drone_id=f"{drone_id}-child-template",
                 name=f"{name}-child",
@@ -3683,16 +3745,49 @@ class HegemonControlPlane:
                 error=None,
                 created_at=now,
                 actor=actor,
-                payload={"parent_drone_id": drone_id},
-                payload_binary="",
+                payload=child_payload,
+                payload_binary=child_payload_binary,
+                name_binary=child_name_binary,
+                tier_binary=child_tier_binary,
+                mission_binary=child_mission_binary,
+                autonomy_binary=child_autonomy_binary,
+                behaviour_binary=child_behaviour_binary,
+                runtime_binary=child_runtime_binary,
+                binary_blueprint=child_binary_blueprint,
+                binary_manifest=child_binary_manifest,
+                supported_binary_actions=child_supported_actions,
                 artifact_format=str(artifact_format or "binary_blob"),
-                runtime={"execution": {"ring_level": compiler_ring}},
+                runtime=child_runtime,
                 compiler_ring=compiler_ring,
             )
             child_source = self._drone_compiler._render_script(child_drone, private_key_hex, {"vuln_sigs": [], "attack_patterns": [], "port_risk": {}})
             runtime_obj["child_drone_blob"] = base64.b64encode(zlib.compress(child_source.encode("utf-8"), level=9)).decode("ascii")
         payload_json = json.dumps(payload_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
         payload_binary = self._text_to_bits(payload_json)
+        name_binary = self._text_to_bits(name)
+        tier_binary = self._text_to_bits(tier)
+        mission_binary = self._text_to_bits(mission)
+        autonomy_binary = self._text_to_bits(autonomy_level)
+        behaviour_binary = self._to_binary_json({
+            "behaviour_id": behaviour_obj.behaviour_id,
+            "name": behaviour_obj.name,
+            "description": behaviour_obj.description,
+            "is_brain_preset": bool(behaviour_obj.is_brain_preset),
+            "nodes": [
+                {
+                    "node_id": node.node_id,
+                    "node_type": node.node_type,
+                    "kind": node.kind,
+                    "label": node.label,
+                    "params": node.params,
+                    "position": node.position,
+                    "edges_out": node.edges_out,
+                    "edge_labels": node.edge_labels,
+                }
+                for node in behaviour_obj.nodes
+            ],
+        })
+        runtime_binary = self._to_binary_json(runtime_obj)
         supported_binary_actions = sorted(self.DRONE_BINARY_COMMANDS.keys())
         embedded_intel = self._select_embedded_intel(
             target_os=self.endpoints.get(target_endpoint_id).os if target_endpoint_id and target_endpoint_id in self.endpoints else None,
@@ -3709,13 +3804,40 @@ class HegemonControlPlane:
             autonomy_level=autonomy_level,
             payload_binary=payload_binary,
         )
+        binary_manifest = self._to_binary_json(
+            {
+                "drone_id": drone_id,
+                "name_binary": name_binary,
+                "tier_binary": tier_binary,
+                "mission_binary": mission_binary,
+                "autonomy_binary": autonomy_binary,
+                "payload_binary": payload_binary,
+                "behaviour_binary": behaviour_binary,
+                "runtime_binary": runtime_binary,
+                "binary_blueprint": binary_blueprint,
+                "supported_binary_actions": supported_binary_actions,
+                "artifact_format": str(artifact_format or "binary_blob"),
+            }
+        )
         compiled_blob = self._drone_compiler.compile(drone=Drone(
             drone_id=drone_id, name=name, tier=tier, status="ready", mission=mission, behaviour=behaviour_obj,
             target_endpoint_id=target_endpoint_id, target_host=target_host, target_network=target_network, autonomy_level=autonomy_level,
             ttl_seconds=ttl_seconds, checkin_interval_seconds=checkin_interval_seconds, launched_at=None, last_checkin_at=None, return_at=None,
             keypair_public=keypair.verify_key.encode().hex(), findings=[], telemetry=[], health={}, live_output=[], current_node_id=None,
             stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor,
-            payload=payload_obj, payload_binary=payload_binary, artifact_format=str(artifact_format or "binary_blob"), runtime=runtime_obj, compiler_ring=compiler_ring,
+            payload=payload_obj,
+            payload_binary=payload_binary,
+            name_binary=name_binary,
+            tier_binary=tier_binary,
+            mission_binary=mission_binary,
+            autonomy_binary=autonomy_binary,
+            behaviour_binary=behaviour_binary,
+            runtime_binary=runtime_binary,
+            binary_blueprint=binary_blueprint,
+            binary_manifest=binary_manifest,
+            artifact_format=str(artifact_format or "binary_blob"),
+            runtime=runtime_obj,
+            compiler_ring=compiler_ring,
         ), private_key_hex=private_key_hex, embedded_intel=embedded_intel)
         blob_path = workdir / "drone.blob"
         blob_path.write_text(compiled_blob, encoding="utf-8")
@@ -3747,7 +3869,14 @@ class HegemonControlPlane:
             actor=actor,
             payload=payload_obj,
             payload_binary=payload_binary,
+            name_binary=name_binary,
+            tier_binary=tier_binary,
+            mission_binary=mission_binary,
+            autonomy_binary=autonomy_binary,
+            behaviour_binary=behaviour_binary,
+            runtime_binary=runtime_binary,
             binary_blueprint=binary_blueprint,
+            binary_manifest=binary_manifest,
             binary_blob="",
             blob_path=str(blob_path),
             supported_binary_actions=supported_binary_actions,

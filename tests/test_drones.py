@@ -130,12 +130,70 @@ def test_drone_payload_is_compiled_to_binary_and_embedded(tmp_path: Path):
     assert "PAYLOAD_BIN" in source
     assert "PAYLOAD_JSON" in source
 
+
+def test_drone_metadata_is_binary_first(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("BinaryAll", "controlled", "custom", _mini_behaviour(), payload={"x": 1}, actor="tester")
+    binary_fields = [
+        drone.name_binary,
+        drone.tier_binary,
+        drone.mission_binary,
+        drone.autonomy_binary,
+        drone.behaviour_binary,
+        drone.runtime_binary,
+        drone.payload_binary,
+        drone.binary_blueprint,
+        drone.binary_manifest,
+    ]
+    for value in binary_fields:
+        assert value
+        assert set(value).issubset({"0", "1"})
+
+    source = cp.decode_drone_source(drone.drone_id)
+    assert "DRONE_NAME_BIN" in source
+    assert "BINARY_MANIFEST" in source
+
 def test_available_binary_action_catalog(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     actions = cp.available_drone_actions()
     assert any(row["binary"] == "00000011" and row["action"] == "report" for row in actions)
     assert len(actions) >= 10
 
+
+
+
+@pytest.mark.parametrize("tier,autonomy", [
+    ("controlled", "observe"),
+    ("tethered", "contain"),
+    ("autonomous", "enforce"),
+])
+def test_binary_fields_present_for_all_drone_tiers(tmp_path: Path, tier: str, autonomy: str):
+    cp = HegemonControlPlane(ledger_path=tmp_path / f"ledger-{tier}.jsonl")
+    drone = cp.assemble_drone(f"{tier}-drone", tier, "custom", _mini_behaviour(), autonomy_level=autonomy, payload={"tier": tier}, actor="tester")
+    assert drone.binary_manifest
+    assert set(drone.binary_manifest).issubset({"0", "1"})
+    assert drone.name_binary and set(drone.name_binary).issubset({"0", "1"})
+    assert drone.tier_binary and set(drone.tier_binary).issubset({"0", "1"})
+    assert drone.mission_binary and set(drone.mission_binary).issubset({"0", "1"})
+    assert drone.autonomy_binary and set(drone.autonomy_binary).issubset({"0", "1"})
+    assert drone.behaviour_binary and set(drone.behaviour_binary).issubset({"0", "1"})
+    assert drone.runtime_binary and set(drone.runtime_binary).issubset({"0", "1"})
+
+
+def test_binary_fields_present_for_all_sample_drone_profiles(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger-samples.jsonl")
+    assembled = 0
+    for sample in cp.drone_sample_catalog():
+        try:
+            drone = cp.assemble_sample_drone(sample["sample_id"], actor="tester")
+        except ValueError:
+            continue
+        assembled += 1
+        assert drone.binary_manifest
+        assert set(drone.binary_manifest).issubset({"0", "1"})
+        assert drone.binary_blueprint and set(drone.binary_blueprint).issubset({"0", "1"})
+        assert drone.payload_binary and set(drone.payload_binary).issubset({"0", "1"})
+    assert assembled > 0
 
 def test_blob_roundtrip_and_source_decode(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
@@ -502,6 +560,8 @@ def test_child_graph_blob_embedded(tmp_path: Path):
     assert drone.runtime.get("child_drone_blob"), "child blob must be embedded"
     decompressed = zlib.decompress(base64.b64decode(drone.runtime["child_drone_blob"]))
     assert b"on_launch" in decompressed
+    assert b"DRONE_NAME_BIN" in decompressed
+    assert b"BINARY_MANIFEST" in decompressed
 
 
 def test_shelve_replaced_by_sqlite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
