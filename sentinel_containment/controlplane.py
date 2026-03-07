@@ -33,6 +33,13 @@ from nacl import signing
 
 from signed_ledger import SignedLedger
 from sentinel_containment.drone_compiler import DroneBlobCompiler, decode_blob, deploy_blob_remote, launch_blob_locally
+from sentinel_containment.drone_tactics import (
+    LateralMovementDesigner,
+    IntruderConfrontationDesigner,
+    normalize_ip,
+    normalize_target_host,
+    clamp,
+)
 from sentinel_containment.store_client import StoreClient, StoreSearchResult
 
 try:
@@ -586,6 +593,8 @@ class HegemonControlPlane:
         self._allow_absolute_program_roots: bool = False
         self.store_client = StoreClient()
         self._self_scan_loop = self.SelfScanLoop(self)
+        self._lateral_designer = LateralMovementDesigner()
+        self._countermeasure_designer = IntruderConfrontationDesigner()
         self._reconcile_drone_pids()
 
     def _reconcile_drone_pids(self) -> None:
@@ -4340,6 +4349,111 @@ class HegemonControlPlane:
         if kind == "isolate_source_ip":
             if drone.autonomy_level == "enforce":
                 self._append_signed_telemetry(drone, "Source IP isolated")
+            return self._next_node(node)
+        if kind in {"lateral_move", "pivot_host"}:
+            source_host = normalize_target_host(drone.target_host or "127.0.0.1")
+            target_host = normalize_target_host(str(node.params.get("host", node.params.get("target_host", source_host))))
+            method = str(node.params.get("method", "tcp_probe")).strip() or "tcp_probe"
+            seed_port = int(node.params.get("port", 445) or 445)
+
+            candidate_ports = self._lateral_designer.build_candidate_ports(method, seed_port)
+            open_ports: list[int] = []
+            banners: dict[int, str] = {}
+            for port in candidate_ports[:6]:
+                if stop_event.is_set():
+                    break
+                try:
+                    with socket.create_connection((target_host, port), timeout=0.8) as sock:
+                        open_ports.append(port)
+                        try:
+                            sock.settimeout(0.25)
+                            banner = sock.recv(96).decode("utf-8", errors="ignore").strip()
+                        except Exception:
+                            banner = ""
+                        if banner:
+                            banners[port] = banner[:96]
+                except Exception:
+                    continue
+
+            mesh_hosts = [h for h in {target_host, source_host, "10.0.0.5", "10.0.1.10", "10.0.2.25"} if h]
+            host_roles = {
+                source_host: "jump_host",
+                target_host: "workstation" if target_host.startswith("10.") else "unknown",
+                "10.0.0.5": "domain_controller",
+                "10.0.1.10": "db",
+                "10.0.2.25": "workstation",
+            }
+            host_trust = {source_host: 0.31, target_host: 0.54, "10.0.0.5": 0.79, "10.0.1.10": 0.66, "10.0.2.25": 0.45}
+            host_anomaly = {source_host: 0.12, target_host: 0.35, "10.0.0.5": 0.28, "10.0.1.10": 0.41, "10.0.2.25": 0.2}
+
+            pivot_plan = self._lateral_designer.design_plan(
+                source_host=source_host,
+                target_host=target_host,
+                method=method,
+                seed_port=seed_port,
+                observed_open_ports=open_ports,
+                observed_banners=banners,
+                mesh_hosts=mesh_hosts,
+                host_roles=host_roles,
+                host_trust=host_trust,
+                host_anomaly=host_anomaly,
+            )
+
+            finding_prefix = "pivot-ready" if pivot_plan.confidence >= 0.5 and pivot_plan.selected_chain else "pivot-blocked"
+            finding_id = f"{finding_prefix}-{target_host}-{method}-{int(pivot_plan.confidence*100)}"
+            drone.findings.append(finding_id)
+            drone.stats["findings_count"] = len(drone.findings)
+            self._append_signed_telemetry(
+                drone,
+                f"{kind} designed chain={'->'.join(pivot_plan.selected_chain or [source_host])} target={target_host}",
+                target=target_host,
+                method=method,
+                confidence=pivot_plan.confidence,
+                detection_risk=pivot_plan.detection_risk,
+                resilience=pivot_plan.resilience,
+                blockers=pivot_plan.blockers,
+                opportunities=pivot_plan.opportunities,
+                recommendations=pivot_plan.recommendations,
+                pivot_telemetry=pivot_plan.telemetry,
+            )
+            return self._next_node(node)
+        if kind in {"confront_intruder", "countermeasure", "block_ip"}:
+            target = normalize_ip(str(node.params.get("ip", node.params.get("target", drone.target_host or "unknown"))))
+            strategy = str(node.params.get("strategy", node.params.get("direction", "bidirectional_block"))).strip() or "bidirectional_block"
+            findings_count = len(drone.findings)
+            anomaly = clamp(0.18 + (findings_count / 25.0))
+            active_sessions = int(node.params.get("active_sessions", 3) or 3)
+            confidence = clamp(0.55 + (0.15 if drone.autonomy_level == "enforce" else -0.05))
+            criticality = clamp(float(node.params.get("criticality", 0.74)))
+
+            cm_plan = self._countermeasure_designer.design_plan(
+                target=target,
+                strategy=strategy,
+                intruder_score=anomaly,
+                lateral_pressure=clamp(float(node.params.get("lateral_pressure", 0.65))),
+                endpoint_criticality=criticality,
+                confidence=confidence,
+                active_sessions=active_sessions,
+            )
+
+            mode = "engaged" if drone.autonomy_level == "enforce" else "simulated"
+            finding_id = f"countermeasure-{strategy}-{target}-{mode}-{int(cm_plan.containment_strength*100)}"
+            drone.findings.append(finding_id)
+            drone.stats["findings_count"] = len(drone.findings)
+            self._append_signed_telemetry(
+                drone,
+                f"Countermeasure {mode} strategy={strategy} target={target}",
+                target=target,
+                strategy=strategy,
+                mode=mode,
+                risk_score=cm_plan.risk_score,
+                confidence=cm_plan.confidence,
+                containment_strength=cm_plan.containment_strength,
+                latency_budget_seconds=cm_plan.latency_budget_seconds,
+                operator_brief=cm_plan.operator_brief,
+                rollback_steps=cm_plan.rollback_steps,
+                countermeasure_telemetry=cm_plan.telemetry,
+            )
             return self._next_node(node)
         self._append_signed_telemetry(drone, f"Unknown node kind {kind}")
         return self._next_node(node)
