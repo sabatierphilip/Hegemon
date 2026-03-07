@@ -167,9 +167,13 @@ def test_deadrop_polling_merges_payload(tmp_path: Path):
     raw = json.dumps(payload).encode("utf-8")
     nonce = os.urandom(12)
     aes_key = hashlib.sha256(bytes.fromhex(key_hex[:64])).digest()
-    encrypted = AESGCM(aes_key).encrypt(nonce, raw, None)
+    aad = f"{drone.drone_id}:deadrop:v3:aes-256-gcm".encode()
+    encrypted = AESGCM(aes_key).encrypt(nonce, raw, aad)
     sig = hmac.new(bytes.fromhex(key_hex[:64]), encrypted, hashlib.sha256).hexdigest()
     envelope = base64.b64encode(json.dumps({
+        "v": 3,
+        "alg": "AES-256-GCM",
+        "aad": base64.b64encode(aad).decode(),
         "sig": sig,
         "nonce": base64.b64encode(nonce).decode(),
         "data": base64.b64encode(encrypted).decode(),
@@ -178,6 +182,16 @@ def test_deadrop_polling_merges_payload(tmp_path: Path):
     Path(drone.deadrop_path).write_text(envelope, encoding="utf-8")
     cp._poll_deadrop(drone.drone_id)
     assert "f1" in cp.drones[drone.drone_id].findings
+
+
+def test_deadrop_polling_rejects_unencrypted_payload_shape(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("DropperPlain", "autonomous", "custom", _mini_behaviour(), actor="tester")
+    envelope = base64.b64encode(json.dumps({"findings": ["f1"], "telemetry": [{"message": "hi"}]}).encode()).decode()
+    Path(drone.deadrop_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(drone.deadrop_path).write_text(envelope, encoding="utf-8")
+    cp._poll_deadrop(drone.drone_id)
+    assert "f1" not in cp.drones[drone.drone_id].findings
 
 
 def test_drone_blob_is_stored_as_separate_file(tmp_path: Path):

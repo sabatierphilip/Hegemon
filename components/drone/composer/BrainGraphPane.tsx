@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import ReactFlow, {
   Background,
   Controls,
@@ -56,6 +56,21 @@ export function BrainGraphPane({
   const rfInstance = useRef<ReactFlowInstance | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const edgesRef = useRef(edges);
+
+  const graphDimensions = useMemo(() => {
+    const minWidth = 700;
+    const minHeight = 384;
+    if (!nodes.length) return { width: minWidth, height: minHeight };
+
+    const padding = 220;
+    const rightMostX = nodes.reduce((acc, node) => Math.max(acc, node.position.x), 0);
+    const bottomMostY = nodes.reduce((acc, node) => Math.max(acc, node.position.y), 0);
+
+    return {
+      width: Math.max(minWidth, rightMostX + padding),
+      height: Math.max(minHeight, bottomMostY + padding),
+    };
+  }, [nodes]);
 
   useEffect(() => {
     edgesRef.current = edges;
@@ -155,38 +170,41 @@ export function BrainGraphPane({
         <ActionPalette />
       </div>
 
-      <div ref={containerRef} className="col-span-6 h-96 rounded border border-border">
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          onNodesChange={handleNodesChange}
-          onEdgesChange={handleEdgesChange}
-          onConnect={onConnect}
-          onDragOver={onDragOver}
-          onDrop={onDrop}
-          onNodeClick={onNodeClick}
-          onPaneClick={onPaneClick}
-          onInit={(instance) => {
-            rfInstance.current = instance;
-          }}
-          fitView
-          deleteKeyCode="Delete"
-        >
-          <Background color="#1e1e2e" gap={16} />
-          <Controls />
-          <MiniMap
-            nodeColor={(n) =>
-              n.type === 'meta'
-                ? '#eab308'
-                : n.type === 'timer'
-                  ? '#3b82f6'
-                  : n.type === 'payload'
-                    ? '#22c55e'
-                    : '#6366f1'
-            }
-          />
-        </ReactFlow>
+      <div ref={containerRef} className="col-span-6 overflow-auto rounded border border-border bg-slate-950/80">
+        <div style={{ width: graphDimensions.width, height: graphDimensions.height }}>
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            onNodesChange={handleNodesChange}
+            onEdgesChange={handleEdgesChange}
+            onConnect={onConnect}
+            onDragOver={onDragOver}
+            onDrop={onDrop}
+            onNodeClick={onNodeClick}
+            onPaneClick={onPaneClick}
+            onInit={(instance) => {
+              rfInstance.current = instance;
+            }}
+            fitView
+            deleteKeyCode="Delete"
+          >
+            <Background color="#334155" gap={18} />
+            <Controls />
+            <MiniMap
+              bgColor="#020617"
+              nodeColor={(n) =>
+                n.type === 'meta'
+                  ? '#eab308'
+                  : n.type === 'timer'
+                    ? '#3b82f6'
+                    : n.type === 'payload'
+                      ? '#22c55e'
+                      : '#6366f1'
+              }
+            />
+          </ReactFlow>
+        </div>
       </div>
 
       <div className="col-span-3">
