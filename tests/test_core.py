@@ -195,6 +195,67 @@ def test_containment_live_executor_actions_are_not_noops(tmp_path):
     assert list((tmp_path / "snaps").glob("snapshot-h-exec-*.json"))
 
 
+def test_containment_dry_run_skips_forensic_and_api_key_side_effects(tmp_path):
+    audit = ImmutableAuditLog(tmp_path / "audit.log")
+    executor = ContainmentActionExecutor(active_mode=False)
+    bundle, cfg = _hardware_auth_for(
+        "h-dry-run",
+        95,
+        ["forensic_snapshot_metadata", "revoke_rotate_api_keys"],
+        ["user"],
+        authorize_all_containment=True,
+    )
+    engine = ContainmentEngine(
+        audit,
+        hardware_key_verifier=HardwareKeyVerifier(cfg["trusted_hardware_public_keys"]),
+        action_executor=executor,
+    )
+    result = engine.execute(
+        host="h-dry-run",
+        severity=95,
+        requested_actions=["forensic_snapshot_metadata", "revoke_rotate_api_keys"],
+        approvals=["user"],
+        simulation_mode=False,
+        signature_bundle=bundle,
+        action_context={
+            "forensic_snapshot_dir": str(tmp_path / "snaps"),
+            "api_key_registry_path": str(tmp_path / "api_keys.json"),
+        },
+    )
+
+    assert result.approved is True
+    last = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").splitlines()[-1])
+    action_results = {entry["action"]: entry for entry in last["payload"]["action_results"]}
+
+    assert action_results["forensic_snapshot_metadata"]["status"] == "simulated"
+    assert action_results["revoke_rotate_api_keys"]["status"] == "simulated"
+    assert not (tmp_path / "snaps").exists()
+    assert not (tmp_path / "api_keys.json").exists()
+
+
+def test_forensic_snapshot_supports_vss_profile_and_brain_branches(tmp_path):
+    executor = ContainmentActionExecutor(active_mode=True)
+    result = executor.execute(
+        "host-vss",
+        "forensic_snapshot_metadata",
+        {
+            "forensic_snapshot_dir": str(tmp_path / "snaps"),
+            "forensic_snapshot_profile": "vss",
+            "attack_stages": ["initial_access", "privilege_escalation", "persistence"],
+            "forensic_indicators": ["sudo", "iam", "token"],
+        },
+    )
+
+    assert result.status == "executed"
+    assert result.details["snapshot_profile"] == "vss"
+    assert result.details["branch_count"] == 3
+
+    snapshot_path = Path(result.details["snapshot_path"])
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert payload["snapshot_profile"] == "vss"
+    assert payload["brain_privilege_escalation_path"]["auto_branching"] is True
+    assert payload["brain_privilege_escalation_path"]["mode"] == "defensive_model"
+    assert len(payload["brain_privilege_escalation_path"]["branches"]) == 3
 
 
 def test_run_cycle_emits_severity_alert_feed(tmp_path):
