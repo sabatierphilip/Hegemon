@@ -14,6 +14,9 @@ export function DroneDetail({ drone }: { drone?: Drone }) {
   const { token } = useAuth();
   const [telemetry, setTelemetry] = useState<string[]>([]);
   const [countdown, setCountdown] = useState<number>(drone?.ttl_seconds ?? 0);
+  const [ring1Approver, setRing1Approver] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
     setCountdown(drone?.ttl_seconds ?? 0);
@@ -59,11 +62,27 @@ export function DroneDetail({ drone }: { drone?: Drone }) {
     }
   };
 
+  const handleRing1Approve = async () => {
+    if (!drone || !ring1Approver) return;
+    try {
+      await apiRequest(`/api/drones/${drone.id}/approve-ring1`, token, {
+        method: 'POST',
+        body: JSON.stringify({ approver: ring1Approver }),
+      });
+      setMessage('Ring 1 approved');
+      setError(null);
+    } catch {
+      setError('Approval failed');
+    }
+  };
+
   if (!drone) return <Card className="p-3 text-xs text-textSecondary">Select a drone</Card>;
 
   return (
     <Card className="h-[calc(100vh-7rem)] space-y-3 overflow-auto p-3 text-xs">
       <h3 className="text-sm">Drone Detail</h3>
+      {error && <div className="rounded border border-critical/50 p-2 text-xs text-critical">{error}</div>}
+      {message && <div className="rounded border border-low/50 p-2 text-xs text-low">{message}</div>}
 
       <div className="space-y-1">
         <div className="font-mono">ID: {drone.id}</div>
@@ -121,6 +140,19 @@ export function DroneDetail({ drone }: { drone?: Drone }) {
           View Source
         </Button>
       </div>
+
+      {drone.compiler_ring === 1 && drone.status === 'ready' && (
+        <div className="rounded border border-critical/50 p-2 text-xs space-y-2">
+          <div className="text-critical">Ring 1 — Human Approval Required</div>
+          <input
+            className="w-full rounded border border-border bg-bg px-2 py-1"
+            placeholder="Approver friend_id"
+            value={ring1Approver}
+            onChange={(e) => setRing1Approver(e.target.value)}
+          />
+          <Button size="sm" onClick={handleRing1Approve}>Approve Ring 1 Launch</Button>
+        </div>
+      )}
     </Card>
   );
 }

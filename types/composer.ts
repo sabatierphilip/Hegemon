@@ -4,6 +4,7 @@ export interface ComposerState {
   droneName: string;
   tier: 'controlled' | 'tethered' | 'autonomous';
   autonomy: 'observe' | 'contain' | 'enforce';
+  executionRing: 1 | 2 | 3;
   endpointId?: string;
   host?: string;
   cidr?: string;
@@ -13,6 +14,7 @@ export interface ComposerState {
   checkinSeconds: number;
   nodes: Node[];
   edges: Edge[];
+  childGraph?: { nodes: Node[]; edges: Edge[] };
   payload: Record<string, unknown>;
   meta: {
     selfDestruct: Record<string, unknown>;

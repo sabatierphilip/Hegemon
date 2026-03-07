@@ -46,6 +46,9 @@ export interface Drone {
   };
   live_output: string[];
   current_node_id: string | null;
+  compiler_ring: 1 | 2 | 3;
+  artifact_format: string;
+  child_drone_ids: number[];
 }
 
 export interface Endpoint {

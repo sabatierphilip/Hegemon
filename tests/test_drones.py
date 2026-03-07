@@ -397,7 +397,7 @@ def test_spawn_child_drone_accepts_nested_child_graph(tmp_path: Path):
         }
     }
 
-    drone = cp.assemble_drone("Parent", "autonomous", "custom", parent_behaviour, actor="tester", runtime=runtime)
+    drone = cp.assemble_drone("Parent", "autonomous", "custom", parent_behaviour, actor="tester", runtime=runtime, autonomy_level="enforce")
     source = cp.decode_drone_source(drone.drone_id)
     match = re.search(r"CHILD_DRONE_BLOB = '([^']*)'", source)
     assert match is not None
@@ -456,3 +456,81 @@ def test_seeded_brains_include_lateral_and_confrontation_elements(tmp_path: Path
     assert "confront_intruder" in ghost_kinds
     assert "lateral_move" in watcher_kinds
     assert "confront_intruder" in watcher_kinds
+
+
+def test_brain_node_validation_blocks_enforce_only_node(tmp_path: Path):
+    """Assemble with lateral_move at observe autonomy should raise."""
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    b = _mini_behaviour()
+    b.nodes.append(DroneNode(
+        node_id="lm1", node_type="action", kind="lateral_move",
+        label="LM", params={"host": "10.0.0.1"}, position={"x": 0, "y": 0},
+        edges_out=[], edge_labels={},
+    ))
+    with pytest.raises(ValueError, match="lateral_move"):
+        cp.assemble_drone("BadDrone", "autonomous", "custom", b,
+                          autonomy_level="observe", actor="tester")
+
+
+def test_brain_node_validation_allows_lateral_move_at_enforce(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    b = _mini_behaviour()
+    b.nodes.append(DroneNode(
+        node_id="lm1", node_type="action", kind="lateral_move",
+        label="LM", params={"host": "10.0.0.1"}, position={"x": 0, "y": 0},
+        edges_out=[], edge_labels={},
+    ))
+    drone = cp.assemble_drone("OkDrone", "autonomous", "custom", b,
+                              autonomy_level="enforce", actor="tester")
+    assert drone.status == "ready"
+
+
+def test_child_graph_blob_embedded(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    child_nodes = [
+        {"id": "on_launch", "type": "brain",
+         "data": {"kind": "on_launch", "params": {}}, "position": {"x": 0, "y": 0}},
+        {"id": "self_terminate", "type": "brain",
+         "data": {"kind": "self_terminate", "params": {}}, "position": {"x": 0, "y": 100}},
+    ]
+    child_edges = [{"source": "on_launch", "target": "self_terminate", "id": "e1"}]
+    drone = cp.assemble_drone(
+        "ParentDrone", "autonomous", "custom", _mini_behaviour(),
+        autonomy_level="enforce", actor="tester",
+        runtime={"child_graph": {"nodes": child_nodes, "edges": child_edges}},
+    )
+    assert drone.runtime.get("child_drone_blob"), "child blob must be embedded"
+    decompressed = zlib.decompress(base64.b64decode(drone.runtime["child_drone_blob"]))
+    assert b"on_launch" in decompressed
+
+
+def test_shelve_replaced_by_sqlite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.chdir(tmp_path)
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    cp._intel_cache_set("test_key", {"foo": "bar"})
+    result = cp._intel_cache_get("test_key")
+    assert result == {"foo": "bar"}
+    assert not list(tmp_path.glob("*.shelve*"))
+    db = tmp_path / "data" / "intel_cache.db"
+    assert db.exists()
+
+
+def test_pid_persisted_to_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.chdir(tmp_path)
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("PidDrone", "autonomous", "custom",
+                              _mini_behaviour(), autonomy_level="observe", actor="tester")
+
+    class _FakePopen:
+        pid = 99999
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr("sentinel_containment.controlplane.launch_blob_locally", lambda *a, **k: _FakePopen())
+    cp.launch_drone(drone.drone_id, actor="tester")
+    pid_path = Path("data") / "drones" / drone.drone_id / "pid"
+    assert pid_path.exists()
+    assert int(pid_path.read_text()) == 99999

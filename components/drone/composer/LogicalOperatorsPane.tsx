@@ -15,7 +15,7 @@ function DraggableLogicItem({ node }: { node: (typeof LOGICAL_NODES)[number] }) 
   const [showInfo, setShowInfo] = useState(false);
 
   return (
-    <div className="rounded border border-border p-2 text-xs">
+    <div className="relative rounded border border-border p-2 text-xs">
       <div className="flex items-center justify-between gap-2">
         <div
           draggable
@@ -35,10 +35,10 @@ function DraggableLogicItem({ node }: { node: (typeof LOGICAL_NODES)[number] }) 
         </button>
       </div>
       {showInfo && (
-        <div className="mt-2 space-y-1 text-[11px] text-textSecondary">
+        <div className="absolute left-2 top-10 z-50 w-56 rounded border border-border bg-card p-2 shadow-lg space-y-1 text-[10px] text-textSecondary">
           <p>{node.info}</p>
-          <p>Input: {node.inputType}</p>
-          <p>Output: {node.outputType}</p>
+          <p>In: <span className="text-text">{node.inputType}</span></p>
+          <p>Out: <span className="text-text">{node.outputType}</span></p>
         </div>
       )}
       <div className="mt-2 grid grid-cols-2 gap-1 text-[11px]">

@@ -59,6 +59,37 @@ const PARAM_SCHEMAS: Record<string, ParamField[]> = {
     { key: 'expect_status', label: 'Expected Status', type: 'number' },
   ],
   spawn_child_drone: [{ key: 'max_children', label: 'Max Children', type: 'number', min: 1, max: 10 }],
+  lateral_move: [
+    { key: 'host', label: 'Target Host', type: 'text', placeholder: '10.0.0.1' },
+    { key: 'port', label: 'Port', type: 'number', min: 1, max: 65535 },
+    { key: 'method', label: 'Method', type: 'select', options: ['tcp_probe', 'smb_pivot', 'rdp_trace', 'ssh_hop', 'winrm'] },
+  ],
+  credential_probe: [
+    { key: 'host', label: 'Host Context', type: 'text', placeholder: 'local' },
+    { key: 'scope', label: 'Scope', type: 'select', options: ['env', 'files', 'both'] },
+  ],
+  confront_intruder: [
+    { key: 'ip', label: 'Target IP', type: 'text' },
+    { key: 'strategy', label: 'Strategy', type: 'select', options: ['bidirectional_block', 'counter-lateral-quarantine', 'active-containment', 'sinkhole'] },
+  ],
+  manage_service: [
+    { key: 'service_name', label: 'Service Name', type: 'text' },
+    { key: 'action', label: 'Action', type: 'select', options: ['start', 'stop', 'restart', 'status', 'create', 'delete'] },
+  ],
+  manage_systemd_unit: [
+    { key: 'unit', label: 'Unit', type: 'text', placeholder: 'nginx.service' },
+    { key: 'action', label: 'Action', type: 'select', options: ['start', 'stop', 'restart', 'enable', 'disable', 'status'] },
+  ],
+  ptrace_inspect: [{ key: 'pid', label: 'PID', type: 'number', min: 1 }],
+  inotify_watch: [
+    { key: 'path', label: 'Watch Path', type: 'text', placeholder: '/etc' },
+    { key: 'flags', label: 'Flags', type: 'select', options: ['CLOSE_WRITE', 'ATTRIB', 'CREATE', 'DELETE', 'MODIFY', 'ALL'] },
+  ],
+  snapshot_vss: [{ key: 'volume', label: 'Volume', type: 'text', placeholder: 'C:\\' }],
+  load_driver: [
+    { key: 'driver_path', label: 'Driver Path', type: 'text' },
+    { key: 'driver_name', label: 'Driver Name', type: 'text' },
+  ],
   self_destruct: [
     { key: 'secure_wipe', label: 'Secure Wipe', type: 'boolean' },
     { key: 'wipe_memory', label: 'Wipe Memory', type: 'boolean' },
