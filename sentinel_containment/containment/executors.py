@@ -327,25 +327,78 @@ class ContainmentActionExecutor:
 
     def _forensic_snapshot_metadata(self, host: str, payload: dict[str, Any]) -> ActionExecutionResult:
         snapshot_dir = self._state_file(payload, "forensic_snapshot_dir", "forensic_snapshots")
+        snapshot_profile = str(payload.get("forensic_snapshot_profile", "live")).strip().lower()
+        if snapshot_profile not in {"live", "vss"}:
+            snapshot_profile = "live"
+
+        if not self.active_mode:
+            return ActionExecutionResult(
+                action="forensic_snapshot_metadata",
+                status="simulated",
+                details={
+                    "host": host,
+                    "snapshot_dir": str(snapshot_dir),
+                    "snapshot_profile": snapshot_profile,
+                    "reason": "inactive_mode",
+                },
+            )
+
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         snapshot = snapshot_dir / f"snapshot-{host}-{timestamp}.json"
 
         process_capture = self._safe_run(["ps", "-eo", "pid,ppid,user,comm,args"], timeout_seconds=8)
         net_capture = self._safe_run(["sh", "-c", "ss -tunap 2>/dev/null || netstat -an 2>/dev/null || true"], timeout_seconds=8)
+        files_capture = self._safe_run(["sh", "-c", "find /etc /var/log -maxdepth 2 -type f -printf '%TY-%Tm-%TdT%TH:%TM:%TS %p\n' 2>/dev/null | head -n 200"], timeout_seconds=10)
+
+        indicator_terms = [str(v).strip() for v in payload.get("forensic_indicators", []) if str(v).strip()]
+        stage_hints = [str(v).strip() for v in payload.get("attack_stages", []) if str(v).strip()]
+        branch_seed = stage_hints or ["initial_access", "execution", "privilege_escalation", "persistence"]
+        escalation_branches = [
+            {
+                "block_id": f"brain-block-{idx + 1}",
+                "stage": stage,
+                "evidence_terms": indicator_terms[:5],
+            }
+            for idx, stage in enumerate(branch_seed[:8])
+        ]
+
+        if snapshot_profile == "vss":
+            process_table = process_capture.stdout.splitlines()[:120]
+            network_sockets = net_capture.stdout.splitlines()[:120]
+            file_inventory = files_capture.stdout.splitlines()[:200]
+        else:
+            process_table = process_capture.stdout.splitlines()[:500]
+            network_sockets = net_capture.stdout.splitlines()[:500]
+            file_inventory = files_capture.stdout.splitlines()[:400]
+
         payload_doc = {
             "host": host,
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "collector": "containment_executor",
-            "process_table": process_capture.stdout.splitlines()[:500],
-            "network_sockets": net_capture.stdout.splitlines()[:500],
+            "snapshot_profile": snapshot_profile,
+            "process_table": process_table,
+            "network_sockets": network_sockets,
+            "file_inventory": file_inventory,
+            "brain_privilege_escalation_path": {
+                "mode": "defensive_model",
+                "auto_branching": True,
+                "branches": escalation_branches,
+            },
             "metadata": {k: v for k, v in payload.items() if k != "forensic_snapshot_dir"},
         }
         snapshot.write_text(json.dumps(payload_doc, indent=2, sort_keys=True), encoding="utf-8")
         return ActionExecutionResult(
             action="forensic_snapshot_metadata",
             status="executed",
-            details={"snapshot_path": str(snapshot), "process_rows": len(payload_doc["process_table"]), "socket_rows": len(payload_doc["network_sockets"])},
+            details={
+                "snapshot_path": str(snapshot),
+                "snapshot_profile": snapshot_profile,
+                "process_rows": len(payload_doc["process_table"]),
+                "socket_rows": len(payload_doc["network_sockets"]),
+                "file_inventory_rows": len(payload_doc["file_inventory"]),
+                "branch_count": len(escalation_branches),
+            },
         )
 
     def _kill_active_model_sessions(self, host: str, payload: dict[str, Any]) -> ActionExecutionResult:
@@ -508,6 +561,17 @@ class ContainmentActionExecutor:
 
     def _revoke_rotate_api_keys(self, host: str, payload: dict[str, Any]) -> ActionExecutionResult:
         registry = self._state_file(payload, "api_key_registry_path", "api_keys.json")
+        if not self.active_mode:
+            return ActionExecutionResult(
+                action="revoke_rotate_api_keys",
+                status="simulated",
+                details={
+                    "host": host,
+                    "registry_path": str(registry),
+                    "reason": "inactive_mode",
+                },
+            )
+
         registry.parent.mkdir(parents=True, exist_ok=True)
         doc: dict[str, Any] = {"active_keys": [], "revoked_keys": []}
         if registry.exists():

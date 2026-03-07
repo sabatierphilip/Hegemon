@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, g, jsonify, render_template_string, request
 
+from sentinel_containment.brain_scanner import MultiByteThreatScanner
 from sentinel_containment.config import Settings
 from sentinel_containment.runtime import SentinelRuntime
 
@@ -184,6 +185,9 @@ HTML = """
     .pill { font-size: 11px; border-radius: 999px; padding: 2px 8px; background: #2a3a68; margin-right: 5px; }
     .small { font-size: 12px; }
     .json { max-height: 280px; overflow: auto; background: #0f1528; border: 1px solid #283354; border-radius: 8px; padding: 8px; }
+    .brain-board { display:flex; gap:8px; flex-wrap:wrap; min-height:48px; padding:6px; background:#0f1528; border:1px dashed #2f4383; border-radius:10px; }
+    .brain-block { cursor:grab; user-select:none; font-size:12px; border-radius:8px; border:1px solid #3e5393; background:#1f2c52; color:#d8e2ff; padding:6px 10px; }
+    .brain-block.dragging { opacity: 0.6; }
   </style>
 </head>
 <body>
@@ -276,6 +280,25 @@ HTML = """
         {% endfor %}
         {% if not attack_chains %}<div class=\"small muted\">No multi-stage attack chains detected in current time window.</div>{% endif %}
       </div>
+
+      <div class="panel">
+        <h3>Containment Brain Builder</h3>
+        <div class="small">Drag stages to model defensive privilege-escalation risk paths and auto-branch response order.</div>
+        <button id="brain-scan-btn" style="margin-top:8px;padding:6px 10px;background:#173b5e;color:#d9f2ff;border:1px solid #2b6b9d;border-radius:8px;cursor:pointer;">Run Advanced MBT Scanner</button>
+        <div class="json" style="margin-top:8px;"><pre id="brain-scan-output">Scanner idle.</pre></div>
+        <div id="brain-board" class="brain-board" style="margin-top:8px;">
+          {% for c in attack_chains %}
+            {% for s in c.stages %}
+            <div class="brain-block" draggable="true" data-host="{{ c.host }}" data-stage="{{ s }}">{{ c.host }} · {{ s }}</div>
+            {% endfor %}
+          {% endfor %}
+          <div class="brain-block" draggable="true" data-host="scanner" data-stage="mbt_scanner">scanner · advanced_mbt_scanner</div>
+          {% if not attack_chains %}
+            <div class="small muted">No attack stages available for drag-and-drop modeling.</div>
+          {% endif %}
+        </div>
+      </div>
+
     </div>
 
     <div>
@@ -421,6 +444,18 @@ async function runIncidentDrill(){
   updateDecisionUI(payload);
 }
 
+async function runBrainScanner(){
+  const out=document.getElementById("brain-scan-output");
+  if(out){out.textContent="Running advanced MBT scanner...";}
+  try{
+    const resp=await fetch("/api/brain/scanner/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:true,max_files:350})});
+    const payload=await resp.json();
+    if(out){out.textContent=JSON.stringify(payload,null,2);}
+  }catch(err){
+    if(out){out.textContent=`Scanner failed: ${String(err)}`;}
+  }
+}
+
 async function updateHumanGate(required){
   const status=document.getElementById("human-gate-status");
   const resp=await fetch("/api/human-gate/toggle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({human_required:required})});
@@ -432,7 +467,28 @@ async function updateHumanGate(required){
   }
 }
 
+function initializeBrainBuilder(){
+  const board=document.getElementById("brain-board");
+  if(!board){return;}
+  let dragging=null;
+  board.querySelectorAll(".brain-block").forEach((block)=>{
+    block.addEventListener("dragstart",()=>{dragging=block; block.classList.add("dragging");});
+    block.addEventListener("dragend",()=>{block.classList.remove("dragging"); dragging=null;});
+  });
+  board.addEventListener("dragover",(event)=>{
+    event.preventDefault();
+    const target=event.target?.closest?.(".brain-block");
+    if(!dragging || !target || target===dragging){return;}
+    const rect=target.getBoundingClientRect();
+    const before=(event.clientX-rect.left) < rect.width/2;
+    if(before){ board.insertBefore(dragging,target); }
+    else if(target.nextSibling){ board.insertBefore(dragging,target.nextSibling); }
+    else { board.appendChild(dragging); }
+  });
+}
+
 document.getElementById("run-btn")?.addEventListener("click",startWithPermission);
+document.getElementById("brain-scan-btn")?.addEventListener("click",runBrainScanner);
 document.getElementById("drill-btn")?.addEventListener("click",runIncidentDrill);
 document.getElementById("containment-yes")?.addEventListener("click",()=>decideContainment(true));
 document.getElementById("containment-no")?.addEventListener("click",()=>decideContainment(false));
@@ -444,7 +500,7 @@ document.getElementById("containment-live-toggle")?.addEventListener("change",(e
   const target=event.target;
   updateContainmentLiveMode(Boolean(target && target.checked));
 });
-window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap();});
+window.addEventListener("load",()=>{loadHumanGateStatus(); loadContainmentLiveStatus(); promptHardwareKeyBootstrap(); initializeBrainBuilder();});
 </script>
 </body>
 </html>
@@ -725,6 +781,35 @@ def hardware_key_auto_configure():
     if _runtime is None:
         return jsonify({"required": True, "configured": False, "completed": False, "details": ["runtime_not_initialized"]}), 503
     return jsonify(_runtime.auto_configure_hardware_keys(configure_value))
+
+
+@app.post("/api/brain/scanner/scan")
+def api_brain_scanner_scan():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, error = _safe_json_payload()
+    if error:
+        return error
+    run_value = payload.get("run", False)
+    if not isinstance(run_value, bool):
+        return jsonify({"error": "invalid_payload", "message": "run must be a boolean"}), 400
+    if not run_value:
+        return jsonify({"completed": False, "message": "scan_not_requested"})
+
+    max_files = payload.get("max_files", 350)
+    try:
+        max_files_int = max(1, min(2000, int(max_files)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid_payload", "message": "max_files must be an integer"}), 400
+
+    settings = Settings.load()
+    scan_root = Path(str(settings.get("brain_scanner_root", "."))).resolve()
+    scanner = MultiByteThreatScanner()
+    result = scanner.scan_path(scan_root, max_files=max_files_int)
+    result["completed"] = True
+    result["scan_root"] = str(scan_root)
+    return jsonify(result)
 
 
 @app.get("/api/readiness")

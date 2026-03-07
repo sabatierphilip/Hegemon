@@ -133,6 +133,71 @@ def test_web_auth_and_redaction_controls(auth_headers, monkeypatch):
     assert graph_payload["edges"] == 1
 
 
+def test_dashboard_renders_containment_brain_builder(auth_headers, monkeypatch):
+    monkeypatch.setattr(
+        "sentinel_containment.web.app._load_latest_state",
+        lambda: {
+            "attack_chains": [
+                {"host": "brain-host", "severity": 91, "summary": "chain", "confidence": 0.8, "stages": ["initial_access", "privilege_escalation"]}
+            ],
+            "severity_alerts": [],
+            "graph_anomalies": [],
+            "correlated": {},
+            "contained_hosts": [],
+            "soar_actions": [],
+            "topology": {},
+            "containment_decision": {},
+        },
+    )
+
+    client = app.test_client()
+    resp = client.get("/", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "Containment Brain Builder" in body
+    assert "brain-block" in body
+    assert "Run Advanced MBT Scanner" in body
+    assert "advanced_mbt_scanner" in body
+
+
+def test_brain_scanner_api_runs(tmp_path: Path, auth_headers):
+    cfg = {
+        "telemetry_index_path": str(tmp_path / "telemetry_index.jsonl"),
+        "latest_state_path": str(tmp_path / "latest_state.json"),
+        "rules_path": str(tmp_path / "rules"),
+        "brain_scanner_root": str(tmp_path / "scan-root"),
+        "ingestion": {
+            "cloudtrail_file": str(tmp_path / "cloudtrail.jsonl"),
+            "network_flow_file": str(tmp_path / "network_flows.jsonl"),
+            "model_api_file": str(tmp_path / "model_api.jsonl"),
+            "kernel_events_file": str(tmp_path / "kernel_events.jsonl"),
+            "runtime_events_file": str(tmp_path / "runtime_events.jsonl"),
+            "osquery_file": str(tmp_path / "osquery_events.jsonl"),
+            "hypervisor_events_file": str(tmp_path / "hypervisor_events.jsonl"),
+            "counterclone_events_file": str(tmp_path / "counterclone_events.jsonl"),
+            "syslog_port": 0,
+            "kernel_webhook_port": 0,
+        },
+    }
+    (tmp_path / "rules").mkdir()
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    (scan_root / "x.py").write_text("exec('1')\n", encoding="utf-8")
+
+    runtime = SentinelRuntime(Settings(cfg))
+    set_runtime(runtime)
+    client = app.test_client()
+
+    resp = client.post("/api/brain/scanner/scan", json={"run": True, "max_files": 50}, headers=auth_headers)
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["completed"] is True
+    assert payload["scanner"] == "multi_byte_threat_scanner"
+    assert payload["scanned_files"] >= 1
+
+    runtime.ingestion_service.stop()
+
+
 def test_input_validation_rejects_malformed_payload(auth_headers):
     client = app.test_client()
 
