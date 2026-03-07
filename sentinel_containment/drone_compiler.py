@@ -84,7 +84,7 @@ _state = {{
 }}
 _stop = threading.Event()
 
-NODES = {json.dumps(nodes, ensure_ascii=False)}
+NODES = {repr(nodes)}
 START_NODE = {start_node!r}
 
 
