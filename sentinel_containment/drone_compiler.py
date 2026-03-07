@@ -42,7 +42,7 @@ class DroneBlobCompiler:
             for n in drone.behaviour.nodes
         }
         start_node = next((n.node_id for n in drone.behaviour.nodes if n.kind == "on_launch"), drone.behaviour.nodes[0].node_id if drone.behaviour.nodes else "")
-        deadrop = f"/tmp/.hg_drop_{drone.drone_id.replace('drone-', '')}"
+        deadrop = f"data/drones/{drone.drone_id}/deadrop"
         report_endpoint = "http://127.0.0.1:5000/api/drones/report"
         payload_literal = repr(getattr(drone, 'payload', {}) or {})
         vuln_sigs_literal = repr(embedded_intel.get('vuln_sigs', []) or [])
@@ -50,6 +50,7 @@ class DroneBlobCompiler:
         port_risk_literal = repr(embedded_intel.get('port_risk', {}) or {})
         script = f'''
 import os, sys, socket, time, json, hashlib, hmac, zlib, base64, threading, subprocess, pathlib, datetime, math, re, struct, shutil, ipaddress
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 DRONE_ID = {drone.drone_id!r}
 DRONE_NAME = {drone.name!r}
@@ -60,7 +61,6 @@ TTL_SECONDS = {int(drone.ttl_seconds)}
 CHECKIN_SECS = {int(drone.checkin_interval_seconds)}
 REPORT_ENDPOINT = {report_endpoint!r}
 DEADROP_PATH = {deadrop!r}
-PRIVATE_KEY_HEX = {private_key_hex!r}
 PUBLIC_KEY_HEX = {str(drone.keypair_public or '')!r}
 LAUNCH_TIME = 0.0
 SCRIPT_HASH = {hashlib.sha256((drone.drone_id + drone.name).encode()).hexdigest()!r}
@@ -93,22 +93,30 @@ START_NODE = {start_node!r}
 
 
 def _sign(payload: bytes) -> str:
-    return hmac.new(bytes.fromhex(PRIVATE_KEY_HEX[:64]), payload, hashlib.sha256).hexdigest()
+    return hmac.new(bytes.fromhex(_private_key_hex()[:64]), payload, hashlib.sha256).hexdigest()
 
 def _verify(payload: bytes, sig: str) -> bool:
     return hmac.compare_digest(_sign(payload), sig)
 
-def _xor_encrypt(data: bytes, key: bytes) -> bytes:
-    key_cycle = (key * (len(data) // len(key) + 1))[:len(data)]
-    return bytes(a ^ b for a, b in zip(data, key_cycle))
+def _private_key_hex() -> str:
+    key = os.environ.get('HG_DRONE_KEY_HEX', '').strip()
+    if len(key) < 64:
+        raise RuntimeError('missing HG_DRONE_KEY_HEX')
+    return key
+
+def _aes_key() -> bytes:
+    return hashlib.sha256(bytes.fromhex(_private_key_hex()[:64])).digest()
 
 def _write_deadrop(findings, telemetry):
+    p = pathlib.Path(DEADROP_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({{"findings": findings, "telemetry": telemetry, "drone_id": DRONE_ID, "ts": time.time()}}).encode()
-    key = bytes.fromhex(PRIVATE_KEY_HEX[:32])
-    encrypted = _xor_encrypt(payload, key)
+    nonce = os.urandom(12)
+    encrypted = AESGCM(_aes_key()).encrypt(nonce, payload, None)
     sig = _sign(encrypted)
-    envelope = base64.b64encode(json.dumps({{"sig": sig, "data": base64.b64encode(encrypted).decode()}}).encode()).decode()
-    pathlib.Path(DEADROP_PATH).write_text(envelope, encoding="utf-8")
+    envelope = base64.b64encode(json.dumps({{"sig": sig, "nonce": base64.b64encode(nonce).decode(), "data": base64.b64encode(encrypted).decode()}}).encode()).decode()
+    p.write_text(envelope, encoding="utf-8")
+    os.chmod(p, 0o600)
 
 
 def _read_deadrop(path: str):
@@ -119,8 +127,8 @@ def _read_deadrop(path: str):
     encrypted = base64.b64decode(env.get('data', ''))
     if not _verify(encrypted, str(env.get('sig', ''))):
         return None
-    key = bytes.fromhex(PRIVATE_KEY_HEX[:32])
-    plain = _xor_encrypt(encrypted, key)
+    nonce = base64.b64decode(env.get('nonce', ''))
+    plain = AESGCM(_aes_key()).decrypt(nonce, encrypted, None)
     return json.loads(plain.decode('utf-8', errors='ignore'))
 
 
@@ -137,7 +145,9 @@ def _append(msg, **extra):
     row = {{'ts': time.time(), 'message': msg, **extra}}
     row['signature'] = _sign(json.dumps(row, sort_keys=True).encode())
     _state['telemetry'].append(row)
+    _state['telemetry'] = _state['telemetry'][-500:]
     _state['live_output'].append(msg)
+    _state['live_output'] = _state['live_output'][-500:]
     print(msg, flush=True)
 
 def _adaptive_wait(params):
@@ -295,9 +305,12 @@ def _execute(node_id):
         return _next_node(node)
     if kind == 'spawn_child_drone':
         if AUTONOMY == 'enforce' and DRONE_TIER == 'autonomous' and CHILD_DRONE_BLOB and len(_state['child_drone_ids']) < 3:
-            p = pathlib.Path(os.getcwd()) / f"child_{{int(time.time())}}.py"
+            child_dir = pathlib.Path(__file__).resolve().parent / 'children'
+            child_dir.mkdir(parents=True, exist_ok=True)
+            p = child_dir / f"child_{{int(time.time())}}.py"
             src = zlib.decompress(base64.b64decode(CHILD_DRONE_BLOB.encode())).decode()
             p.write_text(src, encoding='utf-8')
+            os.chmod(p, 0o700)
             proc = subprocess.Popen([sys.executable, str(p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             _state['child_drone_ids'].append(proc.pid)
         return _next_node(node)
@@ -401,17 +414,19 @@ def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, d
     script_path = workdir / "drone.py"
     script_path.write_text(source, encoding="utf-8")
     os.chmod(script_path, 0o700)
+    proc_env = {**os.environ, "HG_DRONE_KEY_HEX": private_key_hex}
     if detached:
         return subprocess.Popen(
             [sys.executable, str(script_path)],
             cwd=str(workdir),
+            env=proc_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
         )
-    return subprocess.Popen([sys.executable, str(script_path)], cwd=str(workdir), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.Popen([sys.executable, str(script_path)], cwd=str(workdir), env=proc_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def deploy_blob_remote(blob_b64: str, private_key_hex: str, host: str, ssh_key_path: str, remote_workdir: str) -> dict[str, Any]:

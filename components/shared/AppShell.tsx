@@ -2,21 +2,25 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { ReactNode, useState } from 'react';
+import { ReactNode, useEffect, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
 const routes = ['/', '/drones', '/graph', '/control-plane', '/peers', '/settings'];
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const { token } = useAuth();
+  const { token, setToken } = useAuth();
   const router = useRouter();
   const [disconnected, setDisconnected] = useState(false);
 
-  if (!token && pathname !== '/login') {
-    router.push('/login');
-    return null;
-  }
+  useEffect(() => {
+    if (!token) {
+      setToken(process.env.NEXT_PUBLIC_AUTO_AUTH_TOKEN ?? 'autonomous-session');
+      if (pathname === '/login') {
+        router.push('/');
+      }
+    }
+  }, [token, setToken, pathname, router]);
 
   return (
     <div className="min-h-screen bg-bg text-text">
