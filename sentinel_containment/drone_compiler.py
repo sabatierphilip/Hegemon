@@ -111,10 +111,18 @@ def _write_deadrop(findings, telemetry):
     p = pathlib.Path(DEADROP_PATH)
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({{"findings": findings, "telemetry": telemetry, "drone_id": DRONE_ID, "ts": time.time()}}).encode()
+    aad = f"{{DRONE_ID}}:deadrop:v3:aes-256-gcm".encode()
     nonce = os.urandom(12)
-    encrypted = AESGCM(_aes_key()).encrypt(nonce, payload, None)
+    encrypted = AESGCM(_aes_key()).encrypt(nonce, payload, aad)
     sig = _sign(encrypted)
-    envelope = base64.b64encode(json.dumps({{"sig": sig, "nonce": base64.b64encode(nonce).decode(), "data": base64.b64encode(encrypted).decode()}}).encode()).decode()
+    envelope = base64.b64encode(json.dumps({{
+        "v": 3,
+        "alg": "AES-256-GCM",
+        "aad": base64.b64encode(aad).decode(),
+        "sig": sig,
+        "nonce": base64.b64encode(nonce).decode(),
+        "data": base64.b64encode(encrypted).decode(),
+    }}).encode()).decode()
     p.write_text(envelope, encoding="utf-8")
     os.chmod(p, 0o600)
 
@@ -124,11 +132,14 @@ def _read_deadrop(path: str):
     if not p.exists():
         return None
     env = json.loads(base64.b64decode(p.read_text(encoding='utf-8')).decode())
+    if str(env.get('alg', '')).upper() != 'AES-256-GCM':
+        return None
     encrypted = base64.b64decode(env.get('data', ''))
     if not _verify(encrypted, str(env.get('sig', ''))):
         return None
     nonce = base64.b64decode(env.get('nonce', ''))
-    plain = AESGCM(_aes_key()).decrypt(nonce, encrypted, None)
+    aad = base64.b64decode(env.get('aad', '')) if env.get('aad') else f"{{DRONE_ID}}:deadrop:v3:aes-256-gcm".encode()
+    plain = AESGCM(_aes_key()).decrypt(nonce, encrypted, aad)
     return json.loads(plain.decode('utf-8', errors='ignore'))
 
 

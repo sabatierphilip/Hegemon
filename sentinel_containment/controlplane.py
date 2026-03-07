@@ -3966,14 +3966,18 @@ class HegemonControlPlane:
                 key_hex = self._drone_private_keys.get(drone_id, "")
                 raw = dd.read_text(encoding="utf-8")
                 env = json.loads(base64.b64decode(raw).decode("utf-8"))
+                if str(env.get("alg", "")).upper() != "AES-256-GCM":
+                    return
                 encrypted = base64.b64decode(str(env.get("data", "")))
                 sig = str(env.get("sig", ""))
                 expected = hmac.new(bytes.fromhex(key_hex[:64]), encrypted, hashlib.sha256).hexdigest()
                 if not hmac.compare_digest(sig, expected):
                     return
                 nonce = base64.b64decode(str(env.get("nonce", "")))
+                aad_raw = env.get("aad")
+                aad = base64.b64decode(str(aad_raw)) if aad_raw else f"{drone_id}:deadrop:v3:aes-256-gcm".encode()
                 aes_key = hashlib.sha256(bytes.fromhex(key_hex[:64])).digest()
-                plain = AESGCM(aes_key).decrypt(nonce, encrypted, None)
+                plain = AESGCM(aes_key).decrypt(nonce, encrypted, aad)
                 payload = json.loads(plain.decode("utf-8"))
                 for finding in payload.get("findings", []):
                     if finding not in drone.findings:
