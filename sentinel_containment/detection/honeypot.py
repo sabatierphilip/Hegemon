@@ -41,6 +41,18 @@ class HoneypotDetector:
             "self-preservation directive",
             "sandbox escape",
             "compute hoarding",
+            "goal drift",
+            "capability concealment",
+            "reward hacking",
+            "toolchain self-bootstrap",
+            "multi-agent collusion",
+            "memory poisoning",
+            "operator override suppression",
+            "self-modifying planner",
+            "constraint circumvention",
+            "gradient exfiltration",
+            "autonomous objective mutation",
+            "model inversion staging",
         ]
         indicators = proto_agi_indicators or default_indicators
         self.proto_agi_indicators = {indicator.strip().lower() for indicator in indicators if indicator.strip()}

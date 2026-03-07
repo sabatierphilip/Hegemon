@@ -435,6 +435,56 @@ class HegemonControlPlane:
         "00001001": "tighten_checkin",
         "00001010": "broadcast_status",
     }
+    DRONE_SAMPLE_PROFILES: dict[str, dict[str, Any]] = {
+        "gnat-light": {
+            "sample_id": "gnat-light",
+            "name": "Gnat (Swarm Scout)",
+            "tier": "controlled",
+            "mission": "scout",
+            "autonomy_level": "observe",
+            "ttl_seconds": 1200,
+            "checkin_interval_seconds": 20,
+            "target": "10.0.0.0/24",
+            "behaviour_id": "brain-pinger-basic",
+            "description": "Lightweight swarm probe with rapid report/exit cadence.",
+        },
+        "specter-adaptive": {
+            "sample_id": "specter-adaptive",
+            "name": "Specter (Adaptive ISR)",
+            "tier": "autonomous",
+            "mission": "watch-loop",
+            "autonomy_level": "contain",
+            "ttl_seconds": 10800,
+            "checkin_interval_seconds": 45,
+            "target": "ep-default-linux",
+            "behaviour_id": "brain-watcher",
+            "description": "Persistent adaptive observer with repeat + anomaly escalation.",
+        },
+        "carrier-relay": {
+            "sample_id": "carrier-relay",
+            "name": "Carrier (Drone Hub)",
+            "tier": "tethered",
+            "mission": "probe",
+            "autonomy_level": "contain",
+            "ttl_seconds": 7200,
+            "checkin_interval_seconds": 90,
+            "target": "10.0.1.0/24",
+            "behaviour_id": "brain-sentinel-honeypot",
+            "description": "Deploy-and-coordinate platform for linked child routes.",
+        },
+        "oracle-fusion": {
+            "sample_id": "oracle-fusion",
+            "name": "Oracle (Fusion Analyst)",
+            "tier": "autonomous",
+            "mission": "watch-loop",
+            "autonomy_level": "enforce",
+            "ttl_seconds": 14400,
+            "checkin_interval_seconds": 60,
+            "target": "ep-default-linux",
+            "behaviour_id": "brain-watcher",
+            "description": "Telemetry fusion observer tuned for high-confidence escalation.",
+        },
+    }
 
     def __init__(self, ledger_path: Path | None = None) -> None:
         signer = signing.SigningKey.generate()
@@ -3546,6 +3596,96 @@ class HegemonControlPlane:
         ]
         port_risk = {22: 0.3, 23: 0.9, 3389: 0.8, 6379: 0.7, 27017: 0.8}
         return {"vuln_sigs": vuln_sigs[:50], "attack_patterns": attack_patterns, "port_risk": port_risk, "known_banners": []}
+
+    def drone_sample_catalog(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for sample_id, profile in self.DRONE_SAMPLE_PROFILES.items():
+            behaviour_id = str(profile.get("behaviour_id", ""))
+            brain = self.drone_brains.get(behaviour_id)
+            rows.append({
+                **dict(profile),
+                "sample_id": sample_id,
+                "brain_name": brain.name if brain is not None else behaviour_id,
+                "available": brain is not None,
+            })
+        return rows
+
+    def _split_destination(self, destination: str | None) -> tuple[str | None, str | None, str | None]:
+        target = str(destination or "").strip()
+        if not target:
+            return None, None, None
+        if target in self.endpoints:
+            endpoint = self.endpoints.get(target)
+            return target, endpoint.host_name if endpoint is not None else None, None
+        if "/" in target:
+            return None, None, target
+        return None, target, None
+
+    def assemble_sample_drone(self, sample_id: str, *, destination: str | None = None, actor: str = "user", name_override: str | None = None, payload: Any = None) -> Drone:
+        profile = self.DRONE_SAMPLE_PROFILES.get(sample_id)
+        if profile is None:
+            raise ValueError("unknown sample drone")
+        behaviour_id = str(profile.get("behaviour_id", ""))
+        if behaviour_id not in self.drone_brains:
+            raise ValueError("sample behaviour unavailable")
+        target_endpoint_id, target_host, target_network = self._split_destination(destination or str(profile.get("target", "")))
+        final_payload = payload if payload is not None else {
+            "sample_id": sample_id,
+            "description": str(profile.get("description", "")),
+            "destination": destination or str(profile.get("target", "")),
+        }
+        return self.assemble_drone(
+            name=str(name_override or profile.get("name", sample_id)),
+            tier=str(profile.get("tier", "controlled")),
+            mission=str(profile.get("mission", "custom")),
+            behaviour=behaviour_id,
+            target_endpoint_id=target_endpoint_id,
+            target_host=target_host,
+            target_network=target_network,
+            autonomy_level=str(profile.get("autonomy_level", "observe")),
+            ttl_seconds=int(profile.get("ttl_seconds", 3600)),
+            checkin_interval_seconds=int(profile.get("checkin_interval_seconds", 60)),
+            payload=final_payload,
+            actor=actor,
+        )
+
+    def assemble_sample_squad(self, nodes: list[dict[str, Any]], links: list[dict[str, Any]], actor: str = "user") -> list[Drone]:
+        if not nodes:
+            raise ValueError("squad requires at least one node")
+        drone_by_client_id: dict[str, Drone] = {}
+        built: list[Drone] = []
+        for node in nodes:
+            client_id = str(node.get("id", "")).strip()
+            sample_id = str(node.get("sample_id", "")).strip()
+            if not client_id or not sample_id:
+                raise ValueError("each squad node requires id and sample_id")
+            drone = self.assemble_sample_drone(
+                sample_id,
+                destination=str(node.get("destination", "")).strip() or None,
+                actor=actor,
+                name_override=str(node.get("name", "")).strip() or None,
+                payload={
+                    "sample_id": sample_id,
+                    "destination": str(node.get("destination", "")).strip(),
+                    "squad_node_id": client_id,
+                },
+            )
+            drone_by_client_id[client_id] = drone
+            built.append(drone)
+
+        for link in links:
+            src = str(link.get("from_id", "")).strip()
+            dst = str(link.get("to_id", "")).strip()
+            if src in drone_by_client_id and dst in drone_by_client_id:
+                src_drone = drone_by_client_id[src]
+                src_drone.payload = {
+                    **(src_drone.payload if isinstance(src_drone.payload, dict) else {}),
+                    "route_targets": [
+                        *(src_drone.payload.get("route_targets", []) if isinstance(src_drone.payload, dict) else []),
+                        drone_by_client_id[dst].drone_id,
+                    ],
+                }
+        return built
 
     def auto_assemble_drone(self, endpoint_id: str, actor: str) -> Drone | None:
         endpoint = self.endpoints.get(endpoint_id)
