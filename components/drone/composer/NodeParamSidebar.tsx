@@ -59,7 +59,22 @@ const PARAM_SCHEMAS: Record<string, ParamField[]> = {
     { key: 'expect_status', label: 'Expected Status', type: 'number' },
   ],
   spawn_child_drone: [{ key: 'max_children', label: 'Max Children', type: 'number', min: 1, max: 10 }],
-  self_destruct: [{ key: 'secure_wipe', label: 'Secure Wipe', type: 'boolean' }],
+  self_destruct: [
+    { key: 'secure_wipe', label: 'Secure Wipe', type: 'boolean' },
+    { key: 'wipe_memory', label: 'Wipe Memory', type: 'boolean' },
+    { key: 'wipe_deadrops', label: 'Purge Deadrops', type: 'boolean' },
+    { key: 'revoke_tokens', label: 'Revoke Tokens', type: 'boolean' },
+    { key: 'seconds', label: 'Delay Before Destruct (s)', type: 'number', min: 1 },
+  ],
+  logical_and: [{ key: 'conditions', label: 'Condition Count', type: 'number', min: 2 }],
+  logical_or: [{ key: 'conditions', label: 'Condition Count', type: 'number', min: 2 }],
+  logical_xor: [{ key: 'conditions', label: 'Condition Count', type: 'number', min: 2 }],
+  logical_not: [{ key: 'op', label: 'Operator', type: 'select', options: ['not'] }],
+  expr_check: [
+    { key: 'field', label: 'Field Path', type: 'text', placeholder: 'telemetry.findings' },
+    { key: 'operator', label: 'Operator', type: 'select', options: ['==', '!=', '>=', '<=', '>', '<'] },
+    { key: 'value', label: 'Expected Value', type: 'text' },
+  ],
   self_destruct_on_findings: [{ key: 'threshold', label: 'Findings Threshold', type: 'number', min: 1 }],
   tighten_checkin: [
     { key: 'threshold', label: 'Trigger at findings >', type: 'number', min: 1 },

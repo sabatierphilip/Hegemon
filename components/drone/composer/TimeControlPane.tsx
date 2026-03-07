@@ -1,6 +1,7 @@
 'use client';
 
-import { Clock } from 'lucide-react';
+import { Clock, Info } from 'lucide-react';
+import { useState } from 'react';
 import { ComposerState } from '@/types/composer';
 
 const PRESETS = {
@@ -16,15 +17,16 @@ const PRESETS = {
 };
 
 const TIMER_NODES = [
-  { kind: 'wait', params: { seconds: 30 }, label: 'Wait 30s' },
-  { kind: 'wait', params: { seconds: 60 }, label: 'Wait 60s' },
-  { kind: 'wait', params: { seconds: 300 }, label: 'Wait 5m' },
-  { kind: 'wait', params: { seconds: 600 }, label: 'Wait 10m' },
-  { kind: 'adaptive_wait', params: { base_seconds: 60, adaptive: true }, label: 'Adaptive Wait' },
-  { kind: 'checkin_interval', params: { use_checkin: true }, label: 'Checkin Interval' },
+  { kind: 'wait', params: { seconds: 30 }, label: 'Wait 30s', inputType: 'control_signal', outputType: 'delayed_control_signal' },
+  { kind: 'wait', params: { seconds: 60 }, label: 'Wait 60s', inputType: 'control_signal', outputType: 'delayed_control_signal' },
+  { kind: 'wait', params: { seconds: 300 }, label: 'Wait 5m', inputType: 'control_signal', outputType: 'delayed_control_signal' },
+  { kind: 'wait', params: { seconds: 600 }, label: 'Wait 10m', inputType: 'control_signal', outputType: 'delayed_control_signal' },
+  { kind: 'adaptive_wait', params: { base_seconds: 60, adaptive: true }, label: 'Adaptive Wait', inputType: 'feedback_score:number', outputType: 'dynamic_delay:number' },
+  { kind: 'checkin_interval', params: { use_checkin: true }, label: 'Checkin Interval', inputType: 'checkin_seconds:number', outputType: 'delay_seconds:number' },
 ];
 
 export function TimeControlPane({ state, setState }: { state: ComposerState; setState: (fn: (s: ComposerState) => ComposerState) => void }) {
+  const [openInfo, setOpenInfo] = useState<string | null>(null);
   const ttl = state.unlimitedTTL ? 'Unlimited' : `${Math.floor((state.ttlSeconds ?? 300) / 60)}m`;
   const ttlSeconds = state.ttlSeconds ?? 3600;
   const checkinSeconds = Math.max(state.checkinSeconds, 1);
@@ -86,16 +88,25 @@ export function TimeControlPane({ state, setState }: { state: ComposerState; set
         </div>
         <div className="flex flex-wrap gap-1">
           {TIMER_NODES.map((t) => (
-            <div
-              key={t.label}
-              draggable
-              onDragStart={(e) => {
-                e.dataTransfer.setData('application/hegemon-node', JSON.stringify({ kind: t.kind, nodeType: 'timer', defaultParams: t.params }));
-              }}
-              className="cursor-grab rounded border border-info/40 px-2 py-1 text-xs text-info hover:bg-info/10"
-            >
-              <Clock size={8} className="mr-1 inline" />
-              {t.label}
+            <div key={t.label} className="flex items-center gap-1 rounded border border-info/40 px-1 py-1 text-xs text-info hover:bg-info/10">
+              <div
+                draggable
+                onDragStart={(e) => {
+                  e.dataTransfer.setData('application/hegemon-node', JSON.stringify({ kind: t.kind, nodeType: 'timer', defaultParams: t.params }));
+                }}
+                className="cursor-grab"
+              >
+                <Clock size={8} className="mr-1 inline" />
+                {t.label}
+              </div>
+              <button type="button" className="rounded bg-info/10 px-1 py-0.5" onClick={() => setOpenInfo((v) => (v === t.label ? null : t.label))} title="Info">
+                <Info size={10} />
+              </button>
+              {openInfo === t.label && (
+                <div className="max-w-44 text-[10px] text-textSecondary">
+                  Input: {t.inputType}<br />Output: {t.outputType}
+                </div>
+              )}
             </div>
           ))}
         </div>

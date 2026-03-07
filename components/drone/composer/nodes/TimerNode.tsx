@@ -1,3 +1,5 @@
+'use client';
+
 import { Handle, Position, NodeProps } from 'reactflow';
 import { Clock } from 'lucide-react';
 
