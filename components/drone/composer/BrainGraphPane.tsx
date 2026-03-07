@@ -55,14 +55,11 @@ export function BrainGraphPane({
   const [edges, setEdges] = useEdgesState(state.edges);
   const rfInstance = useRef<ReactFlowInstance | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const edgesRef = useRef(edges);
 
   useEffect(() => {
-    setNodes(state.nodes);
-  }, [setNodes, state.nodes]);
-
-  useEffect(() => {
-    setEdges(state.edges);
-  }, [setEdges, state.edges]);
+    edgesRef.current = edges;
+  }, [edges]);
 
   const syncUp = useCallback(
     (newNodes: Node[], newEdges: Edge[]) => {
@@ -103,7 +100,7 @@ export function BrainGraphPane({
       };
 
       const bounds = containerRef.current.getBoundingClientRect();
-      const position = rfInstance.current.project({
+      const position = rfInstance.current.screenToFlowPosition({
         x: e.clientX - bounds.left,
         y: e.clientY - bounds.top,
       });
@@ -119,12 +116,12 @@ export function BrainGraphPane({
 
       setNodes((ns) => {
         const next = [...ns, newNode];
-        syncUp(next, edges);
+        syncUp(next, edgesRef.current);
         return next;
       });
       onSelectNode(newNode.id);
     },
-    [edges, onSelectNode, setNodes, syncUp]
+    [onSelectNode, setNodes, syncUp]
   );
 
   const onNodeClick = useCallback((_: React.MouseEvent, node: Node) => onSelectNode(node.id), [onSelectNode]);

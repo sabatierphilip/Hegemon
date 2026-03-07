@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { Position } from 'reactflow';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -11,6 +11,7 @@ import { TimeControlPane } from './TimeControlPane';
 import { BrainGraphPane } from './BrainGraphPane';
 import { PayloadPane } from './PayloadPane';
 import { MetaBehaviourPane } from './MetaBehaviourPane';
+import { LogicalOperatorsPane } from './LogicalOperatorsPane';
 import { metaBehaviourDefaults } from '@/lib/metaBehaviourDefaults';
 import { apiRequest } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -41,7 +42,7 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
       },
     ],
     edges: [],
-    payload: { action: 'noop' },
+    payload: { action: 'noop', output_format: 'binary_blob' },
     meta: metaBehaviourDefaults,
   });
 
@@ -59,6 +60,17 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
     edges: composer.edges,
     payload: composer.payload,
     meta: composer.meta,
+    artifact_format: 'binary_blob',
+    runtime: {
+      telemetry: {
+        kernel_feed: {
+          provider: 'ebpf',
+          auto_setup: true,
+          mode: 'advanced',
+          fallback: 'kernel_webhook',
+        },
+      },
+    },
   });
 
   const handlePreviewBuild = async () => {
@@ -109,31 +121,29 @@ export function ComposerShell({ drones, endpoints }: { drones: Drone[]; endpoint
     }
   };
 
-  const panes = useMemo(
-    () => [
-      {
-        id: 'entities',
-        title: 'Pane 1 — Entities',
-        content: <EntityPane state={state} setState={setState} endpoints={endpoints} drones={drones} />,
-      },
-      { id: 'time', title: 'Pane 2 — Time Control', content: <TimeControlPane state={state} setState={setState} /> },
-      {
-        id: 'graph',
-        title: 'Pane 3 — Brain Graph',
-        content: (
-          <BrainGraphPane
-            state={state}
-            setState={setState}
-            selectedNodeId={selectedNodeId}
-            onSelectNode={setSelectedNodeId}
-          />
-        ),
-      },
-      { id: 'payload', title: 'Pane 4 — Payload', content: <PayloadPane state={state} setState={setState} /> },
-      { id: 'meta', title: 'Pane 5 — Meta-Behaviour', content: <MetaBehaviourPane /> },
-    ],
-    [state, selectedNodeId, drones, endpoints]
-  );
+  const panes = [
+    {
+      id: 'entities',
+      title: 'Pane 1 — Entities',
+      content: <EntityPane state={state} setState={setState} endpoints={endpoints} drones={drones} />,
+    },
+    { id: 'time', title: 'Pane 2 — Time Control', content: <TimeControlPane state={state} setState={setState} /> },
+    {
+      id: 'graph',
+      title: 'Pane 3 — Brain Graph',
+      content: (
+        <BrainGraphPane
+          state={state}
+          setState={setState}
+          selectedNodeId={selectedNodeId}
+          onSelectNode={setSelectedNodeId}
+        />
+      ),
+    },
+    { id: 'payload', title: 'Pane 4 — Payload', content: <PayloadPane state={state} setState={setState} /> },
+    { id: 'meta', title: 'Pane 5 — Meta-Behaviour', content: <MetaBehaviourPane /> },
+    { id: 'logic', title: 'Pane 6 — Logical Operators', content: <LogicalOperatorsPane /> },
+  ];
 
   const toggle = (id: string) => {
     const next = { ...collapsed, [id]: !collapsed[id] };
