@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from nacl import signing
 
 from signed_ledger import SignedLedger
@@ -524,6 +525,7 @@ class HegemonControlPlane:
         self._drone_compiler = DroneBlobCompiler()
         self._seed_drone_brains()
         self._proposal_approved_at: dict[str, float] = {}
+        self._enforce_approvals: dict[str, set[str]] = {}
         self.scan_history: dict[str, list[ScanResult]] = {}
         self.scan_results_by_id: dict[str, ScanResult] = {}
         self.suppressed_findings: list[dict[str, Any]] = []
@@ -533,6 +535,11 @@ class HegemonControlPlane:
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         entry = self.ledger.append(event_type, payload)
+        if event_type == "drone.enforce_approved":
+            drone_id = str(payload.get("drone_id", "")).strip()
+            approver = str(payload.get("approver", "")).strip()
+            if drone_id and approver:
+                self._enforce_approvals.setdefault(drone_id, set()).add(approver)
         return {"entry_hash": entry.entry_hash, "ts": entry.ts, "event_type": entry.event_type}
 
     def add_friend(self, payload: dict[str, Any], actor: str) -> Friend:
@@ -3113,25 +3120,27 @@ class HegemonControlPlane:
         cache_path = Path("data/intel_cache.shelve")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         now = time.time()
-        try:
-            with shelve.open(str(cache_path)) as db:
-                row = db.get(key)
-                if not row:
-                    return None
-                if now - float(row.get("ts", 0)) > 86400:
-                    return None
-                return row.get("value")
-        except Exception:
-            return None
+        with self._state_lock:
+            try:
+                with shelve.open(str(cache_path)) as db:
+                    row = db.get(key)
+                    if not row:
+                        return None
+                    if now - float(row.get("ts", 0)) > 86400:
+                        return None
+                    return row.get("value")
+            except Exception:
+                return None
 
     def _intel_cache_set(self, key: str, value: Any) -> None:
         cache_path = Path("data/intel_cache.shelve")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with shelve.open(str(cache_path)) as db:
-                db[key] = {"ts": time.time(), "value": value}
-        except Exception:
-            return
+        with self._state_lock:
+            try:
+                with shelve.open(str(cache_path)) as db:
+                    db[key] = {"ts": time.time(), "value": value}
+            except Exception:
+                return
 
     def _query_ghsa(self, package: str, ecosystem: str) -> list[dict[str, Any]]:
         query = {
@@ -3493,9 +3502,10 @@ class HegemonControlPlane:
             raise ValueError("invalid tier")
         if autonomy_level not in {"observe", "contain", "enforce"}:
             raise ValueError("invalid autonomy_level")
-        active_count = len([d for d in self.drones.values() if d.status == "active"])
-        if active_count >= 10:
-            raise ValueError("max active drone thread cap reached")
+        with self._state_lock:
+            active_count = len([d for d in self.drones.values() if d.status == "active"])
+            if active_count >= 10:
+                raise ValueError("max active drone thread cap reached")
         if target_host and target_host not in self._registered_hosts() and autonomy_level != "observe":
             raise ValueError("unregistered external host requires observe autonomy")
         behaviour_obj = self._resolve_behaviour(behaviour)
@@ -3572,7 +3582,7 @@ class HegemonControlPlane:
         )
         drone.blob_size_bytes = len(base64.b64decode(compiled_blob.encode("ascii"))) if compiled_blob else 0
         drone.blob_hash = hashlib.sha256(compiled_blob.encode("utf-8")).hexdigest()[:16] if compiled_blob else ""
-        drone.deadrop_path = f"/tmp/.hg_drop_{drone_id.replace('drone-','')}"
+        drone.deadrop_path = str(Path("data") / "drones" / drone_id / "deadrop")
         self.drones[drone_id] = drone
         self._drone_command_locks[drone_id] = threading.Lock()
         self._record("drone.assembled", {"actor": actor, "drone_id": drone_id, "tier": tier, "mission": mission})
@@ -3726,13 +3736,8 @@ class HegemonControlPlane:
         friend_ok = {f.friend_id for f in self.friends.values() if f.status == "active" and "approve_patches" in f.capabilities}
         if not friend_ok:
             return False
-        for entry in self.audit_log():
-            if entry.get("event_type") != "drone.enforce_approved":
-                continue
-            payload = entry.get("payload", {})
-            if payload.get("drone_id") == drone_id and payload.get("approver") in friend_ok:
-                return True
-        return False
+        cached = self._enforce_approvals.get(drone_id, set())
+        return any(approver in friend_ok for approver in cached)
 
     def launch_drone(self, drone_id: str, actor: str) -> Drone:
         drone = self.drones[drone_id]
@@ -3789,6 +3794,7 @@ class HegemonControlPlane:
         signed_payload = {**payload, "signature": sig}
         if self._verify_telemetry_signature(drone, signed_payload):
             drone.telemetry.append(signed_payload)
+            drone.telemetry = drone.telemetry[-500:]
 
     def _verify_telemetry_signature(self, drone: Drone, payload: dict[str, Any]) -> bool:
         sig = payload.get("signature")
@@ -3814,6 +3820,7 @@ class HegemonControlPlane:
             drone.stats["hosts_pinged"] = int(drone.stats.get("hosts_pinged", 0)) + 1
             line = f"Ping {host} -> {'ALIVE' if ok else 'TIMEOUT'}"
             drone.live_output.append(line)
+            drone.live_output = drone.live_output[-500:]
             self._append_signed_telemetry(drone, line, node_id=node.node_id, success=ok)
             return self._next_node(node)
         if kind == "port_scan":
@@ -3838,6 +3845,7 @@ class HegemonControlPlane:
             drone.stats["ports_scanned"] = int(drone.stats.get("ports_scanned", 0)) + (end - start + 1)
             msg = f"Port scan {host}:{start}-{end} -> {len(open_ports)} open"
             drone.live_output.append(msg)
+            drone.live_output = drone.live_output[-500:]
             self._append_signed_telemetry(drone, msg, open_ports=open_ports)
             return self._next_node(node)
         if kind == "fingerprint_hosts":
@@ -3947,33 +3955,35 @@ class HegemonControlPlane:
         return self._next_node(node)
 
     def _poll_deadrop(self, drone_id: str) -> None:
-        drone = self.drones.get(drone_id)
-        if not drone:
-            return
-        dd = Path(drone.deadrop_path or "")
-        if not dd.exists():
-            return
-        try:
-            key_hex = self._drone_private_keys.get(drone_id, "")
-            raw = dd.read_text(encoding="utf-8")
-            env = json.loads(base64.b64decode(raw).decode("utf-8"))
-            encrypted = base64.b64decode(str(env.get("data", "")))
-            sig = str(env.get("sig", ""))
-            expected = hmac.new(bytes.fromhex(key_hex[:64]), encrypted, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(sig, expected):
+        with self._state_lock:
+            drone = self.drones.get(drone_id)
+            if not drone:
                 return
-            key = bytes.fromhex(key_hex[:32])
-            key_cycle = (key * (len(encrypted) // len(key) + 1))[:len(encrypted)]
-            plain = bytes(a ^ b for a, b in zip(encrypted, key_cycle))
-            payload = json.loads(plain.decode("utf-8"))
-            for finding in payload.get("findings", []):
-                if finding not in drone.findings:
-                    drone.findings.append(finding)
-            drone.telemetry.extend(payload.get("telemetry", []))
-            drone.stats["findings_count"] = len(drone.findings)
-            drone.last_checkin_at = datetime.now(timezone.utc).isoformat()
-        except Exception:
-            return
+            dd = Path(drone.deadrop_path or "")
+            if not dd.exists():
+                return
+            try:
+                key_hex = self._drone_private_keys.get(drone_id, "")
+                raw = dd.read_text(encoding="utf-8")
+                env = json.loads(base64.b64decode(raw).decode("utf-8"))
+                encrypted = base64.b64decode(str(env.get("data", "")))
+                sig = str(env.get("sig", ""))
+                expected = hmac.new(bytes.fromhex(key_hex[:64]), encrypted, hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(sig, expected):
+                    return
+                nonce = base64.b64decode(str(env.get("nonce", "")))
+                aes_key = hashlib.sha256(bytes.fromhex(key_hex[:64])).digest()
+                plain = AESGCM(aes_key).decrypt(nonce, encrypted, None)
+                payload = json.loads(plain.decode("utf-8"))
+                for finding in payload.get("findings", []):
+                    if finding not in drone.findings:
+                        drone.findings.append(finding)
+                drone.telemetry.extend(payload.get("telemetry", []))
+                drone.telemetry = drone.telemetry[-500:]
+                drone.stats["findings_count"] = len(drone.findings)
+                drone.last_checkin_at = datetime.now(timezone.utc).isoformat()
+            except Exception:
+                return
 
     def _drone_monitor(self, drone_id: str, proc: subprocess.Popen) -> None:
         drone = self.drones.get(drone_id)
@@ -3986,10 +3996,12 @@ class HegemonControlPlane:
                 line = proc.stdout.readline()
                 if line:
                     drone.live_output.append(line.decode("utf-8", errors="ignore").strip())
+                    drone.live_output = drone.live_output[-500:]
             if proc.stderr:
                 err = proc.stderr.readline()
                 if err:
                     drone.live_output.append("ERR: " + err.decode("utf-8", errors="ignore").strip())
+                    drone.live_output = drone.live_output[-500:]
             now = time.time()
             if now - last_deadrop_poll > max(1, drone.checkin_interval_seconds):
                 self._poll_deadrop(drone_id)

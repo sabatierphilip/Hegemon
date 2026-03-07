@@ -1,5 +1,10 @@
 from pathlib import Path
 import json
+import hashlib
+import hmac
+import os
+import base64
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import pytest
 
@@ -139,11 +144,14 @@ def test_blob_roundtrip_and_source_decode(tmp_path: Path):
     source = cp.decode_drone_source(drone.drone_id)
     assert "DRONE_ID" in source
     assert drone.drone_id in source
+    assert "PRIVATE_KEY_HEX" not in source
+    assert "HG_DRONE_KEY_HEX" in source
 
 
 def test_autonomous_drone_launches_detached_from_hegemon_io(tmp_path: Path):
     cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
     drone = cp.assemble_drone("FreeAuto", "autonomous", "custom", _mini_behaviour(), actor="tester")
+    assert drone.deadrop_path.endswith("/deadrop")
     cp.launch_drone(drone.drone_id, actor="tester")
 
     proc = cp._drone_processes[drone.drone_id]
@@ -157,11 +165,16 @@ def test_deadrop_polling_merges_payload(tmp_path: Path):
     key_hex = cp._drone_private_keys[drone.drone_id]
     payload = {"findings": ["f1"], "telemetry": [{"message": "hi"}]}
     raw = json.dumps(payload).encode("utf-8")
-    key = bytes.fromhex(key_hex[:32])
-    key_cycle = (key * (len(raw) // len(key) + 1))[:len(raw)]
-    encrypted = bytes(a ^ b for a, b in zip(raw, key_cycle))
-    sig = __import__("hmac").new(bytes.fromhex(key_hex[:64]), encrypted, __import__("hashlib").sha256).hexdigest()
-    envelope = __import__("base64").b64encode(json.dumps({"sig": sig, "data": __import__("base64").b64encode(encrypted).decode()}).encode()).decode()
+    nonce = os.urandom(12)
+    aes_key = hashlib.sha256(bytes.fromhex(key_hex[:64])).digest()
+    encrypted = AESGCM(aes_key).encrypt(nonce, raw, None)
+    sig = hmac.new(bytes.fromhex(key_hex[:64]), encrypted, hashlib.sha256).hexdigest()
+    envelope = base64.b64encode(json.dumps({
+        "sig": sig,
+        "nonce": base64.b64encode(nonce).decode(),
+        "data": base64.b64encode(encrypted).decode(),
+    }).encode()).decode()
+    Path(drone.deadrop_path).parent.mkdir(parents=True, exist_ok=True)
     Path(drone.deadrop_path).write_text(envelope, encoding="utf-8")
     cp._poll_deadrop(drone.drone_id)
     assert "f1" in cp.drones[drone.drone_id].findings

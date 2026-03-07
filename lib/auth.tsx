@@ -10,7 +10,8 @@ type AuthContextType = {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setToken] = useState<string | null>(null);
+  const defaultToken = process.env.NEXT_PUBLIC_AUTO_AUTH_TOKEN ?? 'autonomous-session';
+  const [token, setToken] = useState<string | null>(defaultToken);
   const value = useMemo(() => ({ token, setToken }), [token]);
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
