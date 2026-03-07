@@ -33,6 +33,7 @@ from nacl import signing
 
 from signed_ledger import SignedLedger
 from sentinel_containment.drone_compiler import DroneBlobCompiler, decode_blob, deploy_blob_remote, launch_blob_locally
+from sentinel_containment.plan_executor import SophisticatedBinaryPlanExecutor
 from sentinel_containment.drone_tactics import (
     LateralMovementDesigner,
     IntruderConfrontationDesigner,
@@ -3639,6 +3640,65 @@ class HegemonControlPlane:
         payload = json.dumps(meta, separators=(",", ":"), sort_keys=True)
         return header + self._text_to_bits(payload)
 
+    @staticmethod
+    def _rag_context_entries(runtime_obj: dict[str, Any], payload_obj: Any) -> list[str]:
+        entries: list[str] = []
+        runtime_rag = runtime_obj.get("rag") if isinstance(runtime_obj.get("rag"), dict) else {}
+        for item in runtime_rag.get("context", []) if isinstance(runtime_rag.get("context"), list) else []:
+            if isinstance(item, str):
+                entries.append(item.strip())
+        if isinstance(payload_obj, dict):
+            for item in payload_obj.get("rag_context", []) if isinstance(payload_obj.get("rag_context"), list) else []:
+                if isinstance(item, str):
+                    entries.append(item.strip())
+        return [item for item in entries if item][:24]
+
+    def _graph_plan_from_behaviour(self, behaviour_obj: DroneBehaviour) -> list[dict[str, Any]]:
+        plan: list[dict[str, Any]] = []
+        for idx, node in enumerate(behaviour_obj.nodes):
+            plan.append({
+                "id": f"step-{idx + 1}",
+                "opcode": "visit_node",
+                "node_id": node.node_id,
+                "kind": node.kind,
+                "next": list(node.edges_out),
+            })
+            if node.kind in {"local_intel_match", "query_local_store", "dns_resolve"}:
+                plan.append({
+                    "id": f"step-{idx + 1}-rag",
+                    "opcode": "collect_context",
+                    "query": node.kind,
+                })
+            if node.kind in {"send_report", "report_to_control_plane"}:
+                plan.append({
+                    "id": f"step-{idx + 1}-report",
+                    "opcode": "emit_report",
+                    "summary": f"Report generated from {node.kind}",
+                })
+        return plan
+
+    def _inject_plan_executor_payload(self, behaviour_obj: DroneBehaviour, runtime_obj: dict[str, Any], payload_obj: Any) -> None:
+        if not isinstance(payload_obj, dict):
+            return
+        plan = self._graph_plan_from_behaviour(behaviour_obj)
+        rag_context = self._rag_context_entries(runtime_obj, payload_obj)
+        executor = SophisticatedBinaryPlanExecutor()
+        blob = executor.build_blob(plan=plan, rag_context=rag_context)
+        preview = executor.execute_blob(blob)
+        runtime_obj["plan_executor"] = {
+            "kind": "binary_executor",
+            "engine": "sophisticated_plan_executor_v1",
+            "blob_b64": blob,
+            "plan_steps": len(plan),
+            "preview": {
+                "success": bool(preview.get("success", False)),
+                "steps_ok": int(preview.get("steps_ok", 0)),
+            },
+        }
+        payload_obj.setdefault("plan", plan)
+        payload_obj["plan_executor_binary"] = blob
+        payload_obj["plan_executor_engine"] = "sophisticated_plan_executor_v1"
+
     def _compose_behaviour_from_graph(self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]], *, behaviour_id: str | None = None, name: str = "composed-drone", description: str = "composed graph") -> DroneBehaviour:
         behaviour_id = behaviour_id or f"brain-{secrets.token_hex(4)}"
         edge_map: dict[str, list[str]] = defaultdict(list)
@@ -3737,6 +3797,7 @@ class HegemonControlPlane:
         checkin_interval_seconds = int(checkin_interval_seconds)
         payload_obj = payload if payload is not None else {}
         runtime_obj = runtime if isinstance(runtime, dict) else {}
+        self._inject_plan_executor_payload(behaviour_obj=behaviour_obj, runtime_obj=runtime_obj, payload_obj=payload_obj)
         ring_candidate = runtime_obj.get("execution", {}).get("ring_level") if isinstance(runtime_obj.get("execution", {}), dict) else None
         if ring_candidate is None and isinstance(runtime_obj.get("telemetry", {}), dict):
             ring_candidate = runtime_obj.get("telemetry", {}).get("kernel_feed", {}).get("ring_level") if isinstance(runtime_obj.get("telemetry", {}).get("kernel_feed", {}), dict) else None
