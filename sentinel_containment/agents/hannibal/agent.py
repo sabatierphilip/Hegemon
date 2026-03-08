@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import threading
 import time
+from queue import Empty, Queue
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +64,7 @@ class HannibalAgent(BaseAgent):
         self._log: list[dict[str, Any]] = []
         self._paused = False
         self._drone_actions: dict[str, str] = {}
+        self._deliberation_queue: Queue[str] = Queue()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     def receive_instruction(self, text: str) -> dict[str, Any]:
@@ -102,23 +104,29 @@ class HannibalAgent(BaseAgent):
                 if directive.target_network:
                     setattr(self._campaign, "target_network", directive.target_network)
             result["acted"] = True
+            self._signal_deliberation("set_target")
         elif directive.intent == "set_objective" and self._campaign and directive.objective:
             with self._lock:
                 self._campaign.mission_objective = directive.objective
             result["acted"] = True
+            self._signal_deliberation("set_objective")
         elif directive.intent == "adjust_autonomy" and directive.autonomy_override and self._campaign:
             with self._lock:
                 setattr(self._campaign, "autonomy_override", directive.autonomy_override)
             result["acted"] = True
+            self._signal_deliberation("adjust_autonomy")
 
         return result
 
     def start_campaign(self, campaign_id: str, target: str, objective: str, autonomy_override: str | None = None) -> CampaignState:
         with self._lock:
             self._campaign = CampaignState(campaign_id=campaign_id, agent_id=self.AGENT_ID, mission_objective=objective)
+            setattr(self._cp, "_active_hannibal_campaign", self._campaign)
+            setattr(self._cp, "_hannibal_agent", self)
             setattr(self._campaign, "target_host", target)
             setattr(self._campaign, "target_network", target if "/" in target else f"{target}/24")
             setattr(self._campaign, "autonomy_override", autonomy_override)
+            self._deliberation_queue = Queue()
         self._stop_event.clear()
         self._paused = False
         self._thread = threading.Thread(target=self._deliberation_loop, daemon=True)
@@ -136,6 +144,7 @@ class HannibalAgent(BaseAgent):
                     except Exception:
                         continue
                 self._campaign.phase = "withdrawal"
+        setattr(self._cp, "_active_hannibal_campaign", None)
         self._record_log("campaign_aborted", {})
 
     def status(self) -> dict[str, Any]:
@@ -216,7 +225,15 @@ class HannibalAgent(BaseAgent):
                     self._deliberate()
                 except Exception as exc:
                     self._record_log("deliberation_error", {"error": str(exc)[:200]})
-            self._stop_event.wait(timeout=self.LOOP_INTERVAL)
+            try:
+                self._deliberation_queue.get(timeout=self.LOOP_INTERVAL)
+            except Empty:
+                continue
+
+    def _signal_deliberation(self, reason: str) -> None:
+        if self._stop_event.is_set():
+            return
+        self._deliberation_queue.put_nowait(reason)
 
     def _deliberate(self) -> None:
         with self._lock:
@@ -225,6 +242,7 @@ class HannibalAgent(BaseAgent):
             state = self._campaign
 
         completed: list[tuple[str, str]] = []
+        detections_before = state.detection_events
         for drone_id in list(state.active_drone_ids):
             try:
                 drone = self._cp.drones.get(drone_id)
@@ -251,6 +269,10 @@ class HannibalAgent(BaseAgent):
             new_q_vec = state.to_q_vector()
             self._q.update(prev_q_vec, last_action, reward, new_q_vec)
             self._record_log("drone_completed", {"drone_id": drone_id, "outcome": outcome, "reward": reward})
+            self._signal_deliberation("drone_completed")
+
+        if state.detection_events > detections_before:
+            self._signal_deliberation("detection_event")
 
         clips_decisions = self._clips.evaluate(state)
         clips_actions = [d["action"] for d in clips_decisions]
@@ -341,7 +363,7 @@ class HannibalAgent(BaseAgent):
                 behaviour = builder(target)
 
             drone_name = f"hannibal-{action.lower().replace('deploy_', '')}-{secrets.token_hex(3)}"
-            drone = self._cp.assemble_drone(
+            assemble_payload = dict(
                 name=drone_name,
                 tier=tier,
                 mission=state.mission_objective[:80],
@@ -352,7 +374,13 @@ class HannibalAgent(BaseAgent):
                 ttl_seconds=ttl,
                 checkin_interval_seconds=45,
                 actor="hannibal",
+                drone_type=action.lower().replace("deploy_", ""),
             )
+            try:
+                drone = self._cp.assemble_drone(**assemble_payload)
+            except TypeError:
+                assemble_payload.pop("drone_type", None)
+                drone = self._cp.assemble_drone(**assemble_payload)
             self._cp.launch_drone(drone.drone_id, actor="hannibal")
             state.active_drone_ids.append(drone.drone_id)
             state.drone_orders.append({"action": action, "drone_id": drone.drone_id, "drone_name": drone_name, "target": target, "ts": time.time(), "phase": state.phase})
@@ -393,7 +421,7 @@ class HannibalAgent(BaseAgent):
                 english_focus=english_focus,
             )
             drone_name = f"hannibal-custom-{secrets.token_hex(3)}"
-            drone = self._cp.assemble_drone(
+            assemble_payload = dict(
                 name=drone_name,
                 tier="autonomous",
                 mission=objective[:80],
@@ -404,7 +432,13 @@ class HannibalAgent(BaseAgent):
                 ttl_seconds=1800,
                 checkin_interval_seconds=40,
                 actor="hannibal",
+                drone_type="custom",
             )
+            try:
+                drone = self._cp.assemble_drone(**assemble_payload)
+            except TypeError:
+                assemble_payload.pop("drone_type", None)
+                drone = self._cp.assemble_drone(**assemble_payload)
             self._cp.launch_drone(drone.drone_id, actor="hannibal")
             state.active_drone_ids.append(drone.drone_id)
             state.drone_orders.append(

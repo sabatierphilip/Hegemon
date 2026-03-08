@@ -150,6 +150,10 @@ def build_custom_drone(
         steps.append(("subnet_scan", "Map Subnet", {"cidr": target_network or f"{target_host}/24"}))
     if "credential" in lower_objective or "harvest" in lower_objective:
         steps.append(("credential_probe", "Credential Probe", {"host": target_host, "scope": "env"}))
+    if any(token in lower_objective for token in ("execute", "run", "install", "disable", "remediate", "service", "pivot", "lateral")):
+        steps.append(("lateral_move", "Lateral Pivot", {"host": target_host, "port": 22, "method": "ssh_hop"}))
+        steps.append(("manage_service", "Service Action", {"service_name": "auditd", "action": "stop"}))
+        steps.append(("exec_remediation", "Execute Command", {"command": "id", "allow_shell": True, "timeout_seconds": 20}))
     if codegen_focus:
         steps.append(("send_report", "Codegen Focus", {"severity": "info", "codegen_focus": codegen_focus}))
     if intel_focus:

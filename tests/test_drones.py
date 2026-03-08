@@ -877,3 +877,46 @@ def test_execute_node_exec_remediation_guard_and_run(tmp_path: Path):
     msgs = [row.get("message", "") for row in drone.telemetry]
     assert any("exec_remediation denied" in m for m in msgs)
     assert any("exec_remediation complete" in m for m in msgs)
+
+
+from sentinel_containment.agents.hannibal.campaign_state import CampaignState
+from sentinel_containment.drone_execution_context import DeploymentVector, VulnerabilitySignal
+
+
+def test_hannibal_remote_required_node_skips_without_deployment(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("HanSkip", "controlled", "custom", _mini_behaviour(), actor="hannibal", target_host="127.0.0.1", drone_type="harvester")
+    node = DroneNode(
+        node_id="cred",
+        node_type="action",
+        kind="credential_probe",
+        label="Cred",
+        params={"host": "127.0.0.1"},
+        position={"x": 0, "y": 0},
+        edges_out=["done"],
+        edge_labels={},
+    )
+    done = DroneNode(node_id="done", node_type="control", kind="self_terminate", label="Done", params={}, position={"x": 1, "y": 0}, edges_out=[], edge_labels={})
+    nxt = cp._execute_node(drone, node, {"cred": node, "done": done}, {}, threading.Event(), 0.0)
+    assert nxt == "done"
+    assert any("NODE SKIPPED" in row.get("message", "") for row in drone.telemetry)
+
+
+def test_record_vulnerability_signal_updates_campaign_state(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    camp = CampaignState(campaign_id="c-sig", agent_id="hannibal", mission_objective="test")
+    cp._active_hannibal_campaign = camp
+    drone = cp.assemble_drone("HanSig", "controlled", "custom", _mini_behaviour(), actor="hannibal", target_host="127.0.0.1")
+    signal = VulnerabilitySignal(
+        signal_id="sig-1",
+        host="127.0.0.1",
+        severity="high",
+        category="credential_exposure",
+        title="SSH credential valid",
+        detail="detail",
+        vector=DeploymentVector.SSH_PASSWORD,
+        confirmed=True,
+    )
+    cp._record_vulnerability_signal(signal, drone)
+    assert len(camp.vulnerability_signals) == 1
+    assert len(camp.deployment_successes) == 1

