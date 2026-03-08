@@ -1,0 +1,28 @@
+ACTION_INDEX: dict[str, int] = {
+    "DEPLOY_SCOUT": 0,
+    "DEPLOY_MAPPER": 1,
+    "DEPLOY_FLANKER": 2,
+    "DEPLOY_HARVESTER": 3,
+    "DEPLOY_ENCIRCLER": 4,
+    "DEPLOY_STRIKER": 5,
+    "DEPLOY_WATCHDOG": 6,
+    "SPAWN_CHILD_SWARM": 7,
+    "RECALL_ALL_DRONES": 8,
+    "TERMINATE_HIGHEST_RISK_DRONE": 9,
+    "ADVANCE_PHASE_RECONNAISSANCE": 10,
+    "ADVANCE_PHASE_MAPPING": 11,
+    "ADVANCE_PHASE_FLANKING": 12,
+    "ADVANCE_PHASE_ENCIRCLEMENT": 13,
+    "ADVANCE_PHASE_EXPLOITATION": 14,
+    "ADVANCE_PHASE_WITHDRAWAL": 15,
+}
+
+DRONE_TYPE_CONFIGS: dict[str, dict] = {
+    "DEPLOY_SCOUT": {"tier": "tethered", "autonomy": "observe", "ttl": 900},
+    "DEPLOY_MAPPER": {"tier": "tethered", "autonomy": "observe", "ttl": 1800},
+    "DEPLOY_FLANKER": {"tier": "tethered", "autonomy": "contain", "ttl": 2400},
+    "DEPLOY_HARVESTER": {"tier": "autonomous", "autonomy": "enforce", "ttl": 1200},
+    "DEPLOY_ENCIRCLER": {"tier": "autonomous", "autonomy": "contain", "ttl": 7200},
+    "DEPLOY_STRIKER": {"tier": "autonomous", "autonomy": "enforce", "ttl": 600},
+    "DEPLOY_WATCHDOG": {"tier": "autonomous", "autonomy": "observe", "ttl": 0},
+}

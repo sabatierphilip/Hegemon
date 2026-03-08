@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _runtime: SentinelRuntime | None = None
 _auth_warning_emitted = False
 _control_plane = HegemonControlPlane()
+_hannibal = None
 _AUTOCOMPLETE_CACHE: dict[str, tuple[float, dict]] = {}
 
 
@@ -2699,3 +2700,92 @@ def api_drones_brains_delete(behaviour_id: str):
         return jsonify({"error": "forbidden"}), 403
     _control_plane.drone_brains.pop(behaviour_id, None)
     return jsonify({"deleted": True})
+
+
+def _get_hannibal():
+    global _hannibal
+    if _hannibal is None:
+        from sentinel_containment.agents.hannibal.agent import HannibalAgent
+
+        _hannibal = HannibalAgent(_control_plane)
+    return _hannibal
+
+@app.post("/api/agents/hannibal/instruct")
+def api_hannibal_instruct():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    result = _get_hannibal().receive_instruction(text)
+    return jsonify(result)
+
+
+@app.get("/api/agents/hannibal/status")
+def api_hannibal_status():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    return jsonify(_get_hannibal().status())
+
+
+@app.post("/api/agents/hannibal/abort")
+def api_hannibal_abort():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    _get_hannibal().abort_campaign()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/agents/hannibal/pause")
+def api_hannibal_pause():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    _get_hannibal()._paused = True
+    return jsonify({"ok": True})
+
+
+@app.post("/api/agents/hannibal/resume")
+def api_hannibal_resume():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    _get_hannibal()._paused = False
+    return jsonify({"ok": True})
+
+
+@app.get("/api/agents/hannibal/campaign")
+def api_hannibal_campaign():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    agent = _get_hannibal()
+    with agent._lock:
+        campaign = agent._campaign
+        if not campaign:
+            return jsonify({"campaign": None})
+        return jsonify({"campaign": campaign.serialize()})
+
+
+@app.get("/api/agents/hannibal/log")
+def api_hannibal_log():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    agent = _get_hannibal()
+    return jsonify({"log": agent._log[-100:]})
+
+
+@app.get("/api/agents/hannibal/qtable")
+def api_hannibal_qtable():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    agent = _get_hannibal()
+    return jsonify({"epsilon": agent._q._epsilon, "episode": agent._q._episode, "entries": len(agent._q._q)})
