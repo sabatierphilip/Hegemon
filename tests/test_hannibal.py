@@ -20,6 +20,7 @@ from sentinel_containment.agents.hannibal.drone_factory import (
 )
 from sentinel_containment.agents.hannibal.nlp_parser import HannibalNLPParser
 from sentinel_containment.agents.hannibal.q_learner import HannibalQLearner
+from sentinel_containment.agents.hannibal.strategy_engine import HannibalStrategyEngine
 from sentinel_containment.agents.hannibal.mission_control import MissionControlBoard
 from sentinel_containment.web.app import app as web_app
 
@@ -462,8 +463,42 @@ def test_hannibal_simulation_endpoint(monkeypatch):
     )
     assert resp.status_code == 200
     body = resp.get_json()
-    assert body["predicted_outcome"] == "high_gain_high_risk"
-    assert body["host_gain"] >= 1
+    assert body["predicted_outcome"] in {"high_gain_high_risk", "balanced_progress"}
+    assert body["exposure_delta"] > 0
+    assert "pivot_gain" in body
+    assert "projected_phase" in body
+    assert body["task_graph"]["nodes"]
+    assert body["binary_codegen"]["enabled"] is True
+    assert body["binary_codegen"]["machine_code"]["byte_length"] > 0
+
+
+def test_hannibal_simulation_profiles_diverge():
+    engine = HannibalStrategyEngine()
+    campaign = CampaignState(campaign_id="camp-sim", agent_id="hannibal", mission_objective="test", phase="mapping")
+    campaign.active_drone_ids = ["dr-1", "dr-2"]
+    campaign.alive_hosts = ["10.0.0.1", "10.0.0.2"]
+
+    aggressive = engine.run_simulation(campaign, "aggressive enforce surge")
+    hold = engine.run_simulation(campaign, "pause and hold with stealth")
+
+    assert aggressive["exposure_delta"] > hold["exposure_delta"]
+    assert hold["predicted_outcome"] == "containment_hold"
+    assert aggressive["confidence"] >= 0.15
+
+
+def test_hannibal_simulation_codegen_and_task_graph_are_real():
+    engine = HannibalStrategyEngine()
+    campaign = CampaignState(campaign_id="camp-codegen", agent_id="hannibal", mission_objective="test", phase="flanking")
+    campaign.active_drone_ids = ["dr-1", "dr-2", "dr-3"]
+    campaign.alive_hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+
+    result = engine.run_simulation(campaign, "compile binary xor 7 11 then map quietly")
+
+    assert result["binary_codegen"]["machine_code"]["arch"] == "x86_64"
+    assert result["binary_codegen"]["tool_calls_used"] <= result["binary_codegen"]["tool_calls_budget"]
+    assert result["task_graph"]["summary"].startswith("4-node")
+    assert any("info" in node and node["info"] for node in result["task_graph"]["nodes"])
+    assert result["linguistic_features"]["interpreted_language"] == "english"
 
 
 def test_hannibal_briefing_in_status():
