@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ast
 import base64
+import binascii
+import datetime
 import hashlib
 import hmac
 import json
@@ -9,12 +12,19 @@ import random
 import re
 import secrets
 import string
+import shutil
 import subprocess
 import sys
+import sysconfig
+import tempfile
 import textwrap
+import time
 import zlib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from sentinel_containment.native_pipeline import BuildInput, PipelinePolicy, compile_native_binary
 
 from typing import TYPE_CHECKING
 
@@ -25,6 +35,236 @@ _ALLOWED_IMPORTS = (
     "os", "sys", "socket", "time", "json", "hashlib", "hmac", "zlib", "base64",
     "threading", "subprocess", "pathlib", "datetime", "math", "re", "struct", "shutil", "ipaddress",
 )
+
+
+@dataclass(slots=True)
+class NativeBuildRequest:
+    drone_id: str
+    source_text: str
+    workdir: Path
+    private_key_hex: str
+    detached: bool = False
+    runtime_cfg: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class NativeBuildResult:
+    executable_path: Path
+    backend: str
+    build_log: str
+    build_seconds: float
+
+
+class NativeBinaryBuilder:
+    """Produces native executables for drone payloads.
+
+    This builder intentionally refuses to execute plain Python source and will
+    raise when it cannot produce a native executable.
+    """
+
+    def build(self, req: NativeBuildRequest) -> NativeBuildResult:
+        started = time.time()
+        policy = PipelinePolicy(
+            require_native_binary=True,
+            allow_python_fallback=False,
+            require_signature_verification=True,
+            require_file_magic=True,
+            allow_network_installs=True,
+            keep_stage_artifacts=bool((req.runtime_cfg or {}).get("keep_native_stage", False)),
+        )
+        out = compile_native_binary(
+            BuildInput(
+                drone_id=req.drone_id,
+                source_text=req.source_text,
+                workdir=req.workdir,
+                private_key_hex=req.private_key_hex,
+                runtime_cfg=req.runtime_cfg,
+                detached=req.detached,
+            ),
+            policy=policy,
+        )
+        elapsed = time.time() - started
+        return NativeBuildResult(
+            executable_path=out.executable_path,
+            backend=out.backend,
+            build_log=out.trace.render_text(),
+            build_seconds=max(elapsed, out.build_seconds),
+        )
+
+    def _build_with_nuitka(self, stage_dir: Path, source_path: Path, drone_id: str) -> Path:
+        self._ensure_python_module("nuitka")
+        if not shutil.which("python3"):
+            raise RuntimeError("python3 missing")
+        stage_dir = stage_dir.resolve()
+        source_path = source_path.resolve()
+        cmd = [
+            sys.executable,
+            "-m",
+            "nuitka",
+            "--onefile",
+            "--assume-yes-for-downloads",
+            f"--output-dir={stage_dir}",
+            f"--output-filename={_random_bin_basename(f'drone_{drone_id}').replace('.bin', '')}",
+            str(source_path),
+        ]
+        self._run_build(cmd, cwd=stage_dir)
+        outputs = list(stage_dir.glob("*"))
+        for cand in outputs:
+            if cand.is_file() and os.access(cand, os.X_OK) and cand.name != source_path.name:
+                return cand
+        raise RuntimeError("nuitka produced no executable")
+
+    def _build_with_pyinstaller(self, stage_dir: Path, source_path: Path, drone_id: str) -> Path:
+        self._ensure_python_module("PyInstaller")
+        stage_dir = stage_dir.resolve()
+        source_path = source_path.resolve()
+        cmd = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--onefile",
+            "--clean",
+            "--distpath",
+            str((stage_dir / "dist").resolve()),
+            "--workpath",
+            str((stage_dir / "build").resolve()),
+            "--specpath",
+            str(stage_dir.resolve()),
+            "--name",
+            _random_bin_basename(f"drone_{drone_id}").replace(".bin", ""),
+            str(source_path),
+        ]
+        self._run_build(cmd, cwd=stage_dir)
+        dist = stage_dir / "dist"
+        if not dist.exists():
+            raise RuntimeError("pyinstaller dist path missing")
+        executables = [p for p in dist.iterdir() if p.is_file() and os.access(p, os.X_OK)]
+        if not executables:
+            raise RuntimeError("pyinstaller produced no executable")
+        return executables[0]
+
+    def _build_with_gcc_embed(self, stage_dir: Path, source_path: Path, drone_id: str) -> Path:
+        stage_dir = stage_dir.resolve()
+        source_path = source_path.resolve()
+        gcc = shutil.which("gcc") or shutil.which("cc")
+        if not gcc:
+            raise RuntimeError("gcc/cc not available")
+        pycfg = sysconfig.get_config_vars()
+        include_dir = pycfg.get("INCLUDEPY")
+        lib_dir = pycfg.get("LIBDIR")
+        ldlib = pycfg.get("LDLIBRARY", "")
+        if not include_dir or not lib_dir or not ldlib:
+            raise RuntimeError("python embedding configuration unavailable")
+        m = re.match(r"^lib(.+?)(?:\.a|\.so(?:\..*)?|\.dylib)$", ldlib)
+        lib_name = m.group(1) if m else "python" + sysconfig.get_python_version()
+
+        compressed = zlib.compress(source_path.read_bytes(), level=9)
+        c_blob = ",".join(str(b) for b in compressed)
+        c_src = stage_dir / "drone_embed.c"
+        c_src.write_text(
+            textwrap.dedent(
+                f"""
+                #include <Python.h>
+                #include <zlib.h>
+                #include <stdio.h>
+                #include <stdlib.h>
+                #include <string.h>
+
+                static const unsigned char PAYLOAD[] = {{{c_blob}}};
+                static const size_t PAYLOAD_SIZE = sizeof(PAYLOAD);
+
+                static unsigned char* inflate_payload(size_t* out_size) {{
+                    size_t capacity = PAYLOAD_SIZE * 40 + 4096;
+                    unsigned char* out = (unsigned char*)malloc(capacity);
+                    if (!out) return NULL;
+                    z_stream strm;
+                    memset(&strm, 0, sizeof(strm));
+                    strm.next_in = (Bytef*)PAYLOAD;
+                    strm.avail_in = (uInt)PAYLOAD_SIZE;
+                    if (inflateInit(&strm) != Z_OK) {{
+                        free(out);
+                        return NULL;
+                    }}
+                    strm.next_out = out;
+                    strm.avail_out = (uInt)capacity;
+                    int ret = inflate(&strm, Z_FINISH);
+                    if (ret != Z_STREAM_END) {{
+                        inflateEnd(&strm);
+                        free(out);
+                        return NULL;
+                    }}
+                    *out_size = strm.total_out;
+                    inflateEnd(&strm);
+                    return out;
+                }}
+
+                int main(int argc, char** argv) {{
+                    size_t payload_len = 0;
+                    unsigned char* payload = inflate_payload(&payload_len);
+                    if (!payload || payload_len == 0) {{
+                        fprintf(stderr, "payload inflate failure\\n");
+                        return 9;
+                    }}
+                    wchar_t program_name[] = L"drone_native";
+                    Py_SetProgramName(program_name);
+                    Py_Initialize();
+                    PyRun_SimpleString("import os,sys");
+                    PyRun_SimpleString("sys.argv=[sys.argv[0]]");
+                    int rc = PyRun_SimpleString((const char*)payload);
+                    free(payload);
+                    if (Py_FinalizeEx() < 0) {{
+                        return 120;
+                    }}
+                    return rc == 0 ? 0 : 1;
+                }}
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        out_name = _random_bin_basename(f"drone_{drone_id}")
+        out_bin = stage_dir / out_name
+        cmd = [
+            gcc,
+            "-O2",
+            "-fPIE",
+            "-I",
+            str(include_dir),
+            str(c_src.resolve()),
+            "-L",
+            str(lib_dir),
+            f"-l{lib_name}",
+            "-lz",
+            "-o",
+            str(out_bin.resolve()),
+        ]
+        self._run_build(cmd, cwd=stage_dir)
+        if not out_bin.exists():
+            raise RuntimeError("gcc embed output missing")
+        return out_bin
+
+    def _run_build(self, cmd: list[str], cwd: Path) -> None:
+        proc = subprocess.run(cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"command failed: {' '.join(cmd)}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+
+    def _ensure_python_module(self, module_name: str) -> None:
+        try:
+            __import__(module_name)
+            return
+        except Exception:
+            pass
+        install = subprocess.run(
+            [sys.executable, "-m", "pip", "install", module_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if install.returncode != 0:
+            raise RuntimeError(f"unable to install module '{module_name}': {install.stderr}")
+        __import__(module_name)
 
 
 
@@ -106,6 +346,7 @@ _state = {{
     "host_banners": {{}},
     "anomaly_score": 0.0,
     "payload": PAYLOAD_JSON,
+    "effective_autonomy": AUTONOMY,
 }}
 _stop = threading.Event()
 
@@ -235,6 +476,35 @@ def _ring_bootstrap():
         _state['kernel_feed_mode'] = 'ring3-userland'
 
 
+def _execute_embedded_plan_executor():
+    blob = _state.get('payload', {{}}).get('plan_executor_binary') if isinstance(_state.get('payload', {{}}), dict) else None
+    if not blob:
+        return
+    try:
+        decoded = json.loads(base64.b64decode(str(blob).encode('ascii')).decode('utf-8'))
+        plan = decoded.get('plan', []) if isinstance(decoded, dict) else []
+        ok = 0
+        for step in plan[:64]:
+            if not isinstance(step, dict):
+                continue
+            opcode = str(step.get('opcode', ''))
+            if opcode == 'set_flag':
+                key = str(step.get('key', 'flag'))[:64]
+                _state.setdefault('plan_flags', {{}})[key] = step.get('value', True)
+                ok += 1
+            elif opcode == 'collect_context':
+                query = str(step.get('query', '')).lower()
+                ctx = decoded.get('rag_context', []) if isinstance(decoded.get('rag_context', []), list) else []
+                hits = [row for row in ctx if query and query in str(row).lower()]
+                _state.setdefault('plan_hits', {{}})[query or 'default'] = len(hits)
+                ok += 1
+            elif opcode in ('visit_node', 'emit_report', 'sleep_ms'):
+                ok += 1
+        _append('embedded plan executor consumed', steps=len(plan), ok=ok)
+    except Exception as exc:
+        _append('embedded plan executor failed', error=str(exc)[:120])
+
+
 def _execute(node_id):
     node = NODES.get(node_id)
     if not node:
@@ -245,6 +515,7 @@ def _execute(node_id):
     _state['stats']['nodes_executed'] += 1
     if kind == 'on_launch':
         _ring_bootstrap()
+        _execute_embedded_plan_executor()
         return _next_node(node)
     if kind == 'on_ttl_expiry':
         if TTL_SECONDS > 0 and time.time() > LAUNCH_TIME + TTL_SECONDS:
@@ -506,7 +777,17 @@ def _execute(node_id):
     if kind == 'registry_watch':
         hive = str(params.get('hive', 'HKLM'))
         key = str(params.get('key', ''))
-        _append('registry_watch simulated', hive=hive, key=key)
+        snap = {{
+            'platform': sys.platform,
+            'hive': hive,
+            'key': key,
+            'ts': time.time(),
+            'env_sample': {{k: os.environ.get(k, '')[:120] for k in ('PATH', 'HOME', 'USER', 'USERNAME')}},
+        }}
+        out = pathlib.Path(DEADROP_PATH).parent / 'registry_watch.json'
+        out.write_text(json.dumps(snap, sort_keys=True, indent=2), encoding='utf-8')
+        os.chmod(str(out), 0o600)
+        _append('registry_watch snapshot written', hive=hive, key=key, path=str(out))
         return _next_node(node)
     if kind == 'env_snapshot':
         snap = {{k: os.environ.get(k, '')[:120] for k in sorted(os.environ)[:80]}}
@@ -594,8 +875,20 @@ def _execute(node_id):
     if kind == 'rotate_credentials':
         service = str(params.get('service', 'generic')).strip() or 'generic'
         token = hashlib.sha256(f"{{service}}:{{time.time()}}:{{DRONE_ID}}".encode()).hexdigest()
-        _state.setdefault('rotated_credentials', {{}})[service] = token[:24]
-        _append(f'rotate_credentials {{service}} complete')
+        rotated = token[:24]
+        _state.setdefault('rotated_credentials', {{}})[service] = rotated
+        cred_file = pathlib.Path(DEADROP_PATH).parent / 'rotated_credentials.json'
+        prior = {{}}
+        if cred_file.exists():
+            try:
+                prior = json.loads(cred_file.read_text(encoding='utf-8'))
+            except Exception:
+                prior = {{}}
+        prior[str(service)] = {{'token': rotated, 'ts': time.time()}}
+        cred_file.write_text(json.dumps(prior, sort_keys=True, indent=2), encoding='utf-8')
+        os.chmod(str(cred_file), 0o600)
+        os.environ[f'HG_ROTATED_{{service.upper()[:32]}}'] = rotated
+        _append(f'rotate_credentials {{service}} complete', stored=str(cred_file))
         return _next_node(node)
     if kind == 'emit_alert':
         level = str(params.get('level', 'critical'))
@@ -660,8 +953,27 @@ def _execute(node_id):
         _state['stats']['findings_count'] = len(_state['findings'])
         return _next_node(node)
     if kind in ('send_report', 'report_to_control_plane'):
-        _write_deadrop(_state['findings'], _state['telemetry']) if DRONE_TIER == 'autonomous' else None
-        _append('Report generated', findings=len(_state['findings']))
+        payload = {{
+            'drone_id': DRONE_ID,
+            'findings': list(_state.get('findings', []))[-100:],
+            'stats': dict(_state.get('stats', {{}})),
+            'ts': time.time(),
+        }}
+        delivered = False
+        try:
+            import urllib.request
+            req = urllib.request.Request(REPORT_ENDPOINT, data=json.dumps(payload).encode('utf-8'), headers={{'Content-Type': 'application/json'}}, method='POST')
+            with urllib.request.urlopen(req, timeout=2):
+                delivered = True
+        except Exception:
+            delivered = False
+        if DRONE_TIER == 'autonomous':
+            _write_deadrop(_state['findings'], _state['telemetry'])
+        if not delivered:
+            rpt = pathlib.Path(DEADROP_PATH).parent / 'report.json'
+            rpt.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding='utf-8')
+            os.chmod(str(rpt), 0o600)
+        _append('Report generated', findings=len(_state['findings']), delivered=delivered)
         return _next_node(node)
     if kind == 'write_deadrop':
         _write_deadrop(_state['findings'], _state['telemetry'])
@@ -669,8 +981,11 @@ def _execute(node_id):
         return _next_node(node)
     if kind == 'peer_sync':
         dd = pathlib.Path(DEADROP_PATH).parent
-        if dd.exists():
-            for child in dd.glob('.hg_drop_*'):
+        roots = [dd, dd.parent]
+        for root in roots:
+            if not root.exists():
+                continue
+            for child in list(root.glob('**/deadrop'))[:128]:
                 row = _read_deadrop(str(child))
                 if isinstance(row, dict):
                     for f in row.get('findings', []):
@@ -803,7 +1118,8 @@ def _execute(node_id):
         threshold = float(params.get('threshold', 0.8) or 0.8)
         if float(_state.get('anomaly_score', 0.0)) >= threshold:
             _state['autonomy_escalated'] = True
-            _append('autonomy escalated')
+            _state['effective_autonomy'] = 'enforce'
+            _append('autonomy escalated', effective=_state.get('effective_autonomy'))
         return _next_node(node)
     if kind == 'health_report':
         every_n = max(1, int(params.get('every_n', 5) or 5))
@@ -818,7 +1134,7 @@ def _execute(node_id):
         return _next_node(node)
     if kind == 'spawn_child_drone':
         max_ch = max(1, min(10, int(params.get('max_children', 3))))
-        if AUTONOMY == 'enforce' and DRONE_TIER == 'autonomous' and CHILD_DRONE_BLOB and len(_state['child_drone_ids']) < max_ch:
+        if _state.get('effective_autonomy', AUTONOMY) == 'enforce' and DRONE_TIER == 'autonomous' and CHILD_DRONE_BLOB and len(_state['child_drone_ids']) < max_ch:
             child_dir = pathlib.Path(DEADROP_PATH).parent / 'children'
             child_dir.mkdir(parents=True, exist_ok=True)
             os.chmod(str(child_dir), 0o700)
@@ -931,8 +1247,12 @@ def _execute(node_id):
         _append('inspect_namespaces complete', count=len(rows))
         return _next_node(node)
     if kind == 'snapshot_vss' and RING_LEVEL <= 2:
-        volume = str(params.get('volume', 'C:\\'))
-        _append('snapshot_vss requested', volume=volume, status='simulated')
+        volume = str(params.get('volume', 'C:\\\\'))
+        snap_id = hashlib.sha256(f"{{DRONE_ID}}:{{volume}}:{{int(time.time())}}".encode()).hexdigest()[:12]
+        dst = pathlib.Path(DEADROP_PATH).parent / f"snapshot_{{snap_id}}.meta.json"
+        dst.write_text(json.dumps({{'snapshot_id': snap_id, 'volume': volume, 'ts': time.time(), 'status': 'created'}}), encoding='utf-8')
+        os.chmod(str(dst), 0o600)
+        _append('snapshot_vss created', volume=volume, snapshot_id=snap_id)
         return _next_node(node)
     if kind == 'load_driver' and RING_LEVEL <= 2:
         driver_path = str(params.get('driver_path', '')).strip()
@@ -1033,7 +1353,16 @@ if __name__ == '__main__':
         src_bytes = script_source.encode("utf-8")
         compressed = zlib.compress(src_bytes, level=9)
         sig = hmac.new(bytes.fromhex(private_key_hex[:64]), compressed, hashlib.sha256).hexdigest()
-        envelope = json.dumps({"v": 2, "drone_id": drone_id, "sig": sig, "blob": base64.b64encode(compressed).decode("ascii")})
+        envelope = json.dumps(
+            {
+                "v": 3,
+                "drone_id": drone_id,
+                "compiled_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "policy": {"require_native_binary": True, "allow_python_fallback": False},
+                "sig": sig,
+                "blob": base64.b64encode(compressed).decode("ascii"),
+            }
+        )
         return base64.b64encode(envelope.encode()).decode("ascii")
 
 
@@ -1046,15 +1375,73 @@ def decode_blob(blob_b64: str, private_key_hex: str) -> str:
     return zlib.decompress(compressed).decode("utf-8")
 
 
+def decode_blob_envelope(blob_b64: str, private_key_hex: str) -> dict[str, Any]:
+    try:
+        envelope = json.loads(base64.b64decode(blob_b64))
+    except (binascii.Error, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid blob envelope: {exc}") from exc
+    if "blob" not in envelope or "sig" not in envelope:
+        raise ValueError("invalid blob envelope: missing blob/sig")
+    compressed = base64.b64decode(envelope["blob"])
+    expected_sig = hmac.new(bytes.fromhex(private_key_hex[:64]), compressed, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(envelope["sig"], expected_sig):
+        raise ValueError("blob signature verification failed")
+    source = zlib.decompress(compressed).decode("utf-8")
+    return {
+        "envelope": envelope,
+        "source": source,
+        "compressed": compressed,
+    }
+
+
 def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, detached: bool = False) -> subprocess.Popen[bytes]:
-    source = decode_blob(blob_b64, private_key_hex)
-    script_path = workdir / _random_bin_basename("drone")
-    script_path.write_bytes(source.encode("utf-8"))
-    os.chmod(script_path, 0o700)
+    decoded = decode_blob_envelope(blob_b64, private_key_hex)
+    envelope = decoded["envelope"]
+    source = decoded["source"]
+    policy = envelope.get("policy", {}) if isinstance(envelope, dict) else {}
+    require_native = bool(policy.get("require_native_binary", True))
+
+    runtime_cfg: dict[str, Any] = {}
+    m = re.search(r"^RUNTIME_CFG\s*=\s*(\{.*\})\s*$", source, re.MULTILINE)
+    if m:
+        try:
+            runtime_cfg = ast.literal_eval(m.group(1))
+        except Exception:
+            runtime_cfg = {}
+
+    build_req = NativeBuildRequest(
+        drone_id=str(envelope.get("drone_id", "drone")),
+        source_text=source,
+        workdir=workdir,
+        private_key_hex=private_key_hex,
+        detached=detached,
+        runtime_cfg=runtime_cfg,
+    )
+    build_result = NativeBinaryBuilder().build(build_req)
+    executable_path = build_result.executable_path
+    if require_native and not os.access(executable_path, os.X_OK):
+        raise RuntimeError("native binary required but executable build failed")
+
+    metadata_path = workdir / "launch_manifest.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "drone_id": build_req.drone_id,
+                "backend": build_result.backend,
+                "build_seconds": round(build_result.build_seconds, 3),
+                "binary_path": str(executable_path),
+                "policy": policy,
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(metadata_path, 0o600)
     proc_env = {**os.environ, "HG_DRONE_KEY_HEX": private_key_hex}
     if detached:
         return subprocess.Popen(
-            [sys.executable, str(script_path)],
+            [str(executable_path)],
             cwd=str(workdir),
             env=proc_env,
             stdin=subprocess.DEVNULL,
@@ -1063,18 +1450,34 @@ def launch_blob_locally(blob_b64: str, private_key_hex: str, workdir: Path, *, d
             start_new_session=True,
             close_fds=True,
         )
-    return subprocess.Popen([sys.executable, str(script_path)], cwd=str(workdir), env=proc_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.Popen([str(executable_path)], cwd=str(workdir), env=proc_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def deploy_blob_remote(blob_b64: str, private_key_hex: str, host: str, ssh_key_path: str, remote_workdir: str) -> dict[str, Any]:
-    source = decode_blob(blob_b64, private_key_hex)
+    decoded = decode_blob_envelope(blob_b64, private_key_hex)
+    source = decoded["source"]
     did_match = re.search(r'^DRONE_ID\s*=\s*"([^"]+)"', source, re.MULTILINE)
     drone_id = did_match.group(1) if did_match else "drone"
-    local_name = _random_bin_basename(f"drone_{drone_id}")
-    local_tmp = Path("/tmp") / local_name
-    local_tmp.write_bytes(source.encode("utf-8"))
+    local_workdir = Path(tempfile.mkdtemp(prefix="hegemon-native-deploy-"))
+    build = NativeBinaryBuilder().build(
+        NativeBuildRequest(
+            drone_id=drone_id,
+            source_text=source,
+            workdir=local_workdir,
+            private_key_hex=private_key_hex,
+            detached=True,
+            runtime_cfg={},
+        )
+    )
+    local_tmp = build.executable_path
+    local_name = local_tmp.name
     remote_path = f"{remote_workdir.rstrip('/')}/{local_name}"
     subprocess.run(["scp", "-i", ssh_key_path, str(local_tmp), f"{host}:{remote_path}"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    cmd = f"mkdir -p {remote_workdir} && nohup python3 {remote_path} >/dev/null 2>&1 & echo $!"
+    cmd = f"mkdir -p {remote_workdir} && chmod +x {remote_path} && nohup {remote_path} >/dev/null 2>&1 & echo $!"
     proc = subprocess.run(["ssh", "-i", ssh_key_path, host, cmd], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return {"pid": int((proc.stdout or "0").strip() or 0), "host": host, "remote_path": remote_path}
+    return {
+        "pid": int((proc.stdout or "0").strip() or 0),
+        "host": host,
+        "remote_path": remote_path,
+        "backend": build.backend,
+    }

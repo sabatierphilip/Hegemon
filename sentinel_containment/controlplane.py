@@ -42,6 +42,7 @@ from sentinel_containment.drone_tactics import (
     clamp,
 )
 from sentinel_containment.store_client import StoreClient, StoreSearchResult
+from sentinel_containment.action_runtime import RuntimeActionEngine, RuntimeContext
 
 try:
     import requests
@@ -369,7 +370,7 @@ class Drone:
     child_drone_ids_binary: str = ""
     supported_binary_actions: list[str] = field(default_factory=list)
     supported_binary_actions_binary: str = ""
-    artifact_format: str = "binary_blob"
+    artifact_format: str = "native_binary"
     artifact_format_binary: str = ""
     runtime: dict[str, Any] = field(default_factory=dict)
     compiler_ring: int = 3
@@ -3771,11 +3772,13 @@ class HegemonControlPlane:
             return copy.deepcopy(self.drone_brains[behaviour])
         return copy.deepcopy(behaviour)
 
-    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, payload: Any = None, actor: str = "user", artifact_format: str = "binary_blob", runtime: dict[str, Any] | None = None) -> Drone:
+    def assemble_drone(self, name: str, tier: str, mission: str, behaviour: DroneBehaviour | str, *, target_endpoint_id: str | None = None, target_host: str | None = None, target_network: str | None = None, autonomy_level: str = "observe", ttl_seconds: int = 3600, checkin_interval_seconds: int = 60, payload: Any = None, actor: str = "user", artifact_format: str = "native_binary", runtime: dict[str, Any] | None = None) -> Drone:
         if tier not in {"controlled", "tethered", "autonomous"}:
             raise ValueError("invalid tier")
         if autonomy_level not in {"observe", "contain", "enforce"}:
             raise ValueError("invalid autonomy_level")
+        if str(artifact_format or "native_binary") != "native_binary":
+            raise ValueError("artifact_format must be native_binary")
         with self._state_lock:
             active_count = len([d for d in self.drones.values() if d.status == "active"])
             if active_count >= 10:
@@ -3867,7 +3870,7 @@ class HegemonControlPlane:
                 "binary_header": child_binary_header,
                 "binary_blueprint": child_binary_blueprint,
                 "supported_binary_actions": child_supported_actions,
-                "artifact_format": str(artifact_format or "binary_blob"),
+                "artifact_format": str(artifact_format or "native_binary"),
             })
             child_drone = Drone(
                 drone_id=f"{drone_id}-child-template",
@@ -3906,7 +3909,7 @@ class HegemonControlPlane:
                 binary_blueprint=child_binary_blueprint,
                 binary_manifest=child_binary_manifest,
                 supported_binary_actions=child_supported_actions,
-                artifact_format=str(artifact_format or "binary_blob"),
+                artifact_format=str(artifact_format or "native_binary"),
                 runtime=child_runtime,
                 compiler_ring=compiler_ring,
             )
@@ -3969,7 +3972,7 @@ class HegemonControlPlane:
                 "binary_header": binary_header,
                 "binary_blueprint": binary_blueprint,
                 "supported_binary_actions": supported_binary_actions,
-                "artifact_format": str(artifact_format or "binary_blob"),
+                "artifact_format": str(artifact_format or "native_binary"),
             }
         )
         compiled_blob = self._drone_compiler.compile(drone=Drone(
@@ -3989,7 +3992,7 @@ class HegemonControlPlane:
             binary_blueprint=binary_blueprint,
             binary_header=binary_header,
             binary_manifest=binary_manifest,
-            artifact_format=str(artifact_format or "binary_blob"),
+            artifact_format=str(artifact_format or "native_binary"),
             runtime=runtime_obj,
             compiler_ring=compiler_ring,
         ), private_key_hex=private_key_hex, embedded_intel=embedded_intel)
@@ -4033,7 +4036,7 @@ class HegemonControlPlane:
             binary_blob=compiled_blob,
             blob_path="",
             supported_binary_actions=supported_binary_actions,
-            artifact_format=str(artifact_format or "binary_blob"),
+            artifact_format=str(artifact_format or "native_binary"),
             runtime=runtime_obj,
             compiler_ring=compiler_ring,
         )
@@ -4310,16 +4313,20 @@ class HegemonControlPlane:
             return self._next_node(node)
         if kind == "fingerprint_hosts":
             host = drone.target_host or "127.0.0.1"
-            banners = {}
-            for port in (80, 443, 22):
+            candidate_ports = self._lateral_designer.build_candidate_ports("tcp_probe", 445)[:8]
+            banners: dict[str, str] = {}
+            open_ports: list[int] = []
+            for port in candidate_ports:
                 try:
                     with socket.create_connection((host, port), timeout=0.5) as sock:
+                        open_ports.append(port)
                         sock.settimeout(0.5)
                         data = sock.recv(256)
                         banners[str(port)] = data.decode(errors="ignore")
                 except Exception:
                     continue
-            self._append_signed_telemetry(drone, f"Fingerprint {host}", banners=banners)
+            inferred = self._lateral_designer.infer_services(open_ports, {int(k): v for k, v in banners.items()})
+            self._append_signed_telemetry(drone, f"Fingerprint {host}", open_ports=open_ports, services=inferred, banners=banners)
             return self._next_node(node)
         if kind == "deploy_honeypot":
             if hasattr(self, "_runtime") and getattr(self, "_runtime", None) is not None and hasattr(self._runtime, "detection") and hasattr(self._runtime.detection, "honeypot"):
@@ -4336,12 +4343,24 @@ class HegemonControlPlane:
             self._append_signed_telemetry(drone, f"Vuln scan complete findings={len(result.new_findings)}")
             return self._next_node(node)
         if kind == "send_report":
-            self._append_signed_telemetry(drone, "Report sent", findings=len(drone.findings), stats=drone.stats)
+            body = {
+                "drone_id": drone.drone_id,
+                "status": drone.status,
+                "findings": list(drone.findings)[-100:],
+                "stats": dict(drone.stats),
+                "ts": time.time(),
+            }
+            rt = RuntimeActionEngine(RuntimeContext(drone_id=drone.drone_id, base_dir=Path("data") / "drones" / drone.drone_id, autonomy_level=drone.autonomy_level))
+            res = rt.send_report(body)
+            self._append_signed_telemetry(drone, "Report sent", findings=len(drone.findings), stats=drone.stats, delivered=bool(res.artifacts.get("delivered", False)))
             return self._next_node(node)
         if kind == "establish_contact":
-            if drone.tier == "autonomous":
+            rt = RuntimeActionEngine(RuntimeContext(drone_id=drone.drone_id, base_dir=Path("data") / "drones" / drone.drone_id, autonomy_level=drone.autonomy_level))
+            res = rt.establish_contact("127.0.0.1", 5000)
+            connected = bool(res.artifacts.get("connected", False))
+            if drone.tier == "autonomous" and connected:
                 drone.status = "returning"
-            self._append_signed_telemetry(drone, "Contact established")
+            self._append_signed_telemetry(drone, "Contact established", connected=connected)
             return self._next_node(node)
         if kind == "self_terminate":
             drone.status = "terminated"
@@ -4405,11 +4424,17 @@ class HegemonControlPlane:
             return self._next_node(node)
         if kind == "sinkhole_clone":
             if drone.autonomy_level == "enforce":
-                self._append_signed_telemetry(drone, "Sinkhole clone executed")
+                target = normalize_target_host(str(node.params.get("target", drone.target_host or "127.0.0.1")))
+                rt = RuntimeActionEngine(RuntimeContext(drone_id=drone.drone_id, base_dir=Path("data") / "drones" / drone.drone_id, autonomy_level=drone.autonomy_level))
+                res = rt.sinkhole_clone(target)
+                self._append_signed_telemetry(drone, "Sinkhole clone executed", target=target, sink_file=str(res.artifacts.get("path", "")))
             return self._next_node(node)
         if kind == "isolate_source_ip":
             if drone.autonomy_level == "enforce":
-                self._append_signed_telemetry(drone, "Source IP isolated")
+                source_ip = normalize_ip(str(node.params.get("ip", node.params.get("source_ip", ""))))
+                rt = RuntimeActionEngine(RuntimeContext(drone_id=drone.drone_id, base_dir=Path("data") / "drones" / drone.drone_id, autonomy_level=drone.autonomy_level))
+                res = rt.isolate_source_ip(source_ip)
+                self._append_signed_telemetry(drone, "Source IP isolated", ip=source_ip, blocked=bool(res.ok))
             return self._next_node(node)
         if kind in {"lateral_move", "pivot_host"}:
             source_host = normalize_target_host(drone.target_host or "127.0.0.1")
@@ -4436,16 +4461,13 @@ class HegemonControlPlane:
                 except Exception:
                     continue
 
-            mesh_hosts = [h for h in {target_host, source_host, "10.0.0.5", "10.0.1.10", "10.0.2.25"} if h]
-            host_roles = {
-                source_host: "jump_host",
-                target_host: "workstation" if target_host.startswith("10.") else "unknown",
-                "10.0.0.5": "domain_controller",
-                "10.0.1.10": "db",
-                "10.0.2.25": "workstation",
-            }
-            host_trust = {source_host: 0.31, target_host: 0.54, "10.0.0.5": 0.79, "10.0.1.10": 0.66, "10.0.2.25": 0.45}
-            host_anomaly = {source_host: 0.12, target_host: 0.35, "10.0.0.5": 0.28, "10.0.1.10": 0.41, "10.0.2.25": 0.2}
+            observed_hosts = [normalize_target_host(h) for h in drone.health.get("alive_hosts", []) if isinstance(h, str)]
+            mesh_hosts = [h for h in dict.fromkeys([source_host, *observed_hosts, target_host]) if h]
+            host_roles = {h: ("jump_host" if h == source_host else "workstation") for h in mesh_hosts}
+            host_roles[target_host] = "workstation" if target_host.startswith("10.") else "unknown"
+            base_anomaly = float(drone.health.get("anomaly_score", 0.2) or 0.2)
+            host_trust = {h: max(0.05, min(0.95, 0.65 - (0.02 * i))) for i, h in enumerate(mesh_hosts)}
+            host_anomaly = {h: max(0.0, min(1.0, base_anomaly + (0.04 * i))) for i, h in enumerate(mesh_hosts)}
 
             pivot_plan = self._lateral_designer.design_plan(
                 source_host=source_host,

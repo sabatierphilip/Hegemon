@@ -1,12 +1,12 @@
 """
 StoreClient: fetches live package/app metadata from trusted store APIs.
-All results cached in data/store_cache.shelve with 24hr TTL.
+All results are cached in SQLite with a 24hr TTL.
 Never hard-fails — returns empty result on any network error.
 """
 from __future__ import annotations
 
 import json
-import shelve
+import sqlite3
 import time
 import urllib.error
 import urllib.parse
@@ -32,28 +32,61 @@ class StoreSearchResult:
 
 
 class StoreClient:
-    def __init__(self, cache_path: str = "data/store_cache.shelve"):
+    def __init__(self, cache_path: str = "data/store_cache.sqlite"):
         self._cache_path = cache_path
         self._ttl_seconds = 86400
+        self._init_db()
+
+    def _init_db(self) -> None:
+        Path(self._cache_path).parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._cache_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS store_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    value_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_store_cache_ts ON store_cache(ts)")
+            conn.commit()
 
     def _cache_get(self, key: str) -> Any | None:
-        Path(self._cache_path).parent.mkdir(parents=True, exist_ok=True)
         try:
-            with shelve.open(self._cache_path) as db:
-                row = db.get(key)
+            with sqlite3.connect(self._cache_path) as conn:
+                row = conn.execute(
+                    "SELECT ts, value_json FROM store_cache WHERE cache_key = ?",
+                    (key,),
+                ).fetchone()
                 if not row:
                     return None
-                if time.time() - float(row.get("ts", 0)) > self._ttl_seconds:
+                ts, value_json = float(row[0]), str(row[1])
+                if time.time() - ts > self._ttl_seconds:
+                    conn.execute("DELETE FROM store_cache WHERE cache_key = ?", (key,))
+                    conn.commit()
                     return None
-                return row.get("value")
+                return json.loads(value_json)
         except Exception:
             return None
 
     def _cache_set(self, key: str, value: Any) -> None:
-        Path(self._cache_path).parent.mkdir(parents=True, exist_ok=True)
         try:
-            with shelve.open(self._cache_path) as db:
-                db[key] = {"ts": time.time(), "value": value}
+            encoded = json.dumps(value, sort_keys=True, ensure_ascii=False)
+            with sqlite3.connect(self._cache_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO store_cache(cache_key, ts, value_json)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                      ts=excluded.ts,
+                      value_json=excluded.value_json
+                    """,
+                    (key, time.time(), encoded),
+                )
+                # lightweight GC of stale records
+                conn.execute("DELETE FROM store_cache WHERE ts < ?", (time.time() - self._ttl_seconds * 2,))
+                conn.commit()
         except Exception:
             return
 
@@ -80,6 +113,7 @@ class StoreClient:
 
     def search(self, query: str, store_ids: list[str] | None = None, limit: int = 10) -> list[StoreSearchResult]:
         from sentinel_containment.controlplane import STORE_REGISTRY
+
         out: list[StoreSearchResult] = []
         q = query.strip()
         for store in STORE_REGISTRY:
@@ -108,19 +142,21 @@ class StoreClient:
                 publisher = str(row.get("publisher") or row.get("developer") or row.get("artistName") or row.get("maintainer") or "unknown")
                 if q.lower() not in name.lower() and not name.lower().startswith(q.lower()):
                     continue
-                out.append(StoreSearchResult(
-                    store_id=sid,
-                    name=name,
-                    publisher=publisher,
-                    version=str(row.get("version") or row.get("latest") or "unknown"),
-                    bundle_id=row.get("bundleId") if isinstance(row.get("bundleId"), str) else None,
-                    icon_url=row.get("icon") if isinstance(row.get("icon"), str) else row.get("artworkUrl100"),
-                    category=row.get("category") if isinstance(row.get("category"), str) else None,
-                    description=row.get("description") if isinstance(row.get("description"), str) else None,
-                    score=self._score(q, name),
-                    trust_tier=str(store.get("trust_tier", "community")),
-                    raw=row,
-                ))
+                out.append(
+                    StoreSearchResult(
+                        store_id=sid,
+                        name=name,
+                        publisher=publisher,
+                        version=str(row.get("version") or row.get("latest") or "unknown"),
+                        bundle_id=row.get("bundleId") if isinstance(row.get("bundleId"), str) else None,
+                        icon_url=row.get("icon") if isinstance(row.get("icon"), str) else row.get("artworkUrl100"),
+                        category=row.get("category") if isinstance(row.get("category"), str) else None,
+                        description=row.get("description") if isinstance(row.get("description"), str) else None,
+                        score=self._score(q, name),
+                        trust_tier=str(store.get("trust_tier", "community")),
+                        raw=row,
+                    )
+                )
         dedup: dict[tuple[str, str], StoreSearchResult] = {}
         for r in out:
             key = (r.name.lower(), r.publisher.lower())
@@ -132,7 +168,7 @@ class StoreClient:
         q = package.strip()
         ck = f"meta:{store_id}:{q.lower()}"
         cached = self._cache_get(ck)
-        if cached:
+        if isinstance(cached, dict):
             return StoreSearchResult(**cached)
         hits = self.search(q, [store_id], limit=10)
         if not hits:
