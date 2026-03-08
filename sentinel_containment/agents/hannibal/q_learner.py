@@ -5,6 +5,11 @@ import random
 from pathlib import Path
 
 from .campaign_state import CampaignState
+from .synthetic_dataset import (
+    build_synthetic_q_training_dataset,
+    ensure_synthetic_q_curriculum_file,
+    load_synthetic_q_training_dataset,
+)
 
 StateKey = tuple[int, int, int, int, int]
 
@@ -23,8 +28,11 @@ class HannibalQLearner:
         self._epsilon = self.EPSILON_START
         self._episode = 0
         self._q: dict[str, list[float]] = {}
+        self._bootstrapped_scenarios = 0
         if qtable_path.exists():
             self._load()
+        if not self._q:
+            self._bootstrap_with_synthetic_curriculum()
 
     def _key(self, state: StateKey) -> str:
         return "|".join(map(str, state))
@@ -97,3 +105,26 @@ class HannibalQLearner:
             self._q = data.get("q", {})
         except Exception:
             self._q = {}
+
+    def _bootstrap_with_synthetic_curriculum(self) -> None:
+        """Warm-start Q values using synthetic offense/defence mission scenarios."""
+        curriculum_path = ensure_synthetic_q_curriculum_file()
+        scenarios = load_synthetic_q_training_dataset(curriculum_path)
+        if not scenarios:
+            scenarios = build_synthetic_q_training_dataset()
+        self._bootstrapped_scenarios = len(scenarios)
+        for scenario in scenarios:
+            if scenario.action not in self._actions:
+                continue
+            row = self._q_row(scenario.state)
+            action_idx = self._actions.index(scenario.action)
+            next_row = self._q_row(scenario.next_state)
+            td_target = scenario.reward + self.GAMMA * max(next_row)
+            td_error = td_target - row[action_idx]
+            row[action_idx] += self.ALPHA * td_error
+            self._q[self._key(scenario.state)] = row
+        self._save()
+
+    @property
+    def bootstrapped_scenarios(self) -> int:
+        return self._bootstrapped_scenarios

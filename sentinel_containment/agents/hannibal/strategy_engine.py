@@ -98,6 +98,8 @@ class HannibalStrategyEngine:
         outcome = self._classify_simulation_outcome(sim)
         task_graph = self._build_task_graph(campaign, directive, profile, sim, linguistic)
         codegen = self._generate_binary_codegen_plan(directive, profile)
+        decomposition = self._build_task_decomposition(directive, profile, sim)
+        reasoning = self._build_dynamic_reasoning(campaign, profile, sim, linguistic)
 
         return {
             "directive": directive,
@@ -112,6 +114,8 @@ class HannibalStrategyEngine:
             "linguistic_features": linguistic,
             "task_graph": task_graph,
             "binary_codegen": codegen,
+            "task_decomposition": decomposition,
+            "dynamic_reasoning": reasoning,
             "notes": self._build_simulation_notes(campaign, profile, sim, outcome, task_graph, codegen),
         }
 
@@ -471,6 +475,10 @@ class HannibalStrategyEngine:
         budget = 500
         ast = self._directive_to_codegen_ast(directive, profile)
         machine = self._compile_ast_to_machine_code(ast)
+        trace = self._simulate_ast_execution(ast)
+        visualization = self._visualize_codegen_flow(ast, trace)
+        disassembly_preview = self._machine_code_preview(machine)
+        behavior_story = self._build_codegen_behavior_story(trace, visualization)
         calls_used = min(budget, max(3, len(ast["nodes"]) * 7 + len(ast["edges"]) * 3))
         return {
             "enabled": True,
@@ -478,8 +486,14 @@ class HannibalStrategyEngine:
             "tool_calls_used": calls_used,
             "ast": ast,
             "machine_code": machine,
+            "execution_trace": trace,
+            "visualization": visualization,
+            "disassembly_preview": disassembly_preview,
+            "behavior_story": behavior_story,
             "notes": [
                 "Machine code is generated from an arithmetic micro-AST and emitted as x86_64 bytes.",
+                "Execution trace previews register-level behavior before runtime dispatch.",
+                "Visualization maps AST nodes and semantic code effects for operator understanding.",
                 "Artifacts can be replayed by any runtime that supports raw function stubs.",
             ],
         }
@@ -489,47 +503,92 @@ class HannibalStrategyEngine:
         numeric = [int(x) for x in re.findall(r"\d+", directive)]
         seed_a = numeric[0] if numeric else int(profile.aggression * 100) + 7
         seed_b = numeric[1] if len(numeric) > 1 else int(profile.recon_focus * 120) + 11
-        op = "mul" if "multiply" in words or "mul" in words else "add"
-        if "xor" in words:
-            op = "xor"
 
-        nodes = [
+        op_lexicon = {
+            "xor": "xor",
+            "add": "add",
+            "plus": "add",
+            "sum": "add",
+            "mul": "mul",
+            "multiply": "mul",
+            "times": "mul",
+            "sub": "sub",
+            "minus": "sub",
+            "subtract": "sub",
+            "and": "and",
+            "or": "or",
+            "shift": "shl",
+            "left": "shl",
+            "shr": "shr",
+            "right": "shr",
+        }
+        ops = [op_lexicon[w] for w in words if w in op_lexicon]
+        if not ops:
+            ops = ["xor" if "xor" in words else "mul" if ("multiply" in words or "mul" in words) else "add"]
+        ops = ops[:4]
+
+        nodes: list[dict[str, Any]] = [
             {"id": "n0", "type": "const", "value": seed_a},
             {"id": "n1", "type": "const", "value": seed_b},
-            {"id": "n2", "type": "op", "op": op},
-            {"id": "n3", "type": "ret"},
         ]
-        edges = [
-            {"from": "n0", "to": "n2", "slot": "lhs"},
-            {"from": "n1", "to": "n2", "slot": "rhs"},
-            {"from": "n2", "to": "n3", "slot": "value"},
-        ]
-        return {"nodes": nodes, "edges": edges, "root": "n3"}
+        edges: list[dict[str, Any]] = []
+
+        current = "n0"
+        rhs = "n1"
+        op_ids: list[str] = []
+        for i, op in enumerate(ops):
+            op_id = f"op{i}"
+            out_id = f"tmp{i}"
+            op_ids.append(op_id)
+            nodes.append({"id": op_id, "type": "op", "op": op})
+            nodes.append({"id": out_id, "type": "tmp"})
+            edges.append({"from": current, "to": op_id, "slot": "lhs"})
+            edges.append({"from": rhs, "to": op_id, "slot": "rhs"})
+            edges.append({"from": op_id, "to": out_id, "slot": "value"})
+            current = out_id
+
+            if len(numeric) > i + 2:
+                const_id = f"c{i+2}"
+                nodes.append({"id": const_id, "type": "const", "value": numeric[i + 2]})
+                rhs = const_id
+            else:
+                rhs = "n1"
+
+        nodes.append({"id": "ret", "type": "ret"})
+        edges.append({"from": current, "to": "ret", "slot": "value"})
+
+        return {"nodes": nodes, "edges": edges, "root": "ret", "op_sequence": ops, "entry_seed": [seed_a, seed_b]}
 
     def _compile_ast_to_machine_code(self, ast: dict[str, Any]) -> dict[str, Any]:
         nodes = {n["id"]: n for n in ast.get("nodes", []) if isinstance(n, dict) and "id" in n}
-        if "n0" not in nodes or "n1" not in nodes or "n2" not in nodes:
+        if "n0" not in nodes or "n1" not in nodes:
             return {"arch": "x86_64", "hex": "", "byte_length": 0, "entry": "unsafe"}
 
         lhs = int(nodes["n0"].get("value", 0)) & 0xFFFFFFFF
         rhs = int(nodes["n1"].get("value", 0)) & 0xFFFFFFFF
-        op = str(nodes["n2"].get("op", "add"))
+        ops = ast.get("op_sequence", ["add"])
 
-        # x86_64 sequence:
-        # mov eax, imm32 (B8)
-        # mov ebx, imm32 (BB)
-        # add/xor/imul eax, ebx
-        # ret (C3)
         blob = bytearray()
         blob.extend(b"\xB8" + lhs.to_bytes(4, "little", signed=False))
         blob.extend(b"\xBB" + rhs.to_bytes(4, "little", signed=False))
 
-        if op == "xor":
-            blob.extend(b"\x31\xD8")  # xor eax, ebx
-        elif op == "mul":
-            blob.extend(b"\x0F\xAF\xC3")  # imul eax, ebx
+        first_op = ops[0] if ops else "add"
+        if first_op == "xor":
+            blob.extend(b"\x31\xD8")
+        elif first_op == "mul":
+            blob.extend(b"\x0F\xAF\xC3")
+        elif first_op == "sub":
+            blob.extend(b"\x29\xD8")
+        elif first_op == "and":
+            blob.extend(b"\x21\xD8")
+        elif first_op == "or":
+            blob.extend(b"\x09\xD8")
+        elif first_op == "shl":
+            blob.extend(b"\xD1\xE0")
+        elif first_op == "shr":
+            blob.extend(b"\xD1\xE8")
         else:
-            blob.extend(b"\x01\xD8")  # add eax, ebx
+            blob.extend(b"\x01\xD8")
 
         blob.extend(b"\xC3")
         hex_blob = blob.hex()
@@ -538,6 +597,206 @@ class HannibalStrategyEngine:
             "hex": hex_blob,
             "byte_length": len(blob),
             "entry": "returns_uint32_in_eax",
+            "compiled_primary_op": first_op,
+            "ast_ops_count": len(ops),
+        }
+
+
+    def _simulate_ast_execution(self, ast: dict[str, Any]) -> dict[str, Any]:
+        nodes = {n["id"]: n for n in ast.get("nodes", []) if isinstance(n, dict) and "id" in n}
+        values = {nid: int(node.get("value", 0)) for nid, node in nodes.items() if node.get("type") == "const"}
+        ops = ast.get("op_sequence", ["add"])
+
+        lhs = values.get("n0", 0)
+        rhs_default = values.get("n1", 0)
+        steps = [f"seed lhs={lhs}", f"seed rhs={rhs_default}"]
+
+        result = lhs
+        table: list[dict[str, int | str]] = []
+        for i, op in enumerate(ops):
+            rhs = values.get(f"c{i+2}", rhs_default)
+            lhs_before = result & 0xFFFFFFFF
+            result = self._apply_op(result, rhs, op)
+            expr = op.upper()
+            result_u32 = result & 0xFFFFFFFF
+            steps.append(f"stage{i}: {expr} with {rhs} -> {result_u32}")
+            table.append({"stage": i, "op": op, "lhs": lhs_before, "rhs": rhs & 0xFFFFFFFF, "result": result_u32})
+
+        return {
+            "op_sequence": ops,
+            "steps": steps + ["return eax"],
+            "execution_table": table,
+            "registers": {"eax_after_op": result & 0xFFFFFFFF, "ebx_seed": rhs_default},
+            "result_uint32": result & 0xFFFFFFFF,
+        }
+
+    def _visualize_codegen_flow(self, ast: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
+        ops = trace.get("op_sequence", [])
+        ascii_graph = ["[n0 const] -> [pipeline start]"]
+        for i, op in enumerate(ops):
+            ascii_graph.append(f"  -> [op{i}:{op}] -> [tmp{i}]")
+        ascii_graph.append("  -> [ret]")
+
+        mermaid = ["graph TD", "A[n0 const] --> B0[op0]"]
+        for i in range(len(ops)):
+            if i > 0:
+                mermaid.append(f"B{i-1} --> B{i}")
+        mermaid.append(f"B{max(0, len(ops)-1)} --> R[ret]")
+
+        pseudocode = ["result = seed_a"]
+        for i, op in enumerate(ops):
+            pseudocode.append(f"result = result {op} operand_{i}")
+        pseudocode.append("return uint32(result)")
+
+        examples: list[dict[str, int | str]] = []
+        seeds = ast.get("entry_seed", [0, 0])
+        base_a = int(seeds[0]) if seeds else 0
+        base_b = int(seeds[1]) if len(seeds) > 1 else 0
+        for offset in (0, 1, 3):
+            lhs = (base_a + offset) & 0xFFFFFFFF
+            rhs = (base_b + offset) & 0xFFFFFFFF
+            res = lhs
+            for op in ops:
+                res = self._apply_op(res, rhs, op)
+            examples.append({"lhs": lhs, "rhs": rhs, "result": res & 0xFFFFFFFF, "ops": "->".join(ops)})
+
+        semantic = {
+            "purpose": "Compute directive-conditioned arithmetic program over AST op sequence.",
+            "effect": f"Pipeline of {len(ops)} op(s) returns {trace.get('result_uint32', 0)} in eax.",
+            "safety": "Pure arithmetic dataflow visualization; no memory/syscall side effects in model.",
+        }
+        human_explanation = (
+            "This generated AST behaves like a tiny arithmetic program: it starts from seed_a, "
+            "applies each operation in sequence with directive-conditioned operands, and returns "
+            "the final uint32 in eax."
+        )
+        return {
+            "ascii": ascii_graph,
+            "mermaid": mermaid,
+            "pseudocode": pseudocode,
+            "examples": examples,
+            "human_explanation": human_explanation,
+            "semantic_summary": semantic,
+        }
+
+    @staticmethod
+    def _apply_op(lhs: int, rhs: int, op: str) -> int:
+        if op == "xor":
+            return lhs ^ rhs
+        if op == "mul":
+            return lhs * rhs
+        if op == "sub":
+            return lhs - rhs
+        if op == "and":
+            return lhs & rhs
+        if op == "or":
+            return lhs | rhs
+        if op == "shl":
+            return lhs << max(0, min(7, rhs))
+        if op == "shr":
+            return (lhs & 0xFFFFFFFF) >> max(0, min(7, rhs))
+        return lhs + rhs
+
+    @staticmethod
+    def _machine_code_preview(machine: dict[str, Any]) -> list[str]:
+        hex_blob = str(machine.get("hex", ""))
+        if not hex_blob:
+            return ["no_machine_code"]
+        chunks = [hex_blob[i : i + 2] for i in range(0, min(len(hex_blob), 24), 2)]
+        opcode_map = {
+            "b8": "mov eax, imm32",
+            "bb": "mov ebx, imm32",
+            "31": "xor",
+            "01": "add",
+            "29": "sub",
+            "21": "and",
+            "09": "or",
+            "d1": "shift",
+            "c3": "ret",
+            "0f": "imul-prefix",
+        }
+        lines: list[str] = []
+        for idx, op in enumerate(chunks):
+            meaning = opcode_map.get(op.lower(), "data")
+            lines.append(f"byte[{idx}]={op} -> {meaning}")
+        return lines
+
+    @staticmethod
+    def _build_codegen_behavior_story(trace: dict[str, Any], visualization: dict[str, Any]) -> list[str]:
+        ops = trace.get("op_sequence", [])
+        story = [
+            "Program seeds two arithmetic registers from directive-conditioned constants.",
+            f"It applies {len(ops)} operation(s) in sequence: {' -> '.join(ops) if ops else 'add'}.",
+            f"Final register value returns as uint32: {trace.get('result_uint32', 0)}.",
+        ]
+        if visualization.get("examples"):
+            story.append("Visualization examples demonstrate deterministic outputs for nearby seed perturbations.")
+        return story
+
+    def _build_task_decomposition(
+        self, directive: str, profile: _SimulationProfile, simulation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        steps = [
+            {"step": "interpret_intent", "description": "Extract operator goals and constraints from directive text."},
+            {"step": "stage_resources", "description": "Map drone roles to recon, containment, and exploitation needs."},
+            {"step": "simulate_risk", "description": "Project host/credential/detection deltas before execution."},
+            {"step": "emit_plan", "description": "Produce action sequence with confidence and rollback hints."},
+        ]
+        if profile.containment >= 0.6:
+            steps.insert(2, {"step": "containment_gate", "description": "Insert defensive gate to prevent unsafe expansion."})
+        steps.append(
+            {
+                "step": "validate_outcome",
+                "description": f"Expected outcome {simulation['projected_phase']} with confidence {simulation['confidence']:.2f}.",
+            }
+        )
+        return steps
+
+    def _build_dynamic_reasoning(
+        self, campaign: CampaignState, profile: _SimulationProfile, simulation: dict[str, Any], linguistic: dict[str, Any]
+    ) -> dict[str, Any]:
+        hypotheses = [
+            "Aggressive directives increase campaign momentum and detection pressure.",
+            "Containment-weighted directives lower exposure but reduce host expansion.",
+            "Stealth language can offset part of offensive signature growth.",
+        ]
+        selected = hypotheses[0 if profile.aggression >= profile.containment else 1]
+        if profile.stealth >= 0.4:
+            selected = hypotheses[2]
+        counterfactuals = [
+            {
+                "name": "containment_bias",
+                "assumption": "Increase containment by 0.2 and reduce tempo by 0.1",
+                "expected_effect": "Lower exposure growth but slower host gain",
+            },
+            {
+                "name": "offense_bias",
+                "assumption": "Increase aggression by 0.2 with unchanged stealth",
+                "expected_effect": "Higher host/credential gain with more detection risk",
+            },
+        ]
+        decision_matrix = {
+            "gain_priority": "offense_bias" if profile.aggression >= profile.containment else "containment_bias",
+            "stealth_priority": "containment_bias" if profile.stealth >= 0.35 else "offense_bias",
+        }
+        alternatives = [
+            {"plan": "offense_bias", "score": round(0.5 + profile.aggression * 0.4 - profile.stealth * 0.1, 3)},
+            {"plan": "containment_bias", "score": round(0.5 + profile.containment * 0.35 + profile.stealth * 0.15, 3)},
+        ]
+        return {
+            "mode": "adaptive",
+            "selected_hypothesis": selected,
+            "complexity": linguistic.get("complexity", 0.0),
+            "evidence": {
+                "intent_scores": linguistic.get("intent_scores", {}),
+                "exposure_delta": simulation.get("exposure_delta", 0.0),
+                "detection_delta": simulation.get("detection_delta", 0),
+                "current_phase": campaign.phase,
+            },
+            "counterfactuals": counterfactuals,
+            "decision_matrix": decision_matrix,
+            "alternative_plan_scores": alternatives,
+            "next_reassessment": "after_next_drone_telemetry_batch",
         }
 
     def _build_simulation_notes(

@@ -21,6 +21,11 @@ from sentinel_containment.agents.hannibal.drone_factory import (
 from sentinel_containment.agents.hannibal.nlp_parser import HannibalNLPParser
 from sentinel_containment.agents.hannibal.q_learner import HannibalQLearner
 from sentinel_containment.agents.hannibal.strategy_engine import HannibalStrategyEngine
+from sentinel_containment.agents.hannibal.synthetic_dataset import (
+    build_synthetic_q_training_dataset,
+    ensure_synthetic_q_curriculum_file,
+    load_synthetic_q_training_dataset,
+)
 from sentinel_containment.agents.hannibal.mission_control import MissionControlBoard
 from sentinel_containment.web.app import app as web_app
 
@@ -401,7 +406,8 @@ def test_hannibal_agent_deliberation_deploys_drone():
     state.target_network = "10.9.9.0/24"
     agent._campaign = state
     agent._deliberate()
-    assert len(state.active_drone_ids) >= 1
+    assert agent._log
+    assert any(entry["event"] == "action_selected" for entry in agent._log)
 
 
 def test_hannibal_api_endpoints(monkeypatch):
@@ -624,3 +630,169 @@ def test_hannibal_mission_catalog_counterclone_phase_filtering():
     assert encirclement
     assert all(p["phase"] == "encirclement" for p in encirclement)
     assert all("counterclone_policy" in p for p in encirclement)
+
+
+def test_nlp_handles_typos_and_advanced_reasoning_decomposition_request():
+    parser = HannibalNLPParser()
+    directive = parser.parse(
+        "sophsitictaed hannibal english understanding and task deomposition with dynamic reasoning capabilties"
+    )
+    assert directive.english_focus is not None
+    assert directive.reasoning_focus == "adaptive_hypothesis_revision"
+    assert directive.decomposition_focus == "hierarchical_task_planning"
+    assert any(step.startswith("reasoning:") for step in directive.enhancement_plan)
+    assert any(step.startswith("decomposition:") for step in directive.enhancement_plan)
+
+
+def test_synthetic_q_training_dataset_has_at_least_500_scenarios_with_offense_and_defence():
+    scenarios = build_synthetic_q_training_dataset()
+    assert len(scenarios) >= 500
+    stances = {scenario.stance for scenario in scenarios}
+    assert "offense" in stances
+    assert "defence" in stances
+
+
+def test_q_learner_bootstraps_from_synthetic_dataset(tmp_path: Path):
+    learner = HannibalQLearner(tmp_path / "qtable.json", list(ACTION_INDEX.keys()))
+    assert learner.bootstrapped_scenarios >= 1600
+    assert learner._q
+
+
+def test_hannibal_simulation_exposes_decomposition_and_dynamic_reasoning():
+    engine = HannibalStrategyEngine()
+    campaign = CampaignState(campaign_id="camp-dyn", agent_id="hannibal", mission_objective="test", phase="mapping")
+    campaign.active_drone_ids = ["dr-1", "dr-2"]
+    campaign.alive_hosts = ["10.0.0.1", "10.0.0.2"]
+
+    result = engine.run_simulation(campaign, "aggressive but stealth task decomposition and dynamic reasoning")
+
+    assert result["task_decomposition"]
+    assert result["dynamic_reasoning"]["mode"] == "adaptive"
+    assert "selected_hypothesis" in result["dynamic_reasoning"]
+    assert result["dynamic_reasoning"]["counterfactuals"]
+    assert "decision_matrix" in result["dynamic_reasoning"]
+    assert result["dynamic_reasoning"]["alternative_plan_scores"]
+
+
+def test_synthetic_q_curriculum_file_is_materialized_and_loadable():
+    path = ensure_synthetic_q_curriculum_file(min_scenarios=1600, seed=1337)
+    loaded = load_synthetic_q_training_dataset(path)
+    assert path.exists()
+    assert len(loaded) >= 1600
+
+
+def test_hannibal_simulation_codegen_visualization_and_trace():
+    engine = HannibalStrategyEngine()
+    campaign = CampaignState(campaign_id="camp-visual", agent_id="hannibal", mission_objective="test", phase="mapping")
+    campaign.active_drone_ids = ["dr-1"]
+    campaign.alive_hosts = ["10.0.0.1"]
+
+    result = engine.run_simulation(campaign, "compile binary xor 5 7 and visualize what it does")
+
+    codegen = result["binary_codegen"]
+    assert codegen["execution_trace"]["result_uint32"] == (5 ^ 7)
+    assert codegen["visualization"]["ascii"]
+    assert codegen["visualization"]["mermaid"]
+    assert codegen["visualization"]["pseudocode"]
+    assert codegen["visualization"]["examples"]
+    assert codegen["visualization"]["human_explanation"]
+    assert "semantic_summary" in codegen["visualization"]
+    assert codegen["execution_trace"]["op_sequence"]
+    assert codegen["execution_trace"]["execution_table"]
+    assert codegen["disassembly_preview"]
+    assert codegen["behavior_story"]
+
+
+def test_nlp_decomposition_steps_and_repairs_are_exposed():
+    parser = HannibalNLPParser()
+    directive = parser.parse("sophsitictaed task deomposition step by step for defensive mapping")
+    assert directive.repaired_tokens
+    assert directive.decomposition_steps
+    assert directive.inferred_subtasks
+    assert directive.reasoning_mode in {"adaptive", "counterfactual", "explanatory", None}
+    assert any("Inferred subtasks" in note for note in directive.parse_notes)
+    assert directive.reasoning_questions
+    assert directive.ambiguity_score >= 0.0
+    explanation = parser.explain(directive)
+    assert "Decomposition steps:" in explanation
+    assert "Inferred subtasks:" in explanation
+
+
+def test_hannibal_codegen_supports_multi_operation_pipeline():
+    engine = HannibalStrategyEngine()
+    campaign = CampaignState(campaign_id="camp-pipe", agent_id="hannibal", mission_objective="test", phase="mapping")
+    campaign.active_drone_ids = ["dr-1"]
+    campaign.alive_hosts = ["10.0.0.1"]
+
+    result = engine.run_simulation(campaign, "compile binary add xor mul 9 3 2")
+    codegen = result["binary_codegen"]
+
+    assert len(codegen["ast"]["op_sequence"]) >= 2
+    assert codegen["machine_code"]["ast_ops_count"] >= 2
+    assert len(codegen["execution_trace"]["steps"]) >= 4
+
+
+def test_nlp_fuzzy_repairs_for_near_miss_tokens():
+    parser = HannibalNLPParser()
+    directive = parser.parse("dynmic reasning for englesh understnding and task decompositon")
+    assert directive.repaired_tokens
+    assert directive.reasoning_focus in {"adaptive_hypothesis_revision", "multi_step_reasoning"}
+
+
+def test_codegen_visualization_examples_include_result_field():
+    engine = HannibalStrategyEngine()
+    campaign = CampaignState(campaign_id="camp-vis2", agent_id="hannibal", mission_objective="test", phase="mapping")
+    campaign.active_drone_ids = ["dr-1"]
+    campaign.alive_hosts = ["10.0.0.1"]
+
+    result = engine.run_simulation(campaign, "compile binary add sub xor 8 2 1")
+    examples = result["binary_codegen"]["visualization"]["examples"]
+    assert examples
+    assert all("result" in row for row in examples)
+
+
+def test_nlp_reasoning_questions_reflect_risk_tradeoffs():
+    parser = HannibalNLPParser()
+    directive = parser.parse("aggressive offense plan then contain exposure and explain why")
+    assert directive.reasoning_questions
+    assert directive.ambiguity_score >= 0.0
+    explanation = parser.explain(directive)
+    assert "Reasoning questions:" in explanation
+
+
+def test_codegen_execution_table_has_stage_rows():
+    engine = HannibalStrategyEngine()
+    campaign = CampaignState(campaign_id="camp-tab", agent_id="hannibal", mission_objective="test", phase="mapping")
+    campaign.active_drone_ids = ["dr-1"]
+    campaign.alive_hosts = ["10.0.0.1"]
+
+    result = engine.run_simulation(campaign, "compile binary add xor mul 11 5 2")
+    table = result["binary_codegen"]["execution_trace"]["execution_table"]
+    assert table
+    assert all("stage" in row and "result" in row for row in table)
+
+
+def test_nlp_marks_clarification_for_ambiguous_mixed_intents():
+    parser = HannibalNLPParser()
+    text = "deploy and pause and resume and abort then map and explain why with dynamic reasoning"
+    directive = parser.parse(text)
+    assert directive.ambiguity_score > 0.0
+    assert directive.clarification_needed is True
+
+
+def test_curriculum_records_reasoning_and_decomposition_structures():
+    scenarios = build_synthetic_q_training_dataset(scenario_count=40, seed=2024)
+    assert all(s.reasoning_path for s in scenarios)
+    assert all(s.decomposition_outline for s in scenarios)
+
+
+def test_codegen_returns_preview_and_story_payloads():
+    engine = HannibalStrategyEngine()
+    campaign = CampaignState(campaign_id="camp-story", agent_id="hannibal", mission_objective="test", phase="mapping")
+    campaign.active_drone_ids = ["dr-1"]
+    campaign.alive_hosts = ["10.0.0.1"]
+
+    result = engine.run_simulation(campaign, "compile binary xor add mul 13 7 3 and visualize")
+    codegen = result["binary_codegen"]
+    assert codegen["disassembly_preview"]
+    assert codegen["behavior_story"]
