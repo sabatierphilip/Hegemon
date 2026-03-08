@@ -20,6 +20,7 @@ from sentinel_containment.agents.hannibal.drone_factory import (
 )
 from sentinel_containment.agents.hannibal.nlp_parser import HannibalNLPParser
 from sentinel_containment.agents.hannibal.q_learner import HannibalQLearner
+from sentinel_containment.agents.hannibal.mission_control import MissionControlBoard
 from sentinel_containment.web.app import app as web_app
 
 
@@ -114,6 +115,19 @@ def test_nlp_semantic_curriculum_enrichment():
     assert directive.intel_focus is not None
     assert directive.mission_style is not None
     assert directive.recommended_drone_role is not None
+
+
+def test_nlp_counterclone_request_caps_in_agent_layer():
+    parser = HannibalNLPParser()
+    directive = parser.parse("Deploy 9 counterclones against 10.22.0.8")
+    assert directive.intent == "deploy_agent"
+    assert directive.counterclone_count == 9
+
+
+def test_nlp_counterclone_word_count_extraction():
+    parser = HannibalNLPParser()
+    directive = parser.parse("deploy three counter clones and begin mapping")
+    assert directive.counterclone_count == 3
 
 
 
@@ -304,6 +318,32 @@ def test_hannibal_agent_supports_custom_drone_instruction():
     assert campaign.active_drone_ids
     order_actions = [order["action"] for order in campaign.drone_orders]
     assert "DEPLOY_CUSTOM_DRONE" in order_actions
+
+
+def test_hannibal_agent_counterclones_are_capped_to_three():
+    cp = _FakeControlPlane()
+    agent = HannibalAgent(cp)
+    reply = agent.receive_instruction("Deploy 9 counterclones against 10.12.0.5 for rapid mapping")
+    assert reply["acted"] is True
+    assert reply["counterclones_requested"] == 9
+    assert reply["counterclones_deployed"] == 3
+    campaign = agent._campaign
+    assert campaign is not None
+    assert len(campaign.active_drone_ids) == 3
+
+
+def test_hannibal_agent_counterclones_respect_fleet_capacity():
+    cp = _FakeControlPlane()
+    agent = HannibalAgent(cp)
+    state = CampaignState(campaign_id="cap-clone", agent_id="hannibal", mission_objective="recon")
+    state.target_host = "10.1.1.1"
+    state.target_network = "10.1.1.0/24"
+    state.active_drone_ids = [f"prefill-{i}" for i in range(14)]
+    agent._campaign = state
+
+    deployed = agent._deploy_counterclones(state, 3)
+    assert deployed == 1
+    assert len(state.active_drone_ids) == 15
 
 
 def test_hannibal_agent_fleet_cap_is_15():
@@ -529,3 +569,23 @@ def test_hannibal_mission_control_agent_methods():
     assert "tasks" in snapshot
     assert snapshot["playbooks"]
     agent.abort_campaign()
+
+
+def test_hannibal_mission_catalog_contains_counterclone_policy_entries():
+    board = MissionControlBoard()
+    playbooks = board.list_playbooks(query="counterclone")
+    assert playbooks
+    assert len(playbooks) >= 120
+    for playbook in playbooks[:40]:
+        assert "counterclone_policy" in playbook
+        policy = playbook["counterclone_policy"]
+        assert policy["max_counterclones"] == 3
+        assert policy["spawn_mode"] == "bounded_triplet"
+
+
+def test_hannibal_mission_catalog_counterclone_phase_filtering():
+    board = MissionControlBoard()
+    encirclement = board.list_playbooks(query="counterclone", phase="encirclement")
+    assert encirclement
+    assert all(p["phase"] == "encirclement" for p in encirclement)
+    assert all("counterclone_policy" in p for p in encirclement)
