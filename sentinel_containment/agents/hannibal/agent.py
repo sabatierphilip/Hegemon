@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,10 +34,20 @@ PHASE_ADVANCE_ACTIONS = {
 }
 
 
+@dataclass
+class _CountercloneDirective:
+    objective: str
+    codegen_focus: str | None
+    intel_focus: str | None
+    mission_style: str | None
+    english_focus: str | None
+
+
 class HannibalAgent(BaseAgent):
     AGENT_ID = "hannibal"
     LOOP_INTERVAL = 30
     MAX_ACTIVE_DRONES = 15
+    MAX_COUNTERCLONES_PER_REQUEST = 3
 
     def __init__(self, control_plane: "HegemonControlPlane") -> None:
         self._cp = control_plane
@@ -64,6 +75,10 @@ class HannibalAgent(BaseAgent):
             campaign_id = f"campaign-{secrets.token_hex(4)}"
             objective = directive.objective or text
             campaign = self.start_campaign(campaign_id=campaign_id, target=target, objective=objective, autonomy_override=directive.autonomy_override)
+            if getattr(directive, "counterclone_count", 0):
+                deployed = self._deploy_counterclones(campaign, directive.counterclone_count, directive=directive)
+                result["counterclones_requested"] = directive.counterclone_count
+                result["counterclones_deployed"] = deployed
             if directive.custom_drone_requested:
                 self._deploy_custom_drone(campaign, directive)
             result["acted"] = True
@@ -406,6 +421,55 @@ class HannibalAgent(BaseAgent):
             self._record_log("drone_deployed", {"action": "DEPLOY_CUSTOM_DRONE", "drone_id": drone.drone_id, "drone_name": drone_name, "target": target})
         except Exception as exc:
             self._record_log("deploy_failed", {"action": "DEPLOY_CUSTOM_DRONE", "error": str(exc)[:200]})
+
+    def _deploy_counterclones(self, state: CampaignState, requested_count: int, directive: Any | None = None) -> int:
+        target = getattr(state, "target_host", "127.0.0.1") or "127.0.0.1"
+        network = getattr(state, "target_network", None) or f"{target}/24"
+
+        bounded_request = max(0, min(int(requested_count), self.MAX_COUNTERCLONES_PER_REQUEST))
+        remaining_capacity = max(0, self.MAX_ACTIVE_DRONES - len(state.active_drone_ids))
+        to_deploy = min(bounded_request, remaining_capacity)
+
+        if to_deploy <= 0:
+            self._record_log(
+                "counterclone_deploy_skipped",
+                {
+                    "requested": requested_count,
+                    "bounded_request": bounded_request,
+                    "remaining_capacity": remaining_capacity,
+                    "reason": "no_capacity_or_zero_request",
+                },
+            )
+            return 0
+
+        deployed = 0
+        for index in range(to_deploy):
+            clone_objective = f"counterclone {index + 1}/{to_deploy} :: {state.mission_objective}"
+            clone_directive = _CountercloneDirective(
+                objective=clone_objective,
+                codegen_focus=getattr(directive, "codegen_focus", None),
+                intel_focus=getattr(directive, "intel_focus", None),
+                mission_style=getattr(directive, "mission_style", "balanced"),
+                english_focus=getattr(directive, "english_focus", None),
+            )
+
+            before = len(state.active_drone_ids)
+            self._deploy_custom_drone(state, clone_directive)
+            after = len(state.active_drone_ids)
+            if after > before:
+                deployed += 1
+
+        self._record_log(
+            "counterclone_deployed",
+            {
+                "requested": requested_count,
+                "bounded_request": bounded_request,
+                "deployed": deployed,
+                "target": target,
+                "network": network,
+            },
+        )
+        return deployed
 
     def _record_log(self, event: str, data: dict[str, Any]) -> None:
         self._log.append({"ts": time.time(), "event": event, **data})
