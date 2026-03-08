@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from .language_corpus import HannibalLanguageCorpus
 
 
 @dataclass
@@ -14,6 +17,10 @@ class MissionDirective:
     autonomy_override: str | None = None
     confidence: float = 0.0
     parse_notes: list[str] = field(default_factory=list)
+    recommended_drone_role: str | None = None
+    codegen_focus: str | None = None
+    intel_focus: str | None = None
+    mission_style: str | None = None
 
 
 _IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?)\b")
@@ -70,6 +77,11 @@ _OBJECTIVE_KEYWORDS = [
 
 
 class HannibalNLPParser:
+    def __init__(self) -> None:
+        root = Path(__file__).resolve().parents[3]
+        corpus_path = root / "config" / "hannibal_language_curriculum.tsv"
+        self._corpus = HannibalLanguageCorpus(corpus_path)
+
     def parse(self, text: str) -> MissionDirective:
         lower = text.lower().strip()
         directive = MissionDirective(raw_text=text, intent="unknown", confidence=0.0)
@@ -115,6 +127,34 @@ class HannibalNLPParser:
                     directive.confidence = max(directive.confidence, 0.78)
                 break
 
+        semantic_matches = self._corpus.semantic_match(text)
+        semantic = self._corpus.summarize_axes(semantic_matches)
+        if semantic:
+            if directive.intent == "unknown" and semantic.get("intent"):
+                directive.intent = semantic["intent"]
+                directive.confidence = max(directive.confidence, 0.72)
+                directive.parse_notes.append(f"Semantic intent: {directive.intent}")
+
+            if not directive.autonomy_override and semantic.get("autonomy"):
+                directive.autonomy_override = semantic["autonomy"]
+                directive.parse_notes.append(f"Semantic autonomy: {directive.autonomy_override}")
+
+            if not directive.objective and semantic.get("objective"):
+                directive.objective = semantic["objective"]
+                directive.parse_notes.append(f"Semantic objective: {directive.objective}")
+
+            if semantic.get("drone_role"):
+                directive.recommended_drone_role = semantic["drone_role"]
+            if semantic.get("codegen_focus"):
+                directive.codegen_focus = semantic["codegen_focus"]
+            if semantic.get("intel_focus"):
+                directive.intel_focus = semantic["intel_focus"]
+            if semantic.get("mission_style"):
+                directive.mission_style = semantic["mission_style"]
+
+            if semantic_matches:
+                directive.parse_notes.append(f"Semantic curriculum matches: {len(semantic_matches)}")
+
         if directive.intent == "set_objective" and not directive.objective:
             directive.objective = text.strip()
 
@@ -130,6 +170,14 @@ class HannibalNLPParser:
             lines.append(f"Objective: {directive.objective}")
         if directive.autonomy_override:
             lines.append(f"Autonomy: {directive.autonomy_override}")
+        if directive.recommended_drone_role:
+            lines.append(f"Recommended drone role: {directive.recommended_drone_role}")
+        if directive.codegen_focus:
+            lines.append(f"Code generation focus: {directive.codegen_focus}")
+        if directive.intel_focus:
+            lines.append(f"Intelligence focus: {directive.intel_focus}")
+        if directive.mission_style:
+            lines.append(f"Mission style: {directive.mission_style}")
         lines += [f"Note: {n}" for n in directive.parse_notes]
         if directive.confidence < 0.6:
             lines.append("⚠ Low confidence parse — please confirm before executing.")

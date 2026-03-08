@@ -101,6 +101,20 @@ def test_nlp_status_query():
     assert directive.intent == "query_status"
 
 
+def test_nlp_semantic_curriculum_enrichment():
+    parser = HannibalNLPParser()
+    directive = parser.parse(
+        "Initiate Hannibal strategically to improve english comprehension and generate mission scripts "
+        "on segment 22.99.0.0/24 with analyst drones"
+    )
+    assert directive.intent in {"deploy_agent", "set_objective", "adjust_autonomy"}
+    assert directive.target_network == "22.99.0.0/24"
+    assert directive.codegen_focus is not None
+    assert directive.intel_focus is not None
+    assert directive.mission_style is not None
+    assert directive.recommended_drone_role is not None
+
+
 def test_nlp_cidr_extraction():
     parser = HannibalNLPParser()
     directive = parser.parse("Scan 10.0.0.0/24 and find credentials")
