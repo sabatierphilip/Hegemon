@@ -15,6 +15,8 @@ from .doctrine_defaults import ACTION_INDEX, DRONE_TYPE_CONFIGS
 from .drone_factory import BUILDERS
 from .nlp_parser import HannibalNLPParser
 from .q_learner import HannibalQLearner
+from .strategy_engine import HannibalStrategyEngine
+from .mission_control import MissionControlBoard
 
 if TYPE_CHECKING:
     from sentinel_containment.controlplane import HegemonControlPlane
@@ -41,6 +43,8 @@ class HannibalAgent(BaseAgent):
         self._q = HannibalQLearner(DATA_DIR / "qtable.json", list(ACTION_INDEX.keys()))
         self._nlp = HannibalNLPParser()
         self._campaign: CampaignState | None = None
+        self._strategy = HannibalStrategyEngine()
+        self._mission_control = MissionControlBoard()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -120,6 +124,7 @@ class HannibalAgent(BaseAgent):
         with self._lock:
             if not self._campaign:
                 return {"state": "dormant", "q_episode": self._q._episode}
+            briefing = self._strategy.build_briefing(self._campaign, self._cp.drones)
             return {
                 "state": "running" if not self._paused else "paused",
                 "campaign_id": self._campaign.campaign_id,
@@ -131,7 +136,60 @@ class HannibalAgent(BaseAgent):
                 "objectives_completed": self._campaign.objectives_completed,
                 "log_tail": self._log[-20:],
                 "q_episode": self._q._episode,
+                "risk_score": briefing["risk_score"],
+                "risk_band": briefing["risk_band"],
+                "phase_velocity": briefing["phase_velocity"],
             }
+
+    def mission_briefing(self) -> dict[str, Any]:
+        with self._lock:
+            return self._strategy.build_briefing(self._campaign, self._cp.drones)
+
+    def simulate_directive(self, directive: str) -> dict[str, Any]:
+        with self._lock:
+            return self._strategy.run_simulation(self._campaign, directive)
+
+
+    def mission_control_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            briefing = self._strategy.build_briefing(self._campaign, self._cp.drones)
+            return self._mission_control.summarize(self._campaign, self._cp.drones, briefing)
+
+    def mission_control_create_task(self, payload: dict[str, Any], actor: str = "operator") -> dict[str, Any]:
+        with self._lock:
+            return self._mission_control.create_task(payload, actor=actor)
+
+    def mission_control_update_task(self, task_id: str, payload: dict[str, Any], actor: str = "operator") -> dict[str, Any]:
+        with self._lock:
+            return self._mission_control.update_task(task_id, payload, actor=actor)
+
+    def mission_control_issue_order(self, action: str, rationale: str, operator: str = "operator", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self._lock:
+            order = self._mission_control.issue_order(action, rationale, operator=operator, payload=payload)
+            self._record_log("mission_control_order", {"action": action, "order_id": order["order_id"], "operator": operator})
+            return order
+
+    def mission_control_close_order(self, order_id: str, outcome: str, operator: str = "operator") -> dict[str, Any]:
+        with self._lock:
+            return self._mission_control.close_order(order_id, outcome, operator=operator)
+
+    def mission_control_register_directive(self, payload: dict[str, Any], actor: str = "operator") -> dict[str, Any]:
+        with self._lock:
+            directive = self._mission_control.register_directive(payload, actor=actor)
+            self._record_log("mission_control_directive", {"directive_id": directive["directive_id"], "mode": directive["mode"]})
+            return directive
+
+    def mission_control_decision_log(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._mission_control.decision_log()
+
+    def mission_control_playbooks(self, *, query: str | None = None, phase: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._mission_control.list_playbooks(query=query, phase=phase)
+
+    def mission_control_refresh_catalog(self) -> dict[str, Any]:
+        with self._lock:
+            return self._mission_control.refresh_catalog()
 
     def _deliberation_loop(self) -> None:
         while not self._stop_event.is_set():

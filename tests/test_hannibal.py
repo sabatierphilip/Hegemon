@@ -295,6 +295,7 @@ def test_hannibal_api_endpoints(monkeypatch):
         ("/api/agents/hannibal/campaign", "get"),
         ("/api/agents/hannibal/log", "get"),
         ("/api/agents/hannibal/qtable", "get"),
+        ("/api/agents/hannibal/briefing", "get"),
         ("/api/agents/hannibal/pause", "post"),
         ("/api/agents/hannibal/resume", "post"),
         ("/api/agents/hannibal/abort", "post"),
@@ -308,3 +309,134 @@ def test_hannibal_api_endpoints(monkeypatch):
             kwargs["data"] = "{}"
         response = fn(endpoint, **kwargs)
         assert response.status_code == 200
+
+
+def test_hannibal_simulation_endpoint(monkeypatch):
+    monkeypatch.setattr("sentinel_containment.web.app._is_authenticated", lambda: True)
+    monkeypatch.setattr("sentinel_containment.web.app._hannibal", None)
+
+    client = web_app.test_client()
+    base_headers = {"Origin": "http://localhost", "Content-Type": "application/json"}
+
+    client.post(
+        "/api/agents/hannibal/instruct",
+        json={"text": "Deploy Hannibal against 10.0.0.8"},
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    resp = client.post(
+        "/api/agents/hannibal/simulate",
+        json={"directive": "Shift to aggressive encirclement and enforce mode"},
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["predicted_outcome"] == "high_gain_high_risk"
+    assert body["host_gain"] >= 1
+
+
+def test_hannibal_briefing_in_status():
+    cp = _FakeControlPlane()
+    agent = HannibalAgent(cp)
+    agent.start_campaign("camp-risk", "10.0.0.4", "collect credentials")
+    status = agent.status()
+    assert "risk_score" in status
+    assert "risk_band" in status
+    assert "phase_velocity" in status
+    agent.abort_campaign()
+
+
+def test_hannibal_mission_control_workflow(monkeypatch):
+    monkeypatch.setattr("sentinel_containment.web.app._is_authenticated", lambda: True)
+    monkeypatch.setattr("sentinel_containment.web.app._hannibal", None)
+
+    client = web_app.test_client()
+    base_headers = {"Origin": "http://localhost", "Content-Type": "application/json"}
+
+    client.post(
+        "/api/agents/hannibal/instruct",
+        json={"text": "Deploy Hannibal against 10.0.0.9 map network"},
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    create_task = client.post(
+        "/api/agents/hannibal/mission-control/task",
+        json={"title": "Validate dc pivot", "owner": "alpha", "priority": "high", "notes": ["seed note"]},
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert create_task.status_code == 200
+    task = create_task.get_json()
+
+    update_task = client.patch(
+        f"/api/agents/hannibal/mission-control/task/{task['task_id']}",
+        json={"status": "in_progress", "append_note": "investigating"},
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert update_task.status_code == 200
+
+    issue_order = client.post(
+        "/api/agents/hannibal/mission-control/order",
+        json={"action": "DEPLOY_SCOUT", "rationale": "expand map"},
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert issue_order.status_code == 200
+    order = issue_order.get_json()
+
+    close_order = client.post(
+        f"/api/agents/hannibal/mission-control/order/{order['order_id']}/close",
+        json={"outcome": "executed"},
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert close_order.status_code == 200
+
+    directive = client.post(
+        "/api/agents/hannibal/mission-control/directive",
+        json={"title": "Contain", "objective": "stabilize", "mode": "balanced"},
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert directive.status_code == 200
+
+    state = client.get(
+        "/api/agents/hannibal/mission-control/state",
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert state.status_code == 200
+    body = state.get_json()
+    assert body["tasking"]["open"] >= 1
+    assert len(body["playbooks"]) > 0
+
+    decision_log = client.get(
+        "/api/agents/hannibal/mission-control/decision-log",
+        headers=base_headers,
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert decision_log.status_code == 200
+    assert decision_log.get_json()["log"]
+
+
+def test_hannibal_mission_control_agent_methods():
+    cp = _FakeControlPlane()
+    agent = HannibalAgent(cp)
+    agent.start_campaign("camp-ops", "10.0.0.11", "campaign")
+    task = agent.mission_control_create_task({"title": "map hvt", "owner": "ops", "priority": "high"})
+    assert task["task_id"].startswith("task-")
+    order = agent.mission_control_issue_order("DEPLOY_MAPPER", "needed", payload={"window": 60})
+    assert order["action"] == "DEPLOY_MAPPER"
+    closed = agent.mission_control_close_order(order["order_id"], "done")
+    assert closed["state"] == "closed"
+    directive = agent.mission_control_register_directive({"title": "Directive", "objective": "Expand"})
+    assert directive["directive_id"].startswith("directive-")
+    snapshot = agent.mission_control_snapshot()
+    assert "campaign" in snapshot
+    assert "tasks" in snapshot
+    assert snapshot["playbooks"]
+    agent.abort_campaign()
