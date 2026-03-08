@@ -16,6 +16,7 @@ from sentinel_containment.agents.hannibal.drone_factory import (
     build_scout,
     build_striker,
     build_watchdog,
+    build_custom_drone,
 )
 from sentinel_containment.agents.hannibal.nlp_parser import HannibalNLPParser
 from sentinel_containment.agents.hannibal.q_learner import HannibalQLearner
@@ -114,6 +115,28 @@ def test_nlp_semantic_curriculum_enrichment():
     assert directive.mission_style is not None
     assert directive.recommended_drone_role is not None
 
+
+
+
+def test_nlp_capability_enhancement_plan_includes_all_axes():
+    parser = HannibalNLPParser()
+    directive = parser.parse(
+        "Upgrade Hannibal english understanding, drone building, code generation, mission intelligence, and mission conduct"
+    )
+    assert directive.enhancement_plan
+    assert any(step.startswith("english:") for step in directive.enhancement_plan)
+    assert any(step.startswith("drone_build:") for step in directive.enhancement_plan)
+    assert any(step.startswith("codegen:") for step in directive.enhancement_plan)
+    assert any(step.startswith("intelligence:") for step in directive.enhancement_plan)
+    assert any(step.startswith("mission:") for step in directive.enhancement_plan)
+    assert any(step.startswith("safety:") for step in directive.enhancement_plan)
+
+
+def test_nlp_explain_renders_enhancement_plan():
+    parser = HannibalNLPParser()
+    directive = parser.parse("Improve Hannibal english understanding and code generation")
+    explanation = parser.explain(directive)
+    assert "Enhancement plan:" in explanation
 
 def test_nlp_cidr_extraction():
     parser = HannibalNLPParser()
@@ -243,6 +266,51 @@ def test_drone_factory_harvester_ends_with_destruct():
     behaviour = build_harvester("10.0.0.1")
     assert behaviour.nodes[-1].kind in ("self_destruct", "self_terminate")
 
+
+
+
+def test_drone_factory_custom_drone_runtime_builder():
+    behaviour = build_custom_drone(
+        "10.0.0.1",
+        "10.0.0.0/24",
+        objective="map network and harvest credentials",
+        codegen_focus="typed_python_scaffolding",
+        intel_focus="signal_correlation",
+        mission_style="aggressive",
+        english_focus="intent_disambiguation",
+    )
+    kinds = [n.kind for n in behaviour.nodes]
+    assert "subnet_scan" in kinds
+    assert "credential_probe" in kinds
+    assert kinds.count("send_report") >= 2
+
+
+def test_hannibal_agent_supports_custom_drone_instruction():
+    cp = _FakeControlPlane()
+    agent = HannibalAgent(cp)
+    reply = agent.receive_instruction(
+        "Deploy Hannibal against 10.12.0.5 and create custom drone on the fly for code generation and intelligence"
+    )
+    assert reply["acted"] is True
+    campaign = agent._campaign
+    assert campaign is not None
+    assert campaign.active_drone_ids
+    order_actions = [order["action"] for order in campaign.drone_orders]
+    assert "DEPLOY_CUSTOM_DRONE" in order_actions
+
+
+def test_hannibal_agent_fleet_cap_is_15():
+    cp = _FakeControlPlane()
+    agent = HannibalAgent(cp)
+    state = CampaignState(campaign_id="cap-15", agent_id="hannibal", mission_objective="recon")
+    state.target_host = "10.1.1.1"
+    state.target_network = "10.1.1.0/24"
+    agent._campaign = state
+
+    for _ in range(16):
+        agent._execute_action("DEPLOY_SCOUT", state, "test")
+
+    assert len(state.active_drone_ids) == 15
 
 def test_hannibal_agent_start_and_status():
     cp = _FakeControlPlane()

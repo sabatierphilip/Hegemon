@@ -127,6 +127,54 @@ def build_striker(target_host: str) -> DroneBehaviour:
     return _behaviour(f"hannibal-striker-{secrets.token_hex(3)}", "Hannibal Striker", nodes, "Direct action. Disable defenses, execute, sinkhole, vanish.")
 
 
+
+
+def build_custom_drone(
+    target_host: str,
+    target_network: str | None = None,
+    *,
+    objective: str = "custom mission",
+    codegen_focus: str | None = None,
+    intel_focus: str | None = None,
+    mission_style: str | None = None,
+    english_focus: str | None = None,
+) -> DroneBehaviour:
+    lower_objective = objective.lower()
+
+    steps: list[tuple[str, str, dict[str, Any]]] = [
+        ("ping_host", "Ping Target", {"host": target_host}),
+        ("fingerprint_hosts", "Fingerprint", {"host": target_host}),
+    ]
+
+    if "map" in lower_objective or "network" in lower_objective:
+        steps.append(("subnet_scan", "Map Subnet", {"cidr": target_network or f"{target_host}/24"}))
+    if "credential" in lower_objective or "harvest" in lower_objective:
+        steps.append(("credential_probe", "Credential Probe", {"host": target_host, "scope": "env"}))
+    if codegen_focus:
+        steps.append(("send_report", "Codegen Focus", {"severity": "info", "codegen_focus": codegen_focus}))
+    if intel_focus:
+        steps.append(("send_report", "Intel Focus", {"severity": "info", "intel_focus": intel_focus}))
+    if english_focus:
+        steps.append(("send_report", "English Focus", {"severity": "info", "english_focus": english_focus}))
+
+    hold_base = 120 if mission_style == "aggressive" else 240
+    steps.append(("adaptive_wait", "Adaptive Hold", {"base": hold_base, "jitter": 45}))
+
+    nodes: list[DroneNode] = [_node("on_launch", "on_launch", "Launch", ["c1"], ntype="trigger")]
+    for idx, (kind, label, params) in enumerate(steps, start=1):
+        current = f"c{idx}"
+        nxt = f"c{idx + 1}" if idx < len(steps) else "c_repeat"
+        nodes.append(_node(current, kind, label, [nxt], params, x=0, y=idx * 80))
+
+    nodes.append(_node("c_repeat", "repeat", "Repeat", ["c2"], {"target_node_id": "c2", "max_iterations": 5}, x=0, y=(len(steps) + 1) * 80))
+
+    return _behaviour(
+        f"hannibal-custom-{secrets.token_hex(3)}",
+        "Hannibal Custom Drone",
+        nodes,
+        "Runtime-generated custom behavior graph based on mission objective and focus axes.",
+    )
+
 def build_watchdog(target_host: str) -> DroneBehaviour:
     nodes = [
         _node("on_launch", "on_launch", "Launch", ["w1"], ntype="trigger"),
@@ -148,4 +196,5 @@ BUILDERS: dict[str, Any] = {
     "DEPLOY_ENCIRCLER": build_encircler,
     "DEPLOY_STRIKER": build_striker,
     "DEPLOY_WATCHDOG": build_watchdog,
+    "DEPLOY_CUSTOM_DRONE": build_custom_drone,
 }

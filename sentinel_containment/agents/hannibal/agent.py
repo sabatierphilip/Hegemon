@@ -12,7 +12,7 @@ from sentinel_containment.agents.base_agent import BaseAgent
 from .campaign_state import CampaignState
 from .clips_bridge import ClipsBridge
 from .doctrine_defaults import ACTION_INDEX, DRONE_TYPE_CONFIGS
-from .drone_factory import BUILDERS
+from .drone_factory import BUILDERS, build_custom_drone
 from .nlp_parser import HannibalNLPParser
 from .q_learner import HannibalQLearner
 from .strategy_engine import HannibalStrategyEngine
@@ -36,6 +36,7 @@ PHASE_ADVANCE_ACTIONS = {
 class HannibalAgent(BaseAgent):
     AGENT_ID = "hannibal"
     LOOP_INTERVAL = 30
+    MAX_ACTIVE_DRONES = 15
 
     def __init__(self, control_plane: "HegemonControlPlane") -> None:
         self._cp = control_plane
@@ -62,7 +63,9 @@ class HannibalAgent(BaseAgent):
             target = directive.target_host or directive.target_network or "10.0.0.1"
             campaign_id = f"campaign-{secrets.token_hex(4)}"
             objective = directive.objective or text
-            self.start_campaign(campaign_id=campaign_id, target=target, objective=objective, autonomy_override=directive.autonomy_override)
+            campaign = self.start_campaign(campaign_id=campaign_id, target=target, objective=objective, autonomy_override=directive.autonomy_override)
+            if directive.custom_drone_requested:
+                self._deploy_custom_drone(campaign, directive)
             result["acted"] = True
             result["campaign_id"] = campaign_id
         elif directive.intent == "pause_campaign":
@@ -277,10 +280,14 @@ class HannibalAgent(BaseAgent):
                     pass
             return
 
+        if action == "DEPLOY_CUSTOM_DRONE":
+            self._deploy_custom_drone(state)
+            return
+
         if action not in BUILDERS and action != "SPAWN_CHILD_SWARM":
             return
-        if len(state.active_drone_ids) >= 8:
-            self._record_log("fleet_cap_reached", {"active": len(state.active_drone_ids)})
+        if len(state.active_drone_ids) >= self.MAX_ACTIVE_DRONES:
+            self._record_log("fleet_cap_reached", {"active": len(state.active_drone_ids), "cap": self.MAX_ACTIVE_DRONES})
             return
 
         config = DRONE_TYPE_CONFIGS.get(action, DRONE_TYPE_CONFIGS["DEPLOY_SCOUT"])
@@ -338,6 +345,67 @@ class HannibalAgent(BaseAgent):
             self._record_log("drone_deployed", {"action": action, "drone_id": drone.drone_id, "drone_name": drone_name, "target": target})
         except Exception as exc:
             self._record_log("deploy_failed", {"action": action, "error": str(exc)[:200]})
+
+    def _deploy_custom_drone(self, state: CampaignState, directive: Any | None = None) -> None:
+        target = getattr(state, "target_host", "127.0.0.1") or "127.0.0.1"
+        network = getattr(state, "target_network", None) or f"{target}/24"
+        autonomy = getattr(state, "autonomy_override", None) or "contain"
+
+        if len(state.active_drone_ids) >= self.MAX_ACTIVE_DRONES:
+            self._record_log("fleet_cap_reached", {"active": len(state.active_drone_ids), "cap": self.MAX_ACTIVE_DRONES})
+            return
+
+        objective = state.mission_objective
+        codegen_focus = None
+        intel_focus = None
+        mission_style = None
+        english_focus = None
+        if directive is not None:
+            objective = directive.objective or objective
+            codegen_focus = directive.codegen_focus
+            intel_focus = directive.intel_focus
+            mission_style = directive.mission_style
+            english_focus = directive.english_focus
+
+        try:
+            behaviour = build_custom_drone(
+                target,
+                network,
+                objective=objective,
+                codegen_focus=codegen_focus,
+                intel_focus=intel_focus,
+                mission_style=mission_style,
+                english_focus=english_focus,
+            )
+            drone_name = f"hannibal-custom-{secrets.token_hex(3)}"
+            drone = self._cp.assemble_drone(
+                name=drone_name,
+                tier="autonomous",
+                mission=objective[:80],
+                behaviour=behaviour,
+                target_host=target,
+                target_network=network,
+                autonomy_level=autonomy,
+                ttl_seconds=1800,
+                checkin_interval_seconds=40,
+                actor="hannibal",
+            )
+            self._cp.launch_drone(drone.drone_id, actor="hannibal")
+            state.active_drone_ids.append(drone.drone_id)
+            state.drone_orders.append(
+                {
+                    "action": "DEPLOY_CUSTOM_DRONE",
+                    "drone_id": drone.drone_id,
+                    "drone_name": drone_name,
+                    "target": target,
+                    "ts": time.time(),
+                    "phase": state.phase,
+                }
+            )
+            self._record_drone_action(drone.drone_id, "DEPLOY_CUSTOM_DRONE")
+            self._record_log("drone_deployed", {"action": "DEPLOY_CUSTOM_DRONE", "drone_id": drone.drone_id, "drone_name": drone_name, "target": target})
+        except Exception as exc:
+            self._record_log("deploy_failed", {"action": "DEPLOY_CUSTOM_DRONE", "error": str(exc)[:200]})
 
     def _record_log(self, event: str, data: dict[str, Any]) -> None:
         self._log.append({"ts": time.time(), "event": event, **data})
