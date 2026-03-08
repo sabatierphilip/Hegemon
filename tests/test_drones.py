@@ -771,3 +771,109 @@ def test_controlplane_isolation_and_sinkhole_have_persistent_artifacts(tmp_path:
     block_file = Path("data") / "drones" / drone.drone_id / "blocked_ips.json"
     assert sink_file.exists()
     assert block_file.exists()
+
+
+def test_execute_node_http_probe_hits_local_server(tmp_path: Path):
+    import http.server
+    import socketserver
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format, *args):
+            return
+
+    with socketserver.TCPServer(("127.0.0.1", 0), _Handler) as srv:
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+        drone = cp.assemble_drone("HttpProbe", "autonomous", "custom", _mini_behaviour(), autonomy_level="observe", actor="tester")
+        node = DroneNode(
+            node_id="http",
+            node_type="action",
+            kind="http_probe",
+            label="HTTP Probe",
+            params={"host": f"127.0.0.1:{port}", "paths": ["/"], "timeout_seconds": 2},
+            position={"x": 0.0, "y": 0.0},
+            edges_out=[],
+            edge_labels={},
+        )
+        cp._execute_node(drone, node, {"http": node}, {}, threading.Event(), time.time())
+        srv.shutdown()
+    assert any("HTTP probe complete" in row.get("message", "") for row in drone.telemetry)
+
+
+def test_execute_node_subnet_scan_on_loopback(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Subnetter", "autonomous", "custom", _mini_behaviour(), autonomy_level="observe", actor="tester")
+    node = DroneNode(
+        node_id="sub",
+        node_type="action",
+        kind="subnet_scan",
+        label="Subnet",
+        params={"cidr": "127.0.0.1/32", "ports": [1], "max_hosts": 1},
+        position={"x": 0.0, "y": 0.0},
+        edges_out=[],
+        edge_labels={},
+    )
+    cp._execute_node(drone, node, {"sub": node}, {}, threading.Event(), time.time())
+    assert any("subnet_scan complete" in row.get("message", "") for row in drone.telemetry)
+
+
+def test_execute_node_self_destruct_purges_path(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Boom", "autonomous", "custom", _mini_behaviour(), autonomy_level="enforce", actor="tester")
+    purge_dir = tmp_path / "purge-me"
+    purge_dir.mkdir()
+    (purge_dir / "x.txt").write_text("bye")
+    node = DroneNode(
+        node_id="sd",
+        node_type="action",
+        kind="self_destruct",
+        label="SD",
+        params={"purge_paths": [str(purge_dir)], "reason": "test"},
+        position={"x": 0.0, "y": 0.0},
+        edges_out=[],
+        edge_labels={},
+    )
+    stop = threading.Event()
+    nxt = cp._execute_node(drone, node, {"sd": node}, {}, stop, time.time())
+    assert nxt is None
+    assert stop.is_set()
+    assert drone.status == "terminated"
+    assert not purge_dir.exists()
+
+
+def test_execute_node_exec_remediation_guard_and_run(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Remed", "autonomous", "custom", _mini_behaviour(), autonomy_level="observe", actor="tester")
+    deny = DroneNode(
+        node_id="deny",
+        node_type="action",
+        kind="exec_remediation",
+        label="deny",
+        params={"command": "echo blocked", "allow_shell": False},
+        position={"x": 0.0, "y": 0.0},
+        edges_out=[],
+        edge_labels={},
+    )
+    cp._execute_node(drone, deny, {"deny": deny}, {}, threading.Event(), time.time())
+    allow = DroneNode(
+        node_id="allow",
+        node_type="action",
+        kind="exec_remediation",
+        label="allow",
+        params={"command": "echo allowed", "allow_shell": True},
+        position={"x": 0.0, "y": 0.0},
+        edges_out=[],
+        edge_labels={},
+    )
+    cp._execute_node(drone, allow, {"allow": allow}, {}, threading.Event(), time.time())
+    msgs = [row.get("message", "") for row in drone.telemetry]
+    assert any("exec_remediation denied" in m for m in msgs)
+    assert any("exec_remediation complete" in m for m in msgs)

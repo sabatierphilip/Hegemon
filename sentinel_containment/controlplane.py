@@ -5,6 +5,7 @@ import base64
 import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -4538,6 +4539,231 @@ class HegemonControlPlane:
                 countermeasure_telemetry=cm_plan.telemetry,
             )
             return self._next_node(node)
+        if kind == "adaptive_wait":
+            base_wait = float(node.params.get("seconds", 1.0))
+            base_wait = clamp(base_wait, 0.0, 30.0)
+            jitter = float(node.params.get("jitter", 0.0))
+            jitter = clamp(jitter, 0.0, 10.0)
+            wait_for = base_wait
+            if jitter > 0:
+                wait_for += ((secrets.randbits(16) / 65535.0) * (2.0 * jitter)) - jitter
+            wait_for = clamp(wait_for, 0.0, 45.0)
+            slept = 0.0
+            while slept < wait_for and not stop_event.is_set():
+                step = min(0.2, wait_for - slept)
+                time.sleep(step)
+                slept += step
+            self._append_signed_telemetry(drone, "Adaptive wait complete", requested=base_wait, actual=round(slept, 3), jitter=jitter)
+            return self._next_node(node)
+        if kind == "http_probe":
+            host = str(node.params.get("host", drone.target_host or "127.0.0.1")).format(target=drone.target_host or "127.0.0.1")
+            scheme = str(node.params.get("scheme", "http"))
+            if scheme not in {"http", "https"}:
+                scheme = "http"
+            timeout = clamp(float(node.params.get("timeout_seconds", 2.0)), 0.2, 15.0)
+            method = str(node.params.get("method", "GET")).upper()
+            if method not in {"GET", "HEAD"}:
+                method = "GET"
+            paths = node.params.get("paths", ["/"])
+            if not isinstance(paths, list):
+                paths = ["/"]
+            probes: list[dict[str, Any]] = []
+            for raw_path in paths[:32]:
+                if stop_event.is_set():
+                    break
+                path = str(raw_path)
+                if not path.startswith("/"):
+                    path = "/" + path
+                url = f"{scheme}://{host}{path}"
+                try:
+                    req = urllib.request.Request(url, method=method)
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        body = b""
+                        if method == "GET":
+                            body = resp.read(2048)
+                        probes.append({
+                            "url": url,
+                            "status": int(getattr(resp, "status", 200)),
+                            "bytes": len(body),
+                            "server": str(resp.headers.get("Server", ""))[:120],
+                        })
+                except urllib.error.HTTPError as exc:
+                    probes.append({"url": url, "status": int(exc.code), "bytes": 0, "error": "http_error"})
+                except Exception as exc:
+                    probes.append({"url": url, "status": None, "bytes": 0, "error": type(exc).__name__})
+            self._append_signed_telemetry(drone, f"HTTP probe complete for {host}", probes=probes)
+            return self._next_node(node)
+        if kind == "log_tail":
+            path = Path(str(node.params.get("path", "/var/log/syslog")))
+            lines = int(node.params.get("lines", 50))
+            lines = max(1, min(lines, 300))
+            sample: list[str] = []
+            if path.exists() and path.is_file():
+                try:
+                    data = path.read_text(errors="ignore").splitlines()
+                    sample = data[-lines:]
+                except Exception as exc:
+                    self._append_signed_telemetry(drone, "log_tail failed", path=str(path), error=type(exc).__name__)
+                    return self._next_node(node)
+            redacted = [ln[:220] for ln in sample]
+            self._append_signed_telemetry(drone, "log_tail complete", path=str(path), lines=len(redacted), sample=redacted)
+            return self._next_node(node)
+        if kind == "subnet_scan":
+            cidr = str(node.params.get("cidr") or node.params.get("target_network") or "")
+            if not cidr and drone.target_host:
+                cidr = f"{drone.target_host}/32"
+            results: list[dict[str, Any]] = []
+            try:
+                network = ipaddress.ip_network(cidr, strict=False)
+                max_hosts = min(int(node.params.get("max_hosts", 256)), 1024)
+                ports = node.params.get("ports", [22, 80, 443, 445, 3389])
+                if not isinstance(ports, list):
+                    ports = [22, 80, 443]
+                ports = [max(1, min(65535, int(p))) for p in ports[:10]]
+                for idx, ip in enumerate(network.hosts()):
+                    if idx >= max_hosts or stop_event.is_set():
+                        break
+                    open_ports: list[int] = []
+                    for port in ports:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(0.25)
+                        try:
+                            if sock.connect_ex((str(ip), port)) == 0:
+                                open_ports.append(port)
+                        except Exception:
+                            pass
+                        finally:
+                            sock.close()
+                    if open_ports:
+                        results.append({"host": str(ip), "open_ports": open_ports})
+                if results:
+                    drone.stats["hosts_pinged"] = int(drone.stats.get("hosts_pinged", 0)) + len(results)
+            except Exception as exc:
+                self._append_signed_telemetry(drone, "subnet_scan failed", cidr=cidr, error=type(exc).__name__)
+                return self._next_node(node)
+            self._append_signed_telemetry(drone, "subnet_scan complete", cidr=cidr, discovered=results)
+            return self._next_node(node)
+        if kind == "exec_remediation":
+            command = str(node.params.get("command") or node.params.get("script") or "").strip()
+            if not command:
+                self._append_signed_telemetry(drone, "exec_remediation skipped", reason="empty_command")
+                return self._next_node(node)
+            allowed = bool(node.params.get("allow_shell", False))
+            if not allowed:
+                self._append_signed_telemetry(drone, "exec_remediation denied", reason="allow_shell_false", command=command[:120])
+                return self._next_node(node)
+            timeout = clamp(float(node.params.get("timeout_seconds", 20.0)), 1.0, 120.0)
+            try:
+                proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+                self._append_signed_telemetry(
+                    drone,
+                    "exec_remediation complete",
+                    rc=int(proc.returncode),
+                    stdout=(proc.stdout or "")[:500],
+                    stderr=(proc.stderr or "")[:500],
+                )
+            except Exception as exc:
+                self._append_signed_telemetry(drone, "exec_remediation failed", error=type(exc).__name__)
+            return self._next_node(node)
+        if kind in {"credential_probe", "credential_harvest"}:
+            patterns = node.params.get("patterns", ["KEY", "TOKEN", "SECRET", "PASSWORD", "PWD"])
+            if not isinstance(patterns, list):
+                patterns = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PWD"]
+            upper_patterns = [str(p).upper() for p in patterns[:20]]
+            env_hits: list[dict[str, Any]] = []
+            for key, value in list(os.environ.items())[:4096]:
+                u = key.upper()
+                if any(p in u for p in upper_patterns):
+                    env_hits.append({"key": key, "value_hash": hashlib.sha256(value.encode()).hexdigest()[:16], "length": len(value)})
+            file_hits: list[dict[str, Any]] = []
+            for raw in node.params.get("files", []):
+                path = Path(str(raw))
+                if not path.exists() or not path.is_file():
+                    continue
+                try:
+                    text = path.read_text(errors="ignore")[:10000]
+                except Exception:
+                    continue
+                matches = sum(1 for p in upper_patterns if p in text.upper())
+                file_hits.append({"path": str(path), "keyword_hits": matches, "sha256": hashlib.sha256(text.encode()).hexdigest()[:16]})
+            self._append_signed_telemetry(drone, "credential_probe complete", env_hits=env_hits[:200], file_hits=file_hits[:50], redacted=True)
+            return self._next_node(node)
+        if kind == "ptrace_inspect":
+            pid = int(node.params.get("pid", os.getpid()))
+            proc_dir = Path("/proc") / str(pid)
+            status_preview = ""
+            maps_preview: list[str] = []
+            if proc_dir.exists():
+                try:
+                    status_preview = (proc_dir / "status").read_text(errors="ignore")[:1200]
+                except Exception:
+                    status_preview = ""
+                try:
+                    maps_preview = (proc_dir / "maps").read_text(errors="ignore").splitlines()[:20]
+                except Exception:
+                    maps_preview = []
+            self._append_signed_telemetry(drone, "ptrace_inspect complete", pid=pid, status=status_preview, maps=maps_preview, ptrace_attached=False)
+            return self._next_node(node)
+        if kind == "manage_service":
+            service = str(node.params.get("service_name") or node.params.get("service") or "").strip()
+            action = str(node.params.get("action", "status")).strip().lower()
+            if not service:
+                self._append_signed_telemetry(drone, "manage_service skipped", reason="missing_service")
+                return self._next_node(node)
+            if action not in {"status", "start", "stop", "restart"}:
+                action = "status"
+            if action in {"start", "stop", "restart"} and not bool(node.params.get("allow_mutation", False)):
+                self._append_signed_telemetry(drone, "manage_service denied", service=service, action=action, reason="allow_mutation_false")
+                return self._next_node(node)
+            cmd = ["systemctl", action, service]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                self._append_signed_telemetry(drone, "manage_service complete", service=service, action=action, rc=proc.returncode, stdout=proc.stdout[:400], stderr=proc.stderr[:400])
+            except FileNotFoundError:
+                self._append_signed_telemetry(drone, "manage_service unavailable", service=service, action=action, reason="systemctl_missing")
+            except Exception as exc:
+                self._append_signed_telemetry(drone, "manage_service failed", service=service, action=action, error=type(exc).__name__)
+            return self._next_node(node)
+        if kind == "inotify_watch":
+            path = Path(str(node.params.get("path", "/etc")))
+            duration = clamp(float(node.params.get("duration_seconds", 5.0)), 0.5, 60.0)
+            poll_interval = clamp(float(node.params.get("poll_interval_seconds", 0.5)), 0.1, 5.0)
+            end = time.time() + duration
+            previous = path.stat().st_mtime if path.exists() else None
+            events: list[dict[str, Any]] = []
+            while time.time() < end and not stop_event.is_set():
+                now_exists = path.exists()
+                now_mtime = path.stat().st_mtime if now_exists else None
+                if now_exists != (previous is not None):
+                    events.append({"at": time.time(), "event": "exists_changed", "exists": now_exists})
+                elif previous is not None and now_mtime is not None and now_mtime != previous:
+                    events.append({"at": time.time(), "event": "mtime_changed", "mtime": now_mtime})
+                previous = now_mtime
+                time.sleep(poll_interval)
+            self._append_signed_telemetry(drone, "inotify_watch complete", path=str(path), events=events[-50:], duration=duration)
+            return self._next_node(node)
+        if kind == "self_destruct":
+            base_dir = Path("data") / "drones" / drone.drone_id
+            marker = base_dir / "self_destruct.log"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "drone_id": drone.drone_id, "reason": node.params.get("reason", "operator")}, indent=2))
+            purge_targets = []
+            for raw in node.params.get("purge_paths", []):
+                candidate = Path(str(raw))
+                if candidate.exists():
+                    purge_targets.append(candidate)
+            for target in purge_targets:
+                try:
+                    if target.is_dir():
+                        shutil.rmtree(target, ignore_errors=True)
+                    else:
+                        target.unlink(missing_ok=True)
+                except Exception:
+                    continue
+            drone.status = "terminated"
+            stop_event.set()
+            self._append_signed_telemetry(drone, "self_destruct executed", purged=[str(p) for p in purge_targets])
+            return None
         self._append_signed_telemetry(drone, f"Unknown node kind {kind}")
         return self._next_node(node)
 
