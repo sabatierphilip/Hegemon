@@ -7,12 +7,13 @@ import base64
 import zlib
 import re
 import threading
+import time
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import pytest
 
 from sentinel_containment.controlplane import DroneBehaviour, DroneNode, HegemonControlPlane
-from sentinel_containment.drone_compiler import DroneBlobCompiler, deploy_blob_remote, launch_blob_locally
+from sentinel_containment.drone_compiler import DroneBlobCompiler, decode_blob_envelope, deploy_blob_remote, launch_blob_locally
 
 
 def _mini_behaviour() -> DroneBehaviour:
@@ -220,6 +221,48 @@ def test_blob_roundtrip_and_source_decode(tmp_path: Path):
     assert drone.drone_id in source
     assert "PRIVATE_KEY_HEX" not in source
     assert "HG_DRONE_KEY_HEX" in source
+
+
+def test_blob_envelope_declares_native_policy(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("NativeEnvelope", "controlled", "custom", _mini_behaviour(), actor="tester")
+    key_hex = cp._drone_private_keys[drone.drone_id]
+    env = decode_blob_envelope(drone.binary_blob, key_hex)["envelope"]
+    policy = env.get("policy", {})
+    assert env.get("v") == 3
+    assert policy.get("require_native_binary") is True
+    assert policy.get("allow_python_fallback") is False
+
+
+def test_compiled_runtime_consumes_plan_executor_payload(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Planner", "controlled", "custom", _mini_behaviour(), actor="tester")
+    source = cp.decode_drone_source(drone.drone_id)
+    assert "plan_executor_binary" in source
+    assert "def _execute_embedded_plan_executor" in source
+    assert "_execute_embedded_plan_executor()" in source
+
+
+def test_compiled_runtime_report_and_peer_sync_are_operational(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("Reporter", "controlled", "custom", _mini_behaviour(), actor="tester")
+    source = cp.decode_drone_source(drone.drone_id)
+    assert "urllib.request.Request(REPORT_ENDPOINT" in source
+    assert "root.glob('**/deadrop')" in source
+    assert "snapshot_vss created" in source
+
+
+def test_non_native_artifact_format_rejected(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    with pytest.raises(ValueError):
+        cp.assemble_drone(
+            "LegacyBlob",
+            "controlled",
+            "custom",
+            _mini_behaviour(),
+            actor="tester",
+            artifact_format="binary_blob",
+        )
 
 
 def test_autonomous_drone_launches_detached_from_hegemon_io(tmp_path: Path):
@@ -703,3 +746,28 @@ def test_execute_node_countermeasure_adds_containment_finding(tmp_path: Path):
     assert nxt is None
     assert any("countermeasure-counter-lateral-quarantine" in fid for fid in drone.findings)
     assert any("Countermeasure engaged" in row.get("message", "") for row in drone.telemetry)
+
+
+def test_compiled_runtime_registry_and_rotation_are_not_placeholders(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("RegRot", "controlled", "custom", _mini_behaviour(), actor="tester")
+    source = cp.decode_drone_source(drone.drone_id)
+    assert "registry_watch snapshot written" in source
+    assert "rotated_credentials.json" in source
+    assert "registry_watch simulated" not in source
+
+
+def test_controlplane_isolation_and_sinkhole_have_persistent_artifacts(tmp_path: Path):
+    cp = HegemonControlPlane(ledger_path=tmp_path / "ledger.jsonl")
+    drone = cp.assemble_drone("ContainOps", "controlled", "custom", _mini_behaviour(), autonomy_level="enforce", actor="tester")
+    node_map = {
+        "sink": DroneNode(node_id="sink", node_type="action", kind="sinkhole_clone", label="Sink", params={"target": "10.1.1.10"}, position={"x": 0.0, "y": 0.0}, edges_out=[], edge_labels={}),
+        "iso": DroneNode(node_id="iso", node_type="action", kind="isolate_source_ip", label="Iso", params={"ip": "10.2.2.3"}, position={"x": 0.0, "y": 0.0}, edges_out=[], edge_labels={}),
+    }
+    stop = threading.Event()
+    cp._execute_node(drone, node_map["sink"], node_map, {}, stop, time.time())
+    cp._execute_node(drone, node_map["iso"], node_map, {}, stop, time.time())
+    sink_file = Path("data") / "drones" / drone.drone_id / "sinkhole" / "routes.json"
+    block_file = Path("data") / "drones" / drone.drone_id / "blocked_ips.json"
+    assert sink_file.exists()
+    assert block_file.exists()
