@@ -5,7 +5,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { ReactNode, useEffect, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-const routes = ['/', '/drones', '/graph', '/control-plane', '/peers', '/settings'];
+const routes = ['/', '/drones', '/mission-control', '/graph', '/control-plane', '/peers', '/settings'];
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
@@ -33,7 +33,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               href={route}
               className={`rounded px-2 py-1 ${pathname === route ? 'bg-accent text-white' : 'text-textSecondary hover:bg-border'}`}
             >
-              {route === '/' ? 'dashboard' : route.replace('/', '')}
+              {route === '/mission-control' ? 'mission-control' : route === '/' ? 'dashboard' : route.replace('/', '')}
             </Link>
           ))}
           <button className="ml-auto rounded px-2 py-1 text-textSecondary hover:bg-border" onClick={() => setDisconnected(false)}>
