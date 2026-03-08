@@ -66,6 +66,7 @@ class HannibalQLearner:
             "DEPLOY_ENCIRCLER": 0.6,
             "DEPLOY_STRIKER": 0.8,
             "DEPLOY_WATCHDOG": 0.2,
+            "DEPLOY_CUSTOM_DRONE": 0.55,
             "SPAWN_CHILD_SWARM": 0.65,
             "RECALL_ALL_DRONES": -0.1,
             "TERMINATE_HIGHEST_RISK_DRONE": -0.15,

@@ -244,6 +244,13 @@ def test_q_learner_persists(tmp_path: Path):
     assert q2._episode == q1._episode
 
 
+def test_q_learner_custom_drone_has_dedicated_reward_prior(tmp_path: Path):
+    learner = HannibalQLearner(tmp_path / "qtable.json", list(ACTION_INDEX.keys()))
+    state = CampaignState(campaign_id="c4", agent_id="hannibal", mission_objective="custom")
+    reward = learner.reward_for_outcome("DEPLOY_CUSTOM_DRONE", "unknown_outcome", state)
+    assert reward == 0.55
+
+
 def test_drone_factory_all_types():
     _ = build_flanker("10.0.0.1", "ssh_hop")
     for builder in [build_scout, build_mapper, build_harvester, build_encircler, build_striker, build_watchdog]:
