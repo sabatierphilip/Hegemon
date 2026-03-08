@@ -21,6 +21,10 @@ class MissionDirective:
     codegen_focus: str | None = None
     intel_focus: str | None = None
     mission_style: str | None = None
+    enhancement_plan: list[str] = field(default_factory=list)
+    english_focus: str | None = None
+    drone_build_focus: str | None = None
+    custom_drone_requested: bool = False
 
 
 _IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?)\b")
@@ -75,12 +79,73 @@ _OBJECTIVE_KEYWORDS = [
     "encirclement",
 ]
 
+_ENGLISH_FOCUS_MAP = {
+    "english understanding": "intent_disambiguation",
+    "english": "operator_summarization",
+    "grammar": "dialogue_repair",
+    "comprehension": "constraint_extraction",
+    "clarify": "clarification_loop",
+}
+
+_DRONE_BUILD_FOCUS_MAP = {
+    "drone building": "modular_airframe",
+    "custom drone": "custom_drone_synthesis",
+    "sensor": "sensor_fusion_stack",
+    "power": "power_budgeting",
+    "navigation": "redundant_navigation",
+}
+
+_CODEGEN_FOCUS_MAP = {
+    "code generation": "typed_python_scaffolding",
+    "generate code": "test_first_generation",
+    "refactor": "refactor_suggestions",
+    "template": "config_driven_templates",
+}
+
+_INTEL_FOCUS_MAP = {
+    "intelligence": "signal_correlation",
+    "intel": "telemetry_normalization",
+    "hypothesis": "hypothesis_tracking",
+    "forensic": "timeline_reconstruction",
+}
+
+_MISSION_STYLE_MAP = {
+    "mission conduct": "disciplined",
+    "stealth": "stealth",
+    "aggressive": "aggressive",
+    "balanced": "balanced",
+    "resilient": "resilient",
+}
+
+_SAFETY_FOCUS_MAP = {
+    "mission conduct": "human_approval_required",
+    "safe": "non_destructive_actions",
+    "safety": "simulation_only",
+    "non destructive": "non_destructive_actions",
+    "audit": "audit_every_decision",
+}
+
+_CUSTOM_DRONE_TOKENS = (
+    "custom drone",
+    "bespoke drone",
+    "drone on the fly",
+    "create drone",
+    "build drone",
+)
+
 
 class HannibalNLPParser:
     def __init__(self) -> None:
         root = Path(__file__).resolve().parents[3]
         corpus_path = root / "config" / "hannibal_language_curriculum.tsv"
         self._corpus = HannibalLanguageCorpus(corpus_path)
+
+    @staticmethod
+    def _pick_focus(lower: str, mapping: dict[str, str]) -> str | None:
+        for phrase, value in mapping.items():
+            if phrase in lower:
+                return value
+        return None
 
     def parse(self, text: str) -> MissionDirective:
         lower = text.lower().strip()
@@ -155,6 +220,47 @@ class HannibalNLPParser:
             if semantic_matches:
                 directive.parse_notes.append(f"Semantic curriculum matches: {len(semantic_matches)}")
 
+        directive.english_focus = self._pick_focus(lower, _ENGLISH_FOCUS_MAP)
+        directive.drone_build_focus = self._pick_focus(lower, _DRONE_BUILD_FOCUS_MAP)
+        codegen_focus = self._pick_focus(lower, _CODEGEN_FOCUS_MAP)
+        intel_focus = self._pick_focus(lower, _INTEL_FOCUS_MAP)
+        mission_style = self._pick_focus(lower, _MISSION_STYLE_MAP)
+        safety_focus = self._pick_focus(lower, _SAFETY_FOCUS_MAP)
+
+        if codegen_focus and not directive.codegen_focus:
+            directive.codegen_focus = codegen_focus
+        if intel_focus and not directive.intel_focus:
+            directive.intel_focus = intel_focus
+        if mission_style and not directive.mission_style:
+            directive.mission_style = mission_style
+
+        directive.custom_drone_requested = any(token in lower for token in _CUSTOM_DRONE_TOKENS)
+        if directive.custom_drone_requested:
+            directive.parse_notes.append("Custom drone request detected")
+
+        enhancement_plan: list[str] = []
+        if directive.english_focus:
+            enhancement_plan.append(f"english:{directive.english_focus}")
+        if directive.drone_build_focus:
+            enhancement_plan.append(f"drone_build:{directive.drone_build_focus}")
+        if directive.codegen_focus:
+            enhancement_plan.append(f"codegen:{directive.codegen_focus}")
+        if directive.intel_focus:
+            enhancement_plan.append(f"intelligence:{directive.intel_focus}")
+        if directive.mission_style:
+            enhancement_plan.append(f"mission:{directive.mission_style}")
+        if directive.custom_drone_requested:
+            enhancement_plan.append("drone_runtime:custom_builder_enabled")
+        if safety_focus:
+            enhancement_plan.append(f"safety:{safety_focus}")
+        if enhancement_plan:
+            directive.enhancement_plan = enhancement_plan
+            directive.parse_notes.append(f"Enhancement plan axes: {len(enhancement_plan)}")
+
+        if directive.intent == "unknown" and enhancement_plan:
+            directive.intent = "set_objective"
+            directive.confidence = max(directive.confidence, 0.70)
+
         if directive.intent == "set_objective" and not directive.objective:
             directive.objective = text.strip()
 
@@ -178,6 +284,11 @@ class HannibalNLPParser:
             lines.append(f"Intelligence focus: {directive.intel_focus}")
         if directive.mission_style:
             lines.append(f"Mission style: {directive.mission_style}")
+        if directive.custom_drone_requested:
+            lines.append("Custom drone creation: requested")
+        if directive.enhancement_plan:
+            lines.append("Enhancement plan:")
+            lines.extend([f"- {step}" for step in directive.enhancement_plan])
         lines += [f"Note: {n}" for n in directive.parse_notes]
         if directive.confidence < 0.6:
             lines.append("⚠ Low confidence parse — please confirm before executing.")

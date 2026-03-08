@@ -15,6 +15,7 @@ ACTION_INDEX: dict[str, int] = {
     "ADVANCE_PHASE_ENCIRCLEMENT": 13,
     "ADVANCE_PHASE_EXPLOITATION": 14,
     "ADVANCE_PHASE_WITHDRAWAL": 15,
+    "DEPLOY_CUSTOM_DRONE": 16,
 }
 
 DRONE_TYPE_CONFIGS: dict[str, dict] = {
@@ -25,4 +26,5 @@ DRONE_TYPE_CONFIGS: dict[str, dict] = {
     "DEPLOY_ENCIRCLER": {"tier": "autonomous", "autonomy": "contain", "ttl": 7200},
     "DEPLOY_STRIKER": {"tier": "autonomous", "autonomy": "enforce", "ttl": 600},
     "DEPLOY_WATCHDOG": {"tier": "autonomous", "autonomy": "observe", "ttl": 0},
+    "DEPLOY_CUSTOM_DRONE": {"tier": "autonomous", "autonomy": "contain", "ttl": 1800},
 }
