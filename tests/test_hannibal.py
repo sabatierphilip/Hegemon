@@ -138,6 +138,13 @@ def test_nlp_explain_renders_enhancement_plan():
     explanation = parser.explain(directive)
     assert "Enhancement plan:" in explanation
 
+
+def test_nlp_counterclone_count_capped_to_three():
+    parser = HannibalNLPParser()
+    directive = parser.parse("Deploy Hannibal and launch 5 conterclones on 10.10.0.0/24")
+    assert directive.requested_counterclones == 3
+
+
 def test_nlp_cidr_extraction():
     parser = HannibalNLPParser()
     directive = parser.parse("Scan 10.0.0.0/24 and find credentials")
@@ -304,6 +311,21 @@ def test_hannibal_agent_supports_custom_drone_instruction():
     assert campaign.active_drone_ids
     order_actions = [order["action"] for order in campaign.drone_orders]
     assert "DEPLOY_CUSTOM_DRONE" in order_actions
+
+
+def test_hannibal_agent_deploys_up_to_three_counterclones():
+    cp = _FakeControlPlane()
+    agent = HannibalAgent(cp)
+    reply = agent.receive_instruction(
+        "Deploy Hannibal against 10.12.0.5 and launch 5 conterclones immediately"
+    )
+    assert reply["acted"] is True
+    assert reply["counterclones_deployed"] == 3
+    campaign = agent._campaign
+    assert campaign is not None
+    assert len(campaign.active_drone_ids) >= 3
+    striker_orders = [order for order in campaign.drone_orders if order["action"] == "DEPLOY_STRIKER"]
+    assert len(striker_orders) == 3
 
 
 def test_hannibal_agent_fleet_cap_is_15():

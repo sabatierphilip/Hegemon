@@ -25,10 +25,12 @@ class MissionDirective:
     english_focus: str | None = None
     drone_build_focus: str | None = None
     custom_drone_requested: bool = False
+    requested_counterclones: int = 0
 
 
 _IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?)\b")
 _CIDR_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\b")
+_COUNTERCLONE_RE = re.compile(r"(?:up to|upto|deploy|launch|run|start)?\s*(\d+)\s*(?:counter\s*-?\s*clones?|counterclones?|conterclones?)")
 
 _INTENT_PATTERNS: list[tuple[list[str], str, float]] = [
     (["deploy", "launch", "start", "begin", "run", "send", "activate", "unleash", "dispatch"], "deploy_agent", 0.85),
@@ -132,6 +134,12 @@ _CUSTOM_DRONE_TOKENS = (
     "create drone",
     "build drone",
 )
+
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+}
 
 
 class HannibalNLPParser:
@@ -238,6 +246,19 @@ class HannibalNLPParser:
         if directive.custom_drone_requested:
             directive.parse_notes.append("Custom drone request detected")
 
+        count_match = _COUNTERCLONE_RE.search(lower)
+        requested_counterclones = 0
+        if count_match:
+            requested_counterclones = int(count_match.group(1))
+        else:
+            for word, value in _NUMBER_WORDS.items():
+                if f"{word} counterclone" in lower or f"{word} conterclone" in lower:
+                    requested_counterclones = value
+                    break
+        directive.requested_counterclones = max(0, min(requested_counterclones, 3))
+        if directive.requested_counterclones:
+            directive.parse_notes.append(f"Counterclone request detected: {directive.requested_counterclones}")
+
         enhancement_plan: list[str] = []
         if directive.english_focus:
             enhancement_plan.append(f"english:{directive.english_focus}")
@@ -286,6 +307,8 @@ class HannibalNLPParser:
             lines.append(f"Mission style: {directive.mission_style}")
         if directive.custom_drone_requested:
             lines.append("Custom drone creation: requested")
+        if directive.requested_counterclones:
+            lines.append(f"Counterclone deployment request: {directive.requested_counterclones}")
         if directive.enhancement_plan:
             lines.append("Enhancement plan:")
             lines.extend([f"- {step}" for step in directive.enhancement_plan])

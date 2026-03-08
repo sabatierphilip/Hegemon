@@ -66,6 +66,9 @@ class HannibalAgent(BaseAgent):
             campaign = self.start_campaign(campaign_id=campaign_id, target=target, objective=objective, autonomy_override=directive.autonomy_override)
             if directive.custom_drone_requested:
                 self._deploy_custom_drone(campaign, directive)
+            if directive.requested_counterclones:
+                deployed = self._deploy_counterclone_set(campaign, directive.requested_counterclones)
+                result["counterclones_deployed"] = deployed
             result["acted"] = True
             result["campaign_id"] = campaign_id
         elif directive.intent == "pause_campaign":
@@ -301,6 +304,24 @@ class HannibalAgent(BaseAgent):
             return
 
         self._deploy_drone(action, target, network, drone_autonomy, drone_tier, ttl, state)
+
+    def _deploy_counterclone_set(self, state: CampaignState, requested_count: int) -> int:
+        if requested_count <= 0:
+            return 0
+        cap_remaining = max(0, self.MAX_ACTIVE_DRONES - len(state.active_drone_ids))
+        deploy_count = min(requested_count, 3, cap_remaining)
+        deployed = 0
+        for _ in range(deploy_count):
+            before = len(state.active_drone_ids)
+            self._execute_action("DEPLOY_STRIKER", state, "Counterclone deployment request")
+            after = len(state.active_drone_ids)
+            if after > before:
+                deployed += 1
+        self._record_log(
+            "counterclone_deployment",
+            {"requested": requested_count, "deployed": deployed, "max_allowed": 3},
+        )
+        return deployed
 
     @staticmethod
     def _drone_age_seconds(launched_at: str | None) -> float:
