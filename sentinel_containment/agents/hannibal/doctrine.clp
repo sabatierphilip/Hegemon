@@ -33,6 +33,18 @@
   (slot rationale (type STRING))
 )
 
+(deftemplate vulnerability-count
+  (slot value (type INTEGER))
+)
+
+(deftemplate deployment-successes
+  (slot value (type INTEGER))
+)
+
+(deftemplate confirmed-rce
+  (slot value)
+)
+
 (defrule enter-reconnaissance
   (campaign-state (phase dormant) (alive-hosts 0) (active-drones 0))
   =>
@@ -158,4 +170,29 @@
   =>
   (assert (hannibal-decision (action TERMINATE_HIGHEST_RISK_DRONE) (confidence 0.82)
     (rationale "Detection pressure rising. Hannibal trims the exposed flank. Sacrifice one to save many.")))
+)
+
+
+(defrule confirmed-rce-escalate
+  (campaign-state (phase flanking))
+  (deployment-successes (value ?n&:(> ?n 0)))
+  =>
+  (assert (hannibal-decision (action ADVANCE_PHASE_ENCIRCLEMENT) (confidence 0.96)
+    (rationale "Confirmed remote execution available.")))
+)
+
+(defrule default-credentials-critical
+  (vulnerability-count (value ?v&:(> ?v 0)))
+  (confirmed-rce (value TRUE))
+  =>
+  (assert (hannibal-decision (action TERMINATE_HIGHEST_RISK_DRONE) (confidence 0.70)
+    (rationale "Critical vulnerability context detected. Trim exposure and escalate operator review.")))
+)
+
+(defrule no-deployment-vectors-zeroscan
+  (campaign-state (phase mapping) (alive-hosts ?n&:(> ?n 0)))
+  (deployment-successes (value 0))
+  =>
+  (assert (hannibal-decision (action DEPLOY_MAPPER) (confidence 0.83)
+    (rationale "No deployment vectors — continue zero-day correlation/mapping mode.")))
 )

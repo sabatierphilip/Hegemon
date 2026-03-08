@@ -239,6 +239,28 @@ def test_clips_bridge_loads_and_evaluates():
     assert any(d["action"] == "DEPLOY_SCOUT" for d in decisions)
 
 
+
+
+def test_custom_drone_aggressive_objective_wires_exec_nodes():
+    behaviour = build_custom_drone(
+        "10.0.0.9",
+        "10.0.0.0/24",
+        objective="disable audit logging and run command on pivot host",
+    )
+    kinds = [n.kind for n in behaviour.nodes]
+    assert "lateral_move" in kinds
+    assert "manage_service" in kinds
+    assert "exec_remediation" in kinds
+
+
+def test_hannibal_set_objective_signals_deliberation_queue():
+    cp = _FakeControlPlane()
+    agent = HannibalAgent(cp)
+    _ = agent.start_campaign("camp-q", "10.0.0.1", "baseline")
+    _ = agent.receive_instruction("set objective to collect credentials")
+    assert not agent._deliberation_queue.empty()
+    agent.abort_campaign()
+
 def test_q_learner_update(tmp_path: Path):
     learner = HannibalQLearner(tmp_path / "qtable.json", list(ACTION_INDEX.keys()))
     state = (0, 0, 0, 0, 0)

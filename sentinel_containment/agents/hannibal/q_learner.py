@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 
@@ -108,7 +109,9 @@ class HannibalQLearner:
 
     def _bootstrap_with_synthetic_curriculum(self) -> None:
         """Warm-start Q values using synthetic offense/defence mission scenarios."""
-        curriculum_path = ensure_synthetic_q_curriculum_file()
+        min_scenarios = max(1600, int(os.getenv("HANNIBAL_Q_CURRICULUM_MIN", "1600") or "1600"))
+        seed = int(os.getenv("HANNIBAL_Q_CURRICULUM_SEED", "1337") or "1337")
+        curriculum_path = ensure_synthetic_q_curriculum_file(min_scenarios=min_scenarios, seed=seed)
         scenarios = load_synthetic_q_training_dataset(curriculum_path)
         if not scenarios:
             scenarios = build_synthetic_q_training_dataset()

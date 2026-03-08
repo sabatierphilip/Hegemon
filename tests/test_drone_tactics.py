@@ -112,6 +112,7 @@ def test_controlplane_execute_node_lateral_move_uses_designer_payload(tmp_path: 
     telemetry_rows = [row for row in drone.telemetry if "pivot_telemetry" in row]
     assert telemetry_rows
     assert "recommendations" in telemetry_rows[-1]["pivot_telemetry"]
+    assert "pivot_execution" in telemetry_rows[-1]
 
 
 def test_controlplane_execute_node_countermeasure_uses_designer_payload(tmp_path: Path):

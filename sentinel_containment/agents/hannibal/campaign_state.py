@@ -59,6 +59,9 @@ class CampaignState:
     pivot_paths_confirmed: int = 0
     countermeasures_executed: int = 0
     objectives_completed: list[str] = field(default_factory=list)
+    vulnerability_signals: list[dict[str, Any]] = field(default_factory=list)
+    deployment_attempts: list[dict[str, Any]] = field(default_factory=list)
+    deployment_successes: list[dict[str, Any]] = field(default_factory=list)
 
     # Operational security
     detection_events: int = 0
@@ -75,6 +78,7 @@ class CampaignState:
 
     def to_clips_facts(self) -> list[str]:
         """Serialize CampaignState into CLIPS assert-string facts."""
+        confirmed_rce = any(bool(v.get("confirmed")) for v in self.vulnerability_signals)
         return [
             (
                 "(campaign-state "
@@ -88,8 +92,12 @@ class CampaignState:
                 f"(exposure-score {float(self.exposure_score):.3f}) "
                 f"(objectives-complete {len(self.objectives_completed)}) "
                 f"(mission-objective \"{self._safe_string(self.mission_objective)}\"))"
-            )
+            ),
+            f"(vulnerability-count (value {len(self.vulnerability_signals)}))",
+            f"(deployment-successes (value {len(self.deployment_successes)}))",
+            f"(confirmed-rce (value {'TRUE' if confirmed_rce else 'FALSE'}))",
         ]
+
 
     @staticmethod
     def _bucket_int(value: float, cuts: tuple[float, float, float, float]) -> int:
@@ -112,8 +120,8 @@ class CampaignState:
         alive_bucket = self._bucket_int(len(self.alive_hosts), (0, 2, 5, 10))
         exposure_bucket = self._bucket_int(self.exposure_score, (0.05, 0.25, 0.50, 0.75))
         hvt_bucket = self._bucket_int(len(self.high_value_targets), (0, 1, 2, 4))
-        active_bucket = self._bucket_int(len(self.active_drone_ids), (0, 1, 3, 5))
-        return (phase_bucket, alive_bucket, exposure_bucket, hvt_bucket, active_bucket)
+        deployment_bucket = self._bucket_int(len(self.deployment_successes), (0, 1, 2, 4))
+        return (phase_bucket, alive_bucket, exposure_bucket, hvt_bucket, deployment_bucket)
 
     @staticmethod
     def _extract_ip_candidates(value: Any) -> list[str]:
@@ -198,6 +206,14 @@ class CampaignState:
                     continue
                 host_map = self._ensure_host_map(host)
                 role = str(entry.get("role") or host_map.get("role") or "").strip().lower()
+                services_hint = [str(v).lower() for v in (entry.get("services") or []) if isinstance(v, (str, int))]
+                open_ports_hint = [int(p) for p in (entry.get("open_ports") or []) if str(p).isdigit()]
+                banners_hint = [str(v).lower() for v in (entry.get("banners") or []) if isinstance(v, str)]
+                if not role:
+                    if 5432 in open_ports_hint or any("postgres" in x or "pgdb" in x for x in services_hint + banners_hint):
+                        role = "database"
+                    elif 389 in open_ports_hint or any("ldap" in x for x in services_hint + banners_hint):
+                        role = "domain_controller"
                 if role:
                     host_map["role"] = role
                 if drone_id not in host_map["sources"]:
