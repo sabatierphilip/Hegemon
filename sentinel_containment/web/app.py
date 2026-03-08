@@ -2782,6 +2782,154 @@ def api_hannibal_log():
     return jsonify({"log": agent._log[-100:]})
 
 
+
+
+@app.get("/api/agents/hannibal/briefing")
+def api_hannibal_briefing():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    agent = _get_hannibal()
+    return jsonify(agent.mission_briefing())
+
+
+@app.post("/api/agents/hannibal/simulate")
+def api_hannibal_simulate():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    directive = str(payload.get("directive", "")).strip()
+    if not directive:
+        return jsonify({"error": "directive required"}), 400
+    agent = _get_hannibal()
+    return jsonify(agent.simulate_directive(directive))
+
+
+
+@app.get("/api/agents/hannibal/mission-control/state")
+def api_hannibal_mission_control_state():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    agent = _get_hannibal()
+    return jsonify(agent.mission_control_snapshot())
+
+
+@app.get("/api/agents/hannibal/mission-control/playbooks")
+def api_hannibal_mission_control_playbooks():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    query = request.args.get("q")
+    phase = request.args.get("phase")
+    agent = _get_hannibal()
+    return jsonify({"playbooks": agent.mission_control_playbooks(query=query, phase=phase)})
+
+
+@app.post("/api/agents/hannibal/mission-control/playbooks/refresh")
+def api_hannibal_mission_control_playbooks_refresh():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    agent = _get_hannibal()
+    return jsonify(agent.mission_control_refresh_catalog())
+
+
+@app.get("/api/agents/hannibal/mission-control/decision-log")
+def api_hannibal_mission_control_decision_log():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    agent = _get_hannibal()
+    return jsonify({"log": agent.mission_control_decision_log()})
+
+
+@app.post("/api/agents/hannibal/mission-control/task")
+def api_hannibal_mission_control_task_create():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    operator = str(payload.get("operator", "operator")).strip() or "operator"
+    try:
+        task = _get_hannibal().mission_control_create_task(payload, actor=operator)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(task)
+
+
+@app.patch("/api/agents/hannibal/mission-control/task/<task_id>")
+def api_hannibal_mission_control_task_update(task_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    operator = str(payload.get("operator", "operator")).strip() or "operator"
+    try:
+        task = _get_hannibal().mission_control_update_task(task_id, payload, actor=operator)
+    except KeyError:
+        return jsonify({"error": "task not found"}), 404
+    return jsonify(task)
+
+
+@app.post("/api/agents/hannibal/mission-control/order")
+def api_hannibal_mission_control_order_issue():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    action = str(payload.get("action", "")).strip()
+    rationale = str(payload.get("rationale", "")).strip()
+    operator = str(payload.get("operator", "operator")).strip() or "operator"
+    if not action or not rationale:
+        return jsonify({"error": "action and rationale required"}), 400
+    order = _get_hannibal().mission_control_issue_order(action, rationale, operator=operator, payload=payload.get("payload", {}))
+    return jsonify(order)
+
+
+@app.post("/api/agents/hannibal/mission-control/order/<order_id>/close")
+def api_hannibal_mission_control_order_close(order_id: str):
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    outcome = str(payload.get("outcome", "")).strip()
+    operator = str(payload.get("operator", "operator")).strip() or "operator"
+    if not outcome:
+        return jsonify({"error": "outcome required"}), 400
+    try:
+        order = _get_hannibal().mission_control_close_order(order_id, outcome, operator=operator)
+    except KeyError:
+        return jsonify({"error": "order not found"}), 404
+    return jsonify(order)
+
+
+@app.post("/api/agents/hannibal/mission-control/directive")
+def api_hannibal_mission_control_directive_register():
+    unauthorized = _require_auth()
+    if unauthorized:
+        return unauthorized
+    payload, err = _safe_json_payload()
+    if err:
+        return err
+    operator = str(payload.get("operator", "operator")).strip() or "operator"
+    try:
+        directive = _get_hannibal().mission_control_register_directive(payload, actor=operator)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(directive)
+
 @app.get("/api/agents/hannibal/qtable")
 def api_hannibal_qtable():
     unauthorized = _require_auth()
